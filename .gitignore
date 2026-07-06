@@ -1,0 +1,125 @@
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor and IDE files
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Logs and runtime files
+*.log
+logs/
+*.pid
+*.seed
+*.tmp
+tmp/
+temp/
+
+# Node / frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dist/
+build/
+.next/
+.nuxt/
+.svelte-kit/
+coverage/
+.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+htmlcov/
+*.egg-info/
+
+# Go
+/bin/
+*.test
+*.out
+coverage.out
+
+# Rust
+target/
+
+# C / C++ / CMake
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+compile_commands.json
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+
+# Java / JVM build output
+.gradle/
+/out/
+*.class
+*.jar
+
+# Containers and local deployment state
+.docker/
+docker-compose.override.yml
+*.local.yml
+*.local.yaml
+
+# Terraform / infrastructure local state
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Data, model, and experiment artifacts
+/artifacts/
+/outputs/
+/runs/
+/checkpoints/
+/data/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+Notes
