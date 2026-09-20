@@ -123,3 +123,5 @@ override.tf.json
 *.sqlite
 *.sqlite3
 Notes
+Password
+AGENTS.md
