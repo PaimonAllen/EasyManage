@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
+# SQLx hashes released migrations: keep their exact bytes, including legacy EOF.
+migrations/*.sql -text whitespace=-blank-at-eof
