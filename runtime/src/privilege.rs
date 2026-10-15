@@ -41,7 +41,7 @@ impl Error for PrivilegeError {}
 
 /// Checks startup privileges using the current policy.
 ///
-/// The default `warn` policy reports the privilege error and allows startup to continue.
+/// The default policy allows normal-user operation in basic mode.
 /// Set `EASYMANAGE_ADMIN_POLICY=require` to turn the same condition into a startup failure.
 ///
 /// # Errors
@@ -53,11 +53,10 @@ pub fn ensure_administrator(component: &str) -> Result<(), PrivilegeError> {
             eprintln!("[INFO] EasyManage {component} is running with administrator privileges");
             Ok(())
         }
-        Err(error) if AdminPolicy::from_environment() == AdminPolicy::WarnAndContinue => {
-            eprintln!(
-                "[ERROR] EasyManage {component}: {error}; continuing in degraded mode. \
-                 Set {ADMIN_POLICY_ENV}=require to reject non-administrator startup in the future."
-            );
+        Err(PrivilegeError::NotAdministrator)
+            if AdminPolicy::from_environment() == AdminPolicy::WarnAndContinue =>
+        {
+            eprintln!("[INFO] EasyManage {component} is running in basic mode as a normal user");
             Ok(())
         }
         Err(error) => Err(error),
