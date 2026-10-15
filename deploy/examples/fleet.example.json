@@ -1,0 +1,24 @@
+{
+  "example": true,
+  "server_url": "https://platform.example.internal:8443",
+  "nodes": [
+    {
+      "hostname": "platform-node",
+      "platform": "linux",
+      "host": "192.0.2.10",
+      "port": 22,
+      "ssh_target": "local",
+      "user": "operator",
+      "node_id": "00000000-0000-4000-8000-000000000001"
+    },
+    {
+      "hostname": "worker-node",
+      "platform": "linux",
+      "host": "192.0.2.20",
+      "port": 22,
+      "ssh_target": "worker-ssh-alias",
+      "user": "operator",
+      "node_id": "00000000-0000-4000-8000-000000000002"
+    }
+  ]
+}

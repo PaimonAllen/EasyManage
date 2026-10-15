@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Deployment assets are versioned here; local configuration stays outside Git.
 set -Eeuo pipefail
 
 if [[ ! -r /etc/os-release ]]; then

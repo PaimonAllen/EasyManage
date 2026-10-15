@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Deployment assets are versioned here; local configuration stays outside Git.
 set -Eeuo pipefail
 
 readonly rust_version="1.98.1"

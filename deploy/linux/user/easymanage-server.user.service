@@ -1,0 +1,22 @@
+[Unit]
+Description=EasyManage ordinary-user control plane
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/easymanage
+Environment=EASYMANAGE_ENV_FILE=%h/.local/share/easymanage/config/server.env
+Environment=EASYMANAGE_ADMIN_POLICY=warn
+Environment=EASYMANAGE_OPERATIONS_TARGETS=%h/.local/share/easymanage/config/targets.json
+ExecStart=%h/.local/share/easymanage/bin/easymanage-server
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+Nice=5
+TasksMax=128
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

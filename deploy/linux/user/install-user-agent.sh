@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Deployment assets are versioned here; local configuration stays outside Git.
+# Verified, reversible install as the target SSH user. Never invokes sudo.
+set -Eeuo pipefail
+umask 0077
+if (( EUID == 0 )); then
+  printf 'Run this installer as the intended ordinary agent user.\n' >&2
+  exit 1
+fi
+operator_user="$(id -un)"
+operator_home="$(getent passwd "$operator_user" | cut -d: -f6)"
+[[ "$operator_home" =~ ^/home/[a-zA-Z0-9_.-]+$ && "${HOME:?}" == "$operator_home" ]] || exit 64
+bundle_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+[[ "$bundle_dir" =~ ^/tmp/easymanage-agent\.[a-zA-Z0-9_-]+$ ]] || exit 64
+agent_base="$operator_home/.local/share/easymanage"
+unit_path="$operator_home/.config/systemd/user/easymanage-agent.service"
+assert_plain_path() {
+  local item="$1"
+  while [[ "$item" != / && "$item" != . ]]; do
+    [[ ! -L "$item" ]] || { printf 'Refusing symbolic-link deployment path.\n' >&2; return 1; }
+    item="$(dirname -- "$item")"
+  done
+}
+for item in "$bundle_dir" "$agent_base/bin/easymanage-agent" "$agent_base/config/agent.env" \
+  "$agent_base/config/ca.crt" "$agent_base/state/state.db" "$agent_base/state/state.db-wal" \
+  "$agent_base/state/state.db-shm" "$unit_path"; do
+  assert_plain_path "$item"
+done
+cd "$bundle_dir"
+[[ -f SHA256SUMS && ! -L SHA256SUMS ]] || exit 64
+declare -A verified_files=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ "$line" =~ ^[a-fA-F0-9]{64}\ \ ([a-zA-Z0-9_.-]+)$ ]] || exit 64
+  file="${BASH_REMATCH[1]}"
+  case "$file" in
+    easymanage-agent|install-user-agent.sh|install-full-candidate.sh|migrate-agent-to-user.sh|handover.sh|easymanage-agent.user.service|node.json|agent.env|ca.crt) ;;
+    *) exit 64 ;;
+  esac
+  [[ -z "${verified_files[$file]:-}" && -f "$file" && ! -L "$file" ]] || exit 64
+  verified_files["$file"]=1
+done < SHA256SUMS
+for file in easymanage-agent install-user-agent.sh easymanage-agent.user.service node.json agent.env ca.crt; do
+  [[ "${verified_files[$file]:-}" == 1 ]] || { printf 'Incomplete agent installation manifest.\n' >&2; exit 64; }
+done
+sha256sum --check --status SHA256SUMS
+legacy_state="$(systemctl show -p ActiveState --value easymanage-agent.service 2>/dev/null || true)"
+if [[ "$legacy_state" != inactive && "$legacy_state" != failed && -n "$legacy_state" ]] \
+  || systemctl is-enabled --quiet easymanage-agent.service 2>/dev/null; then
+  printf 'A system/root Agent is active or enabled. An administrator must migrate it first:\n' >&2
+  printf '  sudo bash %q %q\n' "$bundle_dir/handover.sh" "$operator_user" >&2
+  exit 3
+fi
+# Validate configuration as plain data, including the persistent identity. Never source/eval it.
+python3 - "$agent_base" "$operator_user" <<'PY'
+import json, pathlib, re, sqlite3, sys, uuid
+from urllib.parse import quote
+base, user = sys.argv[1:]
+values = {}
+for line in pathlib.Path("agent.env").read_text().splitlines():
+    if not line or line.startswith("#"):
+        continue
+    key, separator, value = line.partition("=")
+    if not separator or key in values:
+        raise SystemExit("Invalid or duplicate agent environment entry")
+    values[key] = value
+if not re.fullmatch(r"https://(?:[a-zA-Z0-9.-]+|\[[a-fA-F0-9:]+\])(?::[0-9]+)?", values.get("EASYMANAGE_SERVER_URL", "")):
+    raise SystemExit("Invalid HTTPS controller URL")
+if not re.fullmatch(r"[a-fA-F0-9]{64}", values.get("EASYMANAGE_ENROLLMENT_TOKEN", "")):
+    raise SystemExit("Invalid enrollment configuration")
+if values.get("EASYMANAGE_CA_CERTIFICATE") != base + "/config/ca.crt" or values.get("EASYMANAGE_AGENT_STATE_DB") != base + "/state/state.db":
+    raise SystemExit("Agent configuration points outside the expected user deployment")
+node_id = uuid.UUID(values["EASYMANAGE_NODE_ID"])
+node = json.loads(pathlib.Path("node.json").read_text())
+if uuid.UUID(node["node_id"]) != node_id or node.get("user") != user or node.get("agent_home") != base:
+    raise SystemExit("Bundle node/account identity mismatch")
+state = pathlib.Path(base) / "state/state.db"
+if state.exists():
+    with sqlite3.connect("file:" + quote(str(state), safe="/") + "?mode=ro", uri=True, timeout=5) as db:
+        existing = db.execute("SELECT value FROM metadata WHERE key='node_id'").fetchone()
+    if not existing or uuid.UUID(existing[0]) != node_id:
+        raise SystemExit("Persisted identity differs; administrator review is required")
+PY
+systemctl --user show-environment >/dev/null
+install -d -m 0700 "$agent_base" "$agent_base/bin" "$agent_base/config" "$agent_base/state" "$operator_home/.config/systemd/user"
+backup_dir="$(mktemp -d "$agent_base/install-backup.XXXXXX")"
+targets=("$agent_base/bin/easymanage-agent" "$agent_base/config/agent.env" "$agent_base/config/ca.crt" "$unit_path")
+sources=("$bundle_dir/easymanage-agent" "$bundle_dir/agent.env" "$bundle_dir/ca.crt" "$bundle_dir/easymanage-agent.user.service")
+for index in "${!targets[@]}"; do
+  target="${targets[$index]}"
+  [[ ! -e "$target" || -f "$target" ]] || exit 64
+  if [[ -f "$target" ]]; then cp -p -- "$target" "$backup_dir/previous-$index"; fi
+done
+was_active=false
+was_enabled=false
+if systemctl --user is-active --quiet easymanage-agent.service; then was_active=true; fi
+if systemctl --user is-enabled --quiet easymanage-agent.service; then was_enabled=true; fi
+mutation_started=false
+restore_on_exit() {
+  local result=$?
+  trap - EXIT
+  if (( result != 0 )) && [[ "$mutation_started" == true ]]; then
+    set +e
+    systemctl --user stop easymanage-agent.service
+    for index in "${!targets[@]}"; do
+      target="${targets[$index]}"
+      if [[ -f "$target" && ! -L "$target" ]]; then mv -- "$target" "$backup_dir/failed-$index"; fi
+      if [[ -f "$backup_dir/previous-$index" ]]; then cp -p -- "$backup_dir/previous-$index" "$target"; fi
+    done
+    systemctl --user daemon-reload
+    if [[ "$was_enabled" == true ]]; then
+      systemctl --user enable easymanage-agent.service
+    else
+      systemctl --user disable easymanage-agent.service
+    fi
+    if [[ "$was_active" == true ]]; then systemctl --user start easymanage-agent.service; fi
+    printf 'User-agent update failed; prior files/service restoration attempted. Recovery: %s\n' "$backup_dir" >&2
+  fi
+  exit "$result"
+}
+trap restore_on_exit EXIT
+mutation_started=true
+# Stop only this agent while replacing its executable, configuration and unit together.
+systemctl --user stop easymanage-agent.service 2>/dev/null || [[ "$was_active" == false ]]
+for index in "${!targets[@]}"; do
+  target="${targets[$index]}"
+  temporary="$(mktemp "$(dirname -- "$target")/.easymanage-install.XXXXXX")"
+  mode=0600
+  if [[ "$index" == 0 ]]; then mode=0700; fi
+  install -m "$mode" "${sources[$index]}" "$temporary"
+  mv -f -- "$temporary" "$target"
+done
+systemctl --user daemon-reload
+systemctl --user enable easymanage-agent.service
+systemctl --user restart easymanage-agent.service
+sleep 3
+systemctl --user is-active --quiet easymanage-agent.service
+trap - EXIT
+printf 'Basic Agent installed for user %s. Master checks the fresh heartbeat.\n' "$operator_user"
