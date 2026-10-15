@@ -1,6 +1,41 @@
 # EasyManage Web
 
-This directory reserves the React/TypeScript frontend structure from the system design.
-Dependencies are deliberately deferred until the first UI feature so that the initial stack
-decision and generated lockfile are made together.
+React / TypeScript 前端，由 Server 提供 `dist/` 静态文件，API 与 WebSocket 均使用同源地址。内网只读页面无平台登录或 Dashboard Token。
 
+| 导航 | 地址 | 数据来源 |
+| --- | --- | --- |
+| 操作手册首页 | `#/docs`（默认） | 原有《服务器管理操作手册》正文迁入 VitePress，同源 `/guide/` 展示；按钮独立打开 EasyManage 平台文档 `/guide/easymanage.html`。 |
+| 设备总览 | `#/overview` | CPU、内存、GPU 核心/显存、磁盘 IO 读写和网络收发的真实历史曲线。 |
+| 用户状态 | `#/users` | root 与普通用户 UID 范围内的账户、终端/logind/SSH 会话证据、进程、登录 Shell 基础状态和管理组标记。 |
+| 存储状态 | `#/storage` | 只读磁盘管理：物理盘、未挂载分区、文件系统与挂载关系的分区图；保留容量、Swap 和设备 I/O。 |
+| 网络状态 | `#/network` | 有线 / Wi-Fi 接口、Tailscale / ZeroTier 官方 CLI 状态、虚拟网络 / VLAN 与路由。 |
+| 在线运维 | `#/operations` | xterm.js 与真实 SSH-backed WebSocket Bash 会话。 |
+| Security | `#/security` | 两台服务器各自的 AppArmor、ASLR、ptrace、Lockdown、管理组账户与 Agent 可见性。 |
+| 平台 | `#/platform-health` | 平台 API / 数据库健康、节点链路；Server 与全部 Agent 的 24 小时进程性能；持久采集设置、频率安全上下限及节点应用状态。保留原路由兼容旧书签。 |
+| OSandSoftwares | `#/software` | OS、内核、安装软件包和运行中的服务。 |
+| Global Network | `#/global-network` | 按服务器与用户展示跨境代理进程、可见监听范围和快照新鲜度；不主动探测外部出口。 |
+| Gitea 状态 | `#/gitea` | 本机 Gitea 健康与版本接口。 |
+| AI 工具状态 | `#/ai-tools` | 固定白名单内 AI CLI、推理服务的可执行文件、进程和运行单元。 |
+| 编程环境 | `#/programming-environment` | Rust、C/C++、Python、JavaScript 等固定工具清单的只读可见性。 |
+| Agent 管理 | `#/agent-management`（旧地址 `#/agent-updates` 兼容） | 节点心跳、版本、运行权限、可信 SSH 目标与候选包状态；可单独重启 Agent，或在候选摘要与已登记安装摘要不同时更新并重启。Full 节点每次操作均需管理员 SSH 与 sudo 认证。 |
+
+设备总览每节点只显示 CPU、内存、GPU 核心/显存、磁盘 IO 读写和网络收发，桌面端一行五图；磁盘容量仍在「存储状态」。可见的总览每秒读取独立的 CPU、内存和网络轻量实时值，每 5 秒读取完整状态、每 15 秒读取 PostgreSQL 保存的近 10 分钟历史样本，最多每节点 180 个长期点；平台健康链路每 15 秒检查一次，24 小时进程统计每 60 秒更新一次；其他页面一般每 30 秒刷新。浏览器在后台暂停轮询。实时点仅保留在本次浏览器会话中最多 5 分钟，刷新后保留的仅是数据库长期曲线；历史断档不补零、不伪造连线。完整 Agent 报告仍按配置周期上报，GPU 随完整报告更新，磁盘探测最多每 30 秒执行一次。每个节点只在标题区域显示采集时间和数据年龄：完整指标超过 45 秒、磁盘超过 90 秒、扩展清单超过 150 秒或节点离线时标为历史快照。未知和权限不足的字段不替换成模拟值。
+
+普通用户 legacy 的 Agent 为 Basic，不能读取所有系统权限信息；其他用户的进程、监听地址、密码锁定状态或硬件指标可能不可见。系统级 Full 以实际 root 心跳为准，更新不自动降权。账户文件不能证明是否手工创建，因此按系统普通用户 UID 范围筛选并包含 root。无会话不等于账户不存在，密码锁定也不代表不能使用 SSH 密钥。
+
+权限检查详情允许“人工标记 OK”（可填写备注）或撤销标记，深绿色与自动通过区分。标记保存在 PostgreSQL，浏览器共享；匹配具体节点和该项完整检查内容，自动证据保持原样。新上报使观测、状态、规则或说明变化时，标记失效且保留审计记录；延迟旧报告不影响当前标记。离线或超过 8 分钟的快照不能新增确认，也不以深绿色显示历史标记。平台未验证标记人的身份，这只是内网人工备注，不是安全认证或实际权限修改。
+
+每台设备的提权按钮要求明确输入目标机器管理员用户名和密码，Full 会将 Agent 切换为 root 服务。仅在实际心跳报告 `mode=full` 且 `uid=0` 后显示 Full，不将请求成功当成验证完成。
+
+Agent 管理中的“重启”只作用于所选节点的 Agent 服务，不重启主机。Basic 使用可信普通用户 SSH 目标；Full 重新验证管理员凭据。“更新并重启”仅在已发布候选包的 SHA-256 与登记的已安装 SHA-256 不同时启用；登记摘要不是对远端二进制的实时校验。操作会短暂中断监控心跳，页面执行结果仍需以新心跳确认。
+
+在线终端要求目标主机真实 SSH 账户与密码，命令直接在选定的生产主机执行，权限与该账户一致。凭据仅用于当前请求 / 会话，不写入 URL、日志或浏览器持久存储；提交后清空密码输入，离开终端页时断开连接。平台无登录不等于 SSH 或提权免认证。
+
+```bash
+pnpm install --frozen-lockfile
+pnpm build
+```
+
+主项目普通用户部署入口是 `./scripts/run-server.sh --build` / `--fleet`，用法见 [scripts/README.md](../scripts/README.md)。xterm.js 使用 pnpm 管理的常规依赖；额外引入完整第三方项目时应放 Git 忽略的 `third_party/` 或 `vendor_projects/`，不混入前端源代码。
+
+构建不代表线上发布完成。浏览器运行时、交互式 SSH、故障和提权测试须在隔离虚拟环境执行；不要为测试在生产终端输入命令。
