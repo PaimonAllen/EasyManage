@@ -1,0 +1,38 @@
+# 隔离集成测试
+
+生产主机不直接运行测试。`isolated_smoke.py` 必须在独立网络和挂载命名空间、私有 `/tmp`、非 root 用户下执行；它会拒绝原主机命名空间。该环境不是完整虚拟机。
+
+先在工作区编译，测试程序不在此步骤运行：
+
+```bash
+./scripts/run-server.sh --build
+cargo test --workspace --no-run --jobs 2
+```
+
+已有 `bwrap` 和 PostgreSQL 18 二进制时，可使用下面的隔离测试入口。它遮蔽主机 home、运行时 socket、设备和进程，仅以只读方式映射工作区；网络只有隔离环境自己的 loopback：
+
+```bash
+bwrap --unshare-all --die-with-parent --new-session \
+  --ro-bind / / --dev /dev --proc /proc \
+  --tmpfs /tmp --tmpfs /run --tmpfs /home --tmpfs /sys \
+  --dir /tmp/work --ro-bind "$PWD" /tmp/work --chdir /tmp/work \
+  /usr/bin/python3 /tmp/work/tests/integration/isolated_smoke.py \
+  --server-binary /tmp/work/target/release/easymanage-server \
+  --agent-binary /tmp/work/target/release/easymanage-agent \
+  --host-netns "$(readlink /proc/self/ns/net)" \
+  --host-mntns "$(readlink /proc/self/ns/mnt)"
+```
+
+测试自建临时 PostgreSQL、TLS 和节点数据，结束后停止子进程并移除其临时数据。不会连接生产数据库、SSH、Nginx 或 systemd。覆盖无登录只读 API、Agent 机器认证、快照排序、24 小时进程历史聚合、只读块设备树/未挂载分区的协议兼容、目标信息脱敏和跨源运维拒绝；不代表真实浏览器、生产 Full 提权及服务交接已通过验证。
+
+Rust 单元测试同样在上述隔离环境执行编译得到的 `target/debug/deps/` 测试二进制，不在生产环境直接执行 `cargo test`。
+
+可选 `--machine-onboarding` 回归需临时测试 venv 的 Paramiko 3.5.1（不是平台依赖）和 C 编译器。仍须使用上面的私有网络、`/home` 与 `/tmp`，将 venv 只读映射至 `/tmp/ssh-env` 并用其 Python 调用隔离入口。测试会生成临时 SSH 密钥和凭据，SSH/SCP、摘要校验、用户安装脚本与 Agent 上报是真实执行；systemd 用户 manager 为 mock。`fixtures/ssh_loopback_redirect.c` 仅预加载到该临时 Server，将两个合成内网 IP 的 SSH 连接转到隔离 loopback，不改网络配置、不接触生产 SSH。严禁对生产进程使用该测试 shim。
+
+新增机器鉴权回归包含旧版密码请求兼容、未加密/加密 PEM RSA 私钥、带口令 OpenSSH Ed25519 私钥完成真实部署、错误口令和指纹阻断；还检查解析错误不回显秘密，任务日志、运行日志、清单和安装后的 Agent 文件不含密码/私钥/口令。所有密钥均在隔离测试运行时生成，不使用个人 SSH 密钥。`web/tests/machineAuthentication.test.ts` 检查请求序列化后及异常时的引用清理，SSR 检查鉴权选项、密码/口令掩码和不回显正文的私钥上传。
+
+部署纯逻辑回归为 `test_fleet.py`；应急重启 mock 回归为 `force_restart_smoke.py`。后者同样在上述隔离环境调用，并传入两个位置参数：宿主 net、mnt 命名空间 ID。它在嵌套私有命名空间内模拟 systemd/runuser，不联系生产服务。真实 Agent 回归同时检查少量线程、实时上报、慢速采样缓存和重启后身份保持。
+
+温度回归使用合成 hwmon 数据，覆盖 CPU / SSD 分类、机械盘排除、错误读数、缓存、采集时间与数据库历史兼容。隔离入口遮蔽 `/sys`，真实 Agent 测试不会读取生产硬件传感器。前端 `web/tests/temperature.test.ts` 检查缺失读数与采样去重；`web/tests/charts-smoke.mjs` 使用 Vite + React 服务端渲染检查五图布局、三条独立温度曲线及旧版数据，要求传入宿主网络 / 挂载命名空间 ID。两者也必须在上述隔离环境运行；服务端渲染检查不等同真实浏览器截图测试。
+
+平台自身更新回归：`test_platform_release.py` 为临时目录纯逻辑测试，覆盖发布不影响运行服务、逐文件摘要检查、允许组可写的 home 上级目录、拒绝平台自身目录组写入及越界/符号链接、成功安装只改变平台、就绪失败回退和版本比较。机器管理 Rust 单测同样覆盖共享 home 下私有清单目录可用，清单目录组写入和符号链接仍拒绝。`platform_update_smoke.py` 在上述隔离环境运行并接收宿主 net/mnt 命名空间 ID，通过嵌套私有 namespace 模拟 systemd/runuser，覆盖管理员固定调度、错误单元/候选拦截、重复任务拒绝和 Agent 不被触及。HTTP smoke 覆盖平台更新接口跨源拒绝与无候选禁用。所有测试均不重启生产服务；纯逻辑测试也不会真正联系 systemd 或 HTTPS。
