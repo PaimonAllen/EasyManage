@@ -31,6 +31,8 @@ Rust 单元测试同样在上述隔离环境执行编译得到的 `target/debug/
 
 新增机器鉴权回归包含旧版密码请求兼容、未加密/加密 PEM RSA 私钥、带口令 OpenSSH Ed25519 私钥完成真实部署、错误口令和指纹阻断；还检查解析错误不回显秘密，任务日志、运行日志、清单和安装后的 Agent 文件不含密码/私钥/口令。所有密钥均在隔离测试运行时生成，不使用个人 SSH 密钥。`web/tests/machineAuthentication.test.ts` 检查请求序列化后及异常时的引用清理，SSR 检查鉴权选项、密码/口令掩码和不回显正文的私钥上传。
 
+`first_full_install_smoke.py` 同样必须在上述隔离环境运行并传入宿主 net/mnt namespace ID。它在嵌套 root 用户 namespace 内构造私有系统目录，只使用 mock systemd；覆盖普通 SSH / root 暂存布局的首次 Full、配置路径重写、root 所有权、错误摘要、已有单元/身份拒绝、符号链接/不安全系统目录拒绝、启动失败撤回与恢复数据保留。真实 SSH 回归还核对 Basic 暂存包仅在 SSH 用户 home 内、sudo 拒绝时不上传、不回退为 Basic，并执行实际 Full 安装器与 namespace-root Agent，确认真实 Full / UID 0 心跳。sudo 鉴权及 systemd 均为 mock，不是生产 root/sudo 或真实 systemd 的端到端验证。
+
 部署纯逻辑回归为 `test_fleet.py`；应急重启 mock 回归为 `force_restart_smoke.py`。后者同样在上述隔离环境调用，并传入两个位置参数：宿主 net、mnt 命名空间 ID。它在嵌套私有命名空间内模拟 systemd/runuser，不联系生产服务。真实 Agent 回归同时检查少量线程、实时上报、慢速采样缓存和重启后身份保持。
 
 温度回归使用合成 hwmon 数据，覆盖 CPU / SSD 分类、机械盘排除、错误读数、缓存、采集时间与数据库历史兼容。隔离入口遮蔽 `/sys`，真实 Agent 测试不会读取生产硬件传感器。前端 `web/tests/temperature.test.ts` 检查缺失读数与采样去重；`web/tests/charts-smoke.mjs` 使用 Vite + React 服务端渲染检查五图布局、三条独立温度曲线及旧版数据，要求传入宿主网络 / 挂载命名空间 ID。两者也必须在上述隔离环境运行；服务端渲染检查不等同真实浏览器截图测试。

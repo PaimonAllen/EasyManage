@@ -1,8 +1,9 @@
 # Linux 运维操作
 
-这里放已有服务的固定操作脚本，与首次安装和部署模式切换分开。
+这里放平台调用的固定受认证操作脚本；常规安装入口仍位于 `system/` 和 `user/`。
 
 - `promote-agent.sh`：受认证的 Basic → Full 提权及 Full 候选更新，保留节点身份与回滚边界。
+- `install-new-full-agent.sh`：GUI 首次安装 Full 的内嵌固定安装器，仅接受新机器；root/sudo 执行前验证摘要与无既有身份，不依赖用户 linger，不运行普通用户暂存目录里的脚本。失败尝试撤回新增服务并保留恢复数据。
 - `install-full-candidate.sh`：只暂存已验证的 Full 候选包，不由普通用户改变运行中的 root 服务。
 - `restart-full-agent.sh`、`force-restart-service.sh`：受认证的 Agent / 平台重启；不是整机重启。
 - `manage-user.sh`：受管理员认证的目标账户操作。
@@ -13,7 +14,7 @@
 
 ## 平台自身更新
 
-仅支持标准 Linux 普通用户平台服务：`~/.local/share/easymanage/bin/easymanage-server`、`web`、`config/server.env`，以及可信清单中 `ssh_target=local` 的平台用户。其他布局保持只读提示，不猜测服务位置。
+仅支持标准 Linux 普通用户平台服务：`~/.easymanage/bin/easymanage-server`、`web`、`config/server.env`，以及可信清单中 `ssh_target=local` 的平台用户。其他布局保持只读提示，不猜测服务位置。
 
 以平台用户执行 `./scripts/run-server.sh --build` 完成构建并发布候选；已有产物也可用 `./scripts/run-server.sh --publish-platform` 只发布。发布不重启、不修改运行中的平台或 Agent。候选保存在用户私有 `platform-releases/<UUID>` 中，清单包含所有文件的 SHA-256；发布索引原子切换，浏览器确认时绑定摘要，安装前重新逐文件核验。平台自身目录、候选目录和文件保持私有，拒绝符号链接和不可信所有者；home、`.local` 等上级目录允许组写入，不因此阻止操作，也不自动 chmod。这是内网部署的兼容取舍：不再防范受信任的同机组成员替换上级目录。机器管理同样只要求实际清单目录由平台用户安全写入，不因上级目录组写入而禁用。平台候选发布失败不阻断原有 Agent 候选发布。
 

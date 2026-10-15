@@ -21,6 +21,6 @@
 
 自定义 SSH 配置可通过 `EASYMANAGE_REMOTE_SSH_CONFIG` 指定。集群编排拒绝 root；使用经过核验的主机密钥和实际 SSH 账户，保留既有节点 ID。
 
-前台入口兼容当前用户的 `~/.local/share/easymanage/config/*.env`，可显式设置 `EASYMANAGE_ENV_FILE`。系统配置和数据库模板见 [数据库说明](../deploy/database/README.md)。`diagnostics/` 放只读磁盘与 Nginx 检查。实际部署会影响生产服务，不属于测试。
+前台入口兼容当前用户的 `~/.easymanage/config/*.env`，可显式设置 `EASYMANAGE_ENV_FILE`。系统配置和数据库模板见 [数据库说明](../deploy/database/README.md)。`diagnostics/` 放只读磁盘与 Nginx 检查。实际部署会影响生产服务，不属于测试。
 
 发布前运行 `python3 scripts/check-repository.py --staged`，核对索引包含源码、锁文件及迁移，没有私有/生成文件。检查仅输出路径和行号，不显示发现的秘密值；属于定向检查，不代替完整秘密扫描。

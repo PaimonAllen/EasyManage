@@ -628,7 +628,7 @@ fn release_root() -> Result<PathBuf, OperationsError> {
         return Ok(path);
     }
     let home = std::env::var_os("HOME").ok_or(OperationsError::registry())?;
-    Ok(PathBuf::from(home).join(".local/share/easymanage/releases/current"))
+    Ok(PathBuf::from(home).join(".easymanage/releases/current"))
 }
 
 async fn reported_agent_mode(pool: &PgPool, node_id: Uuid) -> Result<bool, OperationsError> {
@@ -982,9 +982,9 @@ fn valid_username(username: &str) -> bool {
 
 fn valid_agent_home(path: &FsPath, username: &str) -> bool {
     let expected = if username == "root" {
-        PathBuf::from("/root/.local/share/easymanage")
+        PathBuf::from("/root/.easymanage")
     } else {
-        PathBuf::from(format!("/home/{username}/.local/share/easymanage"))
+        PathBuf::from(format!("/home/{username}/.easymanage"))
     };
     path == expected
         && path
@@ -1949,7 +1949,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let id = Uuid::new_v4();
         let base = json!({"node_id":id,"hostname":"base","host":"10.0.0.1","port":22,
-            "default_user":"tester","agent_home":"/home/tester/.local/share/easymanage",
+            "default_user":"tester","agent_home":"/home/tester/.easymanage",
             "known_hosts":"/tmp/fixture-known-hosts","agent_sha256":"a".repeat(64),"release_sha256":"b".repeat(64)});
         let path = root.join("targets.json");
         let overlay = root.join("managed-targets.json");
@@ -2014,7 +2014,7 @@ mod tests {
             host: "127.0.0.1".parse().unwrap(),
             port: 22,
             default_user: "tester".to_owned(),
-            agent_home: PathBuf::from("/home/tester/.local/share/easymanage"),
+            agent_home: PathBuf::from("/home/tester/.easymanage"),
             known_hosts: PathBuf::from("/tmp/fixture-known-hosts"),
             agent_sha256: Some("a".repeat(64)),
             server_url: None,
@@ -2103,14 +2103,14 @@ mod tests {
             assert!(!valid_username(username));
         }
         assert!(valid_agent_home(
-            FsPath::new("/home/tzr/.local/share/easymanage"),
+            FsPath::new("/home/tzr/.easymanage"),
             "tzr"
         ));
         for path in [
-            "/home/tzr/../root/.local/share/easymanage",
-            "/home/other/.local/share/easymanage",
+            "/home/tzr/../root/.easymanage",
+            "/home/other/.easymanage",
             "/tmp/easymanage",
-            "/home/tzr/.local/share/easymanage/child",
+            "/home/tzr/.easymanage/child",
         ] {
             assert!(!valid_agent_home(FsPath::new(path), "tzr"));
         }

@@ -24,11 +24,12 @@ impl ServerConfig {
         if let Some(path) = env::var_os("EASYMANAGE_ENV_FILE") {
             dotenvy::from_path(PathBuf::from(path)).context("cannot read EASYMANAGE_ENV_FILE")?;
         } else {
+            let managed_config = env::var_os("HOME").map(|home| PathBuf::from(home).join(".easymanage/config/server.env"));
             let user_config = env::var_os("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
                 .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
                 .map(|dir| dir.join("easymanage/server.env"));
-            if let Some(path) = user_config.filter(|path| path.is_file()) {
+            if let Some(path) = managed_config.filter(|path| path.is_file()).or_else(|| user_config.filter(|path| path.is_file())) {
                 load_environment_file(&path)?;
             } else if Path::new(SYSTEM_ENV_FILE).try_exists().unwrap_or(false) {
                 load_environment_file(Path::new(SYSTEM_ENV_FILE))?;

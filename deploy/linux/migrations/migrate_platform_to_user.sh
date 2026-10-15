@@ -12,7 +12,7 @@ operator_user="${EASYMANAGE_OPERATOR_USER:-$(stat -c %U "$project_root")}"
 }
 operator_home="$(getent passwd "$operator_user" | cut -d: -f6)"
 operator_uid="$(id -u "$operator_user")"
-user_base="$operator_home/.local/share/easymanage"
+user_base="$operator_home/.easymanage"
 [[ "$operator_home" =~ ^/home/[a-zA-Z0-9_.-]+$ && ! -L "$operator_home" && ! -L "$user_base" ]] || exit 64
 run_operator() {
   runuser -u "$operator_user" -- env XDG_RUNTIME_DIR="/run/user/$operator_uid" \
@@ -25,7 +25,7 @@ for file in /etc/easymanage/server.env /etc/easymanage/tls/ca.crt \
   [[ -f "$file" ]] || { printf 'Required handover input missing: %s\n' "$file" >&2; exit 1; }
 done
 local_bundle="$(/usr/bin/jq -er '.nodes[] | select(.ssh_target == "local") | .staging_directory' "$user_base/config/staging.json")"
-[[ "$local_bundle" =~ ^/tmp/easymanage-agent\.[a-zA-Z0-9_-]+$ && -f "$local_bundle/handover.sh" ]] || exit 64
+[[ ( "$local_bundle" =~ ^/tmp/easymanage-agent\.[a-zA-Z0-9_-]+$ || "$local_bundle" =~ ^"$user_base"/staging/agent\.[a-zA-Z0-9]{8}$ ) && -f "$local_bundle/handover.sh" ]] || exit 64
 if ! systemctl is-active --quiet easymanage-server.service && \
   run_operator systemctl --user is-active --quiet easymanage-server.service; then
   printf 'Controller is already running as the ordinary user; only completing Agent handover.\n'

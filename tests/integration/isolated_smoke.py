@@ -708,7 +708,7 @@ def smoke(args):
                 base_url = "https://127.0.0.1:58443"
                 registry = root / "targets.json"
                 registry.write_text(json.dumps({"targets": [{"node_id": node_id, "hostname": "isolated-smoke-node", "host": "198.51.100.1", "port": 22,
-                    "default_user": "smoke", "agent_home": "/home/smoke/.local/share/easymanage", "known_hosts": str(known_hosts),
+                    "default_user": "smoke", "agent_home": "/home/smoke/.easymanage", "known_hosts": str(known_hosts),
                     "agent_sha256": "a" * 64, "server_url": base_url, "ca_sha256": hashlib.sha256(ca_certificate.read_bytes()).hexdigest()}]}))
                 registry.chmod(0o600)
                 server_env = env | {"EASYMANAGE_ENV_FILE": str(empty_env), "DATABASE_URL": "postgresql://smoke@127.0.0.1:55432/easymanage_smoke",
@@ -719,7 +719,7 @@ def smoke(args):
                     if args.agent_binary is None:
                         raise RuntimeError("Machine onboarding tests require --agent-binary")
                     controller_home = root / "controller-home"
-                    candidate = controller_home / ".local/share/easymanage/releases/current/target/release/easymanage-agent"
+                    candidate = controller_home / ".easymanage/releases/current/target/release/easymanage-agent"
                     candidate.parent.mkdir(parents=True, mode=0o700)
                     shutil.copyfile(args.agent_binary, candidate)
                     candidate.chmod(0o700)

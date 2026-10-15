@@ -19,7 +19,7 @@ import urllib.request
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
-BASE = Path.home() / ".local/share/easymanage"
+BASE = Path.home() / ".easymanage"
 
 
 def default_inventory():
@@ -98,7 +98,7 @@ def node_preflight(node):
         actual_user, home = lines[-2:]
     if actual_user != node["user"] or not re.fullmatch(r"/home/[a-zA-Z0-9_.-]+", home):
         raise ValueError(f"SSH account/home mismatch for {node['hostname']}")
-    node["agent_home"] = home + "/.local/share/easymanage"
+    node["agent_home"] = home + "/.easymanage"
     return node
 
 
@@ -133,16 +133,19 @@ def create_bundle(directory, node, enrollment, server_url, ca):
 
 
 def stage(node, enrollment, server_url, ca, prepare, full_candidate=False):
-    with tempfile.TemporaryDirectory(prefix="easymanage-bundle-") as temporary:
+    staging = BASE / "staging"
+    staging.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.TemporaryDirectory(prefix="bundle-", dir=staging) as temporary:
         bundle = Path(temporary)
         create_bundle(bundle, node, enrollment, server_url, ca)
         if node["ssh_target"] == "local":
-            destination = Path(tempfile.mkdtemp(prefix="easymanage-agent."))
+            destination = staging / ("agent." + uuid.uuid4().hex[:8])
+            destination.mkdir(mode=0o700)
             for path in bundle.iterdir():
                 atomic_copy(path, destination / path.name, path.stat().st_mode & 0o777)
         else:
-            destination = remote(node["ssh_target"], "mktemp -d /tmp/easymanage-agent.XXXXXX", capture=True).stdout.strip()
-            if not re.fullmatch(r"/tmp/easymanage-agent\.[a-zA-Z0-9]+", destination):
+            destination = remote(node["ssh_target"], 'umask 077; test ! -L "$HOME/.easymanage"; test ! -L "$HOME/.easymanage/staging"; mkdir -p "$HOME/.easymanage/staging"; mktemp -d "$HOME/.easymanage/staging/agent.XXXXXXXX"', capture=True).stdout.strip()
+            if not re.fullmatch(re.escape(node["agent_home"]) + r"/staging/agent\.[a-zA-Z0-9]{8}", destination):
                 raise ValueError("Unsafe remote staging path")
             scp = ["scp", "-q", "-p", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
             if os.environ.get("EASYMANAGE_REMOTE_SSH_CONFIG"):

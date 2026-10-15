@@ -6,11 +6,11 @@ umask 0077
 operator_user="${1:?Existing ordinary SSH user}"
 [[ $EUID == 0 && "$operator_user" =~ ^[a-z_][a-z0-9_-]*$ && "$operator_user" != root ]] || exit 64
 bundle_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-[[ "$bundle_dir" =~ ^/tmp/easymanage-agent\.[a-zA-Z0-9_-]+$ ]] || exit 64
 operator_home="$(getent passwd "$operator_user" | cut -d: -f6)"
 operator_uid="$(id -u "$operator_user")"
 operator_group="$(id -gn "$operator_user")"
-agent_base="$operator_home/.local/share/easymanage"
+agent_base="$operator_home/.easymanage"
+[[ "$bundle_dir" =~ ^/tmp/easymanage-agent\.[a-zA-Z0-9_-]+$ || "$bundle_dir" =~ ^"$agent_base"/staging/agent\.[a-zA-Z0-9]{8}$ ]] || exit 64
 [[ "$operator_home" =~ ^/home/[a-zA-Z0-9_.-]+$ && "$operator_uid" != 0 ]] || exit 64
 assert_plain_path() {
   local item="$1"
@@ -75,7 +75,8 @@ unset enrollment_token
 (cd "$root_stage" && sha256sum easymanage-agent install-user-agent.sh install-full-candidate.sh migrate-agent-to-user.sh \
   handover.sh easymanage-agent.user.service node.json agent.env ca.crt > SHA256SUMS)
 verify_bundle "$root_stage"
-user_bundle="$(mktemp -d /tmp/easymanage-agent.XXXXXX)"
+install -d -o "$operator_user" -g "$operator_group" -m 0700 "$agent_base/staging"
+user_bundle="$(mktemp -d "$agent_base/staging/agent.XXXXXXXX")"
 # Keep the parent root-owned/private while populating it, then relinquish the whole bundle.
 for file in "${!verified_files[@]}" SHA256SUMS; do
   install -o "$operator_user" -g "$operator_group" -m 0600 "$root_stage/$file" "$user_bundle/$file"

@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 
 const USER_INSTALL: &str = include_str!("../../deploy/linux/user/install-user-agent.sh");
 const USER_UNIT: &str = include_str!("../../deploy/linux/user/easymanage-agent.user.service");
+const FULL_INSTALL: &str = include_str!("../../deploy/linux/operations/install-new-full-agent.sh");
 const JOB_TTL: Duration = Duration::from_mins(30);
 const MAX_PRIVATE_KEY_BYTES: usize = 12 * 1024;
 
@@ -91,6 +92,20 @@ enum AuthMethod {
     PrivateKey,
 }
 
+#[derive(Default, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DeploymentMode {
+    #[default]
+    Basic,
+    Full,
+}
+
+impl DeploymentMode {
+    fn name(self) -> &'static str {
+        match self { Self::Basic => "basic", Self::Full => "full" }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AddMachine {
@@ -100,6 +115,10 @@ struct AddMachine {
     server_url: String,
     fingerprint: String,
     username: String,
+    #[serde(default)]
+    deployment_mode: DeploymentMode,
+    #[serde(default, deserialize_with = "deserialize_secret")]
+    sudo_password: Zeroizing<String>,
     #[serde(default)]
     auth_method: AuthMethod,
     #[serde(default, deserialize_with = "deserialize_secret")]
@@ -111,7 +130,7 @@ struct AddMachine {
 }
 
 impl AddMachine {
-    fn clear_credentials(&mut self) {
+    fn clear_ssh_credentials(&mut self) {
         self.password.zeroize();
         self.private_key.zeroize();
         self.passphrase.zeroize();
@@ -123,6 +142,13 @@ impl AddMachine {
                 "SSH 鉴权参数不正确：请选择密码或私钥一种方式；私钥仅支持 OpenSSH/PEM，最大 12 KiB",
             )
         };
+        if self.sudo_password.len() > 1024
+            || self.sudo_password.bytes().any(|byte| b"\r\n\0".contains(&byte))
+            || (self.deployment_mode == DeploymentMode::Basic
+                && (self.username == "root" || !self.sudo_password.is_empty()))
+        {
+            return Err(OperationsError::bad_request("普通用户模式不能使用 root 或 sudo 凭据；管理员口令不能包含换行"));
+        }
         match self.auth_method {
             AuthMethod::Password => {
                 if self.password.is_empty()
@@ -179,7 +205,7 @@ fn authenticate(session: &Session, request: &mut AddMachine) -> Result<(), Opera
     };
     // Clear Rust-owned copies immediately on both success and failure. libssh2's
     // internal buffers / the TLS/JSON stack are outside this zeroization guarantee.
-    request.clear_credentials();
+    request.clear_ssh_credentials();
     result.map_err(|_| {
         OperationsError(
             StatusCode::UNAUTHORIZED,
@@ -376,22 +402,18 @@ async fn add(
     validate_label(&request.display_name, "")?;
     request.validate_authentication()?;
     if !valid_username(&request.username)
-        || request.username == "root"
         || !request
             .username
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
         || !valid_agent_home(
-            &PathBuf::from(format!(
-                "/home/{}/.local/share/easymanage",
-                request.username
-            )),
+            &deployment_home(&request.username).join(".easymanage"),
             &request.username,
         )
         || !valid_controller_url(&request.server_url)
     {
         return Err(OperationsError::bad_request(
-            "新增只支持普通用户 Basic Agent 和带端口的 HTTPS 平台地址",
+            "请使用有效 SSH 账户及带端口的 HTTPS 平台地址；普通用户 home 需为 /home/账户，root 为 /root",
         ));
     }
     check_parent(&state.registry)?;
@@ -448,11 +470,13 @@ async fn add(
     }
     let response = json!({"job_id":id,"job_key":key.as_str(),"node_id":id});
     let actor = request.username.clone();
+    let deployment_mode = request.deployment_mode;
     state.machines.event(
         id,
         0,
         "running",
-        "任务已创建；默认 Basic，不会执行 sudo 或降级现有 Full Agent",
+        if deployment_mode == DeploymentMode::Basic { "任务已创建；普通用户模式，所有安装文件位于 SSH 用户 home，不执行 sudo" }
+        else { "任务已创建；已选择首次安装管理员 Full Agent，将验证 root/sudo 权限" },
     );
     tokio::spawn(async move {
         let _permit = permit;
@@ -476,14 +500,14 @@ async fn add(
             Ok(Ok(())) => {
                 state
                     .machines
-                    .event(id, 100, "success", "已收到新 Agent 的 Basic 心跳，部署完成")
+                    .event(id, 100, "success", if deployment_mode == DeploymentMode::Basic { "已收到新 Agent 的 Basic 心跳，部署完成；后续可通过设备总览提权" } else { "已收到新 Agent 的 Full / UID 0 心跳，管理员部署完成" })
             }
             Ok(Err(error)) => state.machines.event(id, 100, "failed", error.1),
             Err(_) => state.machines.event(
                 id,
                 100,
                 "failed",
-                "部署任务异常；不推断已回滚，请核对目标用户服务与原节点身份",
+                "部署任务异常；不推断已回滚，请核对目标用户/系统服务与原节点身份",
             ),
         }
     });
@@ -572,7 +596,7 @@ fn command(session: &Session, invocation: &str) -> Result<String, OperationsErro
         .map_err(|_| OperationsError::ssh("远端通道中断"))?;
     if channel.exit_status().unwrap_or(1) != 0 {
         return Err(OperationsError::ssh(
-            "远端检查失败；需要 Linux、Python3、systemd 用户服务及已启用 linger",
+            "远端环境检查失败；请核对 Linux、Python3、systemd 及所选部署权限，Basic 还需用户 manager 与 linger",
         ));
     }
     String::from_utf8(output).map_err(|_| OperationsError::ssh("远端检查格式异常"))
@@ -675,6 +699,49 @@ fn upload(
     Ok(())
 }
 
+fn deployment_home(username: &str) -> PathBuf {
+    if username == "root" { PathBuf::from("/root") } else { PathBuf::from(format!("/home/{username}")) }
+}
+
+// Only fixed controller-owned scripts are executed as root. Secrets go over
+// channel stdin, never command arguments, remote files or job logs.
+fn admin_command(session: &Session, request: &AddMachine, invocation: &str) -> Result<(), OperationsError> {
+    let invocation = if request.username == "root" { invocation.to_owned() }
+        else { format!("/usr/bin/sudo -k -S -p '' {invocation}") };
+    let mut channel = session.channel_session().map_err(|_| OperationsError::ssh("管理员通道不可用"))?;
+    channel.handle_extended_data(ExtendedData::Merge).map_err(|_| OperationsError::ssh("管理员通道初始化失败"))?;
+    channel.exec(&invocation).map_err(|_| OperationsError::ssh("管理员操作启动失败"))?;
+    if request.username != "root" {
+        channel.write_all(request.sudo_password.as_bytes()).and_then(|()| channel.write_all(b"\n"))
+            .map_err(|_| OperationsError::ssh("sudo 认证提交失败"))?;
+    }
+    channel.send_eof().map_err(|_| OperationsError::ssh("管理员通道已中断"))?;
+    session.set_blocking(false);
+    let result = (|| {
+        let started = Instant::now();
+        let mut output = Zeroizing::new([0_u8; 4096]);
+        let mut total = 0;
+        loop {
+            if started.elapsed() > Duration::from_secs(100) { return Err(OperationsError::ssh("管理员安装超时；请核对目标服务及保留的恢复文件")); }
+            match channel.read(&mut *output) {
+                Ok(size) => total += size,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {},
+                Err(_) => return Err(OperationsError::ssh("管理员通道中断；请核对目标服务")),
+            }
+            if total > 64 * 1024 { return Err(OperationsError::ssh("管理员操作输出超过限制")); }
+            if channel.eof() { break; }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    })();
+    session.set_blocking(true);
+    session.set_timeout(10_000);
+    result?;
+    channel.wait_close().map_err(|_| OperationsError::ssh("管理员通道关闭失败"))?;
+    if channel.exit_status().unwrap_or(1) != 0 { return Err(OperationsError::ssh("管理员操作失败；请检查 root/sudo 授权、目标服务日志和恢复文件；凭据不会保存")); }
+    Ok(())
+}
+
 fn deploy(
     state: &OperationsState,
     id: Uuid,
@@ -693,29 +760,45 @@ fn deploy(
             "SSH 指纹与确认值不同；未进行身份鉴权，已停止部署",
         ));
     }
+    let mode = request.deployment_mode;
+    if mode == DeploymentMode::Full && request.username != "root" && request.sudo_password.is_empty()
+        && request.auth_method == AuthMethod::Password {
+        request.sudo_password = Zeroizing::new(request.password.to_string());
+    }
     authenticate(&session, &mut request)?;
     state.machines.event(
         id,
         10,
         "running",
-        "SSH 认证成功；检查普通用户身份、Linux 架构、systemd 与 linger",
+        if mode == DeploymentMode::Basic { "SSH 认证成功；检查普通用户身份、Linux 架构、systemd 与 linger" }
+        else { "SSH 认证成功；检查 Linux 架构和管理员 root/sudo 权限（Full 不依赖用户 linger）" },
     );
     let info = command(
         &session,
-        "/bin/bash --noprofile --norc -c 'set -eu; test \"$(uname -s)\" = Linux; test \"$(id -u)\" != 0; command -v python3 >/dev/null; command -v timeout >/dev/null; printf \"%s\\n\" \"$(id -un)\" \"$(getent passwd \"$(id -un)\" | cut -d: -f6)\" \"$(uname -m)\" \"$(id -u)\"; test \"$(loginctl show-user \"$(id -u)\" -p Linger --value)\" = yes; systemctl --user show-environment >/dev/null' ",
+        &format!("/bin/bash --noprofile --norc -c {}", shell_quote(&format!(
+            "set -eu; test \"$(uname -s)\" = Linux; command -v python3 >/dev/null; command -v timeout >/dev/null; printf '%s\\n' \"$(id -un)\" \"$(getent passwd \"$(id -un)\" | cut -d: -f6)\" \"$(uname -m)\" \"$(id -u)\"; {}",
+            if mode == DeploymentMode::Basic { "test \"$(id -u)\" != 0; test \"$(loginctl show-user \"$(id -u)\" -p Linger --value)\" = yes; systemctl --user show-environment >/dev/null" }
+            else { "systemctl show-environment >/dev/null" }
+        ))),
     )?;
     let fields: Vec<_> = info.lines().collect();
     if fields.len() != 4
         || fields[0] != request.username
-        || fields[1] != format!("/home/{}", request.username)
+        || PathBuf::from(fields[1]) != deployment_home(&request.username)
     {
         return Err(OperationsError::ssh(
-            "目标用户名/home 与请求不符；仅支持 /home/账户 布局",
+            "目标用户名/home 与请求不符；普通账户需 /home/账户，root 需 /root",
         ));
     }
     let uid: u32 = fields[3]
         .parse()
         .map_err(|_| OperationsError::ssh("目标 UID 不正确"))?;
+    if (mode == DeploymentMode::Basic && uid == 0) || (request.username == "root") != (uid == 0) {
+        return Err(OperationsError::ssh("目标 UID 与所选账户/部署权限不一致"));
+    }
+    if mode == DeploymentMode::Full {
+        admin_command(&session, &request, "/usr/bin/true")?;
+    }
     let binary_path = candidate()?;
     let binary = fs::read(&binary_path).map_err(|_| OperationsError::registry())?;
     let hash = hex::encode(Sha256::digest(&binary));
@@ -725,7 +808,9 @@ fn deploy(
         ));
     }
     // Refuse an existing Agent, even if stopped. Onboarding never reassigns its UUID.
-    command(&session,"/bin/bash --noprofile --norc -c 'set -eu; test \"$(systemctl show easymanage-agent.service -p LoadState --value)\" = not-found; test ! -d /var/lib/easymanage-agent; test ! -e /usr/local/sbin/easymanage-agent; test ! -d /etc/easymanage || test -x /etc/easymanage; test ! -e /etc/easymanage/agent.env; test ! -e \"$HOME/.local/share/easymanage/state/state.db\"; test ! -e \"$HOME/.local/share/easymanage/config/agent.env\"; test ! -e \"$HOME/.config/systemd/user/easymanage-agent.service\"' ")
+    command(&session, "test ! -e \"$HOME/.local/share/easymanage/config/agent.env\" && test ! -e \"$HOME/.local/share/easymanage/state/state.db\"")
+        .map_err(|_| OperationsError::bad_request("检测到旧用户目录 Agent 身份，请先迁移到 ~/.easymanage，不允许重复注册"))?;
+    command(&session,"/bin/bash --noprofile --norc -c 'set -eu; test \"$(systemctl show easymanage-agent.service -p LoadState --value)\" = not-found; test ! -d /var/lib/easymanage-agent; test ! -e /usr/local/sbin/easymanage-agent; test ! -d /etc/easymanage || test -x /etc/easymanage; test ! -e /etc/easymanage/agent.env; test ! -e \"$HOME/.easymanage/state/state.db\"; test ! -e \"$HOME/.easymanage/config/agent.env\"; test ! -e \"$HOME/.config/systemd/user/easymanage-agent.service\"' ")
         .map_err(|_|OperationsError::bad_request("目标已存在 Agent 配置、用户单元或身份库；请恢复/接管原节点，不允许覆盖安装"))?;
     let bootstrap = Zeroizing::new(format!(
         "{}{}",
@@ -748,7 +833,7 @@ fn deploy(
         "running",
         "已为新机器预留 ID；准备 Agent CA 与已核验的 SSH 公钥",
     );
-    let home = PathBuf::from(fields[1]).join(".local/share/easymanage");
+    let home = PathBuf::from(fields[1]).join(".easymanage");
     // Deploy the Agent's trusted CA, not the platform leaf certificate.
     let ca = agent_ca(state)?;
     let key_path = state
@@ -806,12 +891,14 @@ fn deploy(
     );
     let stage = command(
         &session,
-        "umask 077; mktemp -d /tmp/easymanage-agent.XXXXXXXX",
+        "umask 077; test ! -L \"$HOME/.easymanage\"; test ! -L \"$HOME/.easymanage/staging\"; mkdir -p \"$HOME/.easymanage/staging\"; chmod 700 \"$HOME/.easymanage\" \"$HOME/.easymanage/staging\"; mktemp -d \"$HOME/.easymanage/staging/agent.XXXXXXXX\"",
     )?
     .trim()
     .to_owned();
-    if !stage.starts_with("/tmp/easymanage-agent.")
-        || !stage["/tmp/easymanage-agent.".len()..]
+    let stage_prefix = format!("{}/.easymanage/staging/agent.", fields[1]);
+    if !stage.starts_with(&stage_prefix)
+        || stage[stage_prefix.len()..].len() != 8
+        || !stage[stage_prefix.len()..]
             .bytes()
             .all(|c| c.is_ascii_alphanumeric())
     {
@@ -862,31 +949,41 @@ fn deploy(
         id,
         60,
         "running",
-        "安装用户服务并启动 Basic Agent（不调用 sudo）",
+        if mode == DeploymentMode::Basic { "安装用户服务并启动 Basic Agent（所有文件位于 SSH 用户 home，不调用 sudo）" }
+        else { "以 root/sudo 安装系统服务并直接启动 Full Agent；不创建 Basic 用户服务" },
     );
     let invocation = format!(
         "/usr/bin/timeout --signal=TERM --kill-after=3s 90s /bin/bash {}",
         shell_quote(&format!("{stage}/install-user-agent.sh"))
     );
     session.set_timeout(100_000);
-    command(&session, &invocation).map_err(|_| {
+    if mode == DeploymentMode::Basic { command(&session, &invocation).map_err(|_| {
         OperationsError::ssh(
             "用户服务安装/启动失败；请检查 systemd 用户 manager、linger、目标日志与保留的暂存包",
         )
-    })?;
+    })?; } else {
+        let invocation = format!("/usr/bin/timeout --signal=TERM --kill-after=3s 90s /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -c {} -- {} {} {} {} {} {}",
+            shell_quote(FULL_INSTALL), shell_quote(&stage), shell_quote(&target.release_sha256.clone().unwrap_or_default()),
+            shell_quote(target.ca_sha256.as_deref().unwrap_or_default()), shell_quote(&hex::encode(Sha256::digest(env.as_bytes()))),
+            shell_quote(&id.to_string()), shell_quote(&request.server_url));
+        let result = admin_command(&session, &request, &invocation);
+        request.sudo_password.zeroize();
+        result?;
+    }
     target.agent_sha256 = target.release_sha256.clone();
     save_target(state, &target)?;
     state.machines.event(
         id,
         80,
         "running",
-        "用户服务已启动；等待平台收到真实 Basic 心跳，未确认前不标记成功",
+        if mode == DeploymentMode::Basic { "用户服务已启动；等待真实 Basic 心跳，未确认前不标记成功" }
+        else { "系统服务已启动；等待真实 Full / UID 0 心跳，未确认前不标记成功" },
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         let confirmed=handle.block_on(async {
-            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM nodes n JOIN metrics_latest m ON m.node_id=n.id WHERE n.id=$1 AND n.deleted_at IS NULL AND n.last_seen>NOW()-INTERVAL '30 seconds' AND m.metrics->'privilege'->>'mode'='basic' AND m.metrics->'privilege'->>'uid'=$2)")
-                .bind(id).bind(uid.to_string()).fetch_one(&state.pool).await
+            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM nodes n JOIN metrics_latest m ON m.node_id=n.id WHERE n.id=$1 AND n.deleted_at IS NULL AND n.last_seen>NOW()-INTERVAL '30 seconds' AND m.metrics->'privilege'->>'mode'=$2 AND m.metrics->'privilege'->>'uid'=$3)")
+                .bind(id).bind(mode.name()).bind(if mode == DeploymentMode::Basic { uid.to_string() } else { "0".to_owned() }).fetch_one(&state.pool).await
         }).unwrap_or(false);
         if confirmed {
             // Remove only the exact seven files uploaded above, never recursive cleanup.
@@ -900,7 +997,7 @@ fn deploy(
                     id,
                     95,
                     "running",
-                    "心跳已确认，但暂存包清理未完成；请管理员核对该目标 /tmp 中的私有暂存包",
+                    "心跳已确认，但暂存包清理未完成；请核对该 SSH 用户 home 中的私有暂存包",
                 );
             }
             return Ok(());
@@ -1108,6 +1205,7 @@ mod tests {
     fn password_legacy_default_and_private_key_requests_are_supported() {
         let request = authentication_request(json!({"password":"fixture-only"}));
         assert!(request.auth_method == AuthMethod::Password);
+        assert!(request.deployment_mode == DeploymentMode::Basic);
         assert!(request.validate_authentication().is_ok());
         for kind in [
             "OPENSSH PRIVATE KEY",
@@ -1139,11 +1237,27 @@ mod tests {
     }
 
     #[test]
+    fn deployment_modes_and_sudo_credentials_are_explicit() {
+        for fields in [json!({"username":"root","password":"fixture-only"}),
+            json!({"password":"fixture-only","sudo_password":"fixture-only"}),
+            json!({"deployment_mode":"full","password":"fixture-only","sudo_password":"fixture\nsecret"})] {
+            assert!(authentication_request(fields).validate_authentication().is_err());
+        }
+        for username in ["tester", "root"] {
+            let request = authentication_request(json!({"deployment_mode":"full","username":username,"password":"fixture-only"}));
+            assert!(request.validate_authentication().is_ok());
+            assert!(request.deployment_mode == DeploymentMode::Full);
+            assert!(valid_agent_home(&deployment_home(username).join(".easymanage"), username));
+        }
+        assert!(serde_json::from_value::<AddMachine>(json!({"deployment_mode":"unknown"})).is_err());
+    }
+
+    #[test]
     fn owned_credentials_are_cleared_together() {
         let mut request = authentication_request(
             json!({"password":"fixture-only","private_key":"fixture-only","passphrase":"fixture-only"}),
         );
-        request.clear_credentials();
+        request.clear_ssh_credentials();
         assert!(
             request.password.is_empty()
                 && request.private_key.is_empty()

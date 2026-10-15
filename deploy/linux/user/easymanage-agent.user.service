@@ -4,10 +4,10 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/.local/share/easymanage
-Environment=EASYMANAGE_ENV_FILE=%h/.local/share/easymanage/config/agent.env
+WorkingDirectory=%h/.easymanage
+Environment=EASYMANAGE_ENV_FILE=%h/.easymanage/config/agent.env
 Environment=EASYMANAGE_ADMIN_POLICY=warn
-ExecStart=%h/.local/share/easymanage/bin/easymanage-agent
+ExecStart=%h/.easymanage/bin/easymanage-agent
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=20

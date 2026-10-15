@@ -32,7 +32,7 @@ if name == 'systemctl':
     if command == 'show':
         field = args[args.index('-p')+1]
         value = {'LoadState':'loaded', 'User':'root', 'ActiveState':'failed' if case == 'full-failed' else 'inactive',
-            'ExecStart':'{ path=/home/tester/.local/share/easymanage/bin/easymanage-server ; argv[]=fixture ; }'}[field]
+            'ExecStart':'{ path=/home/tester/.easymanage/bin/easymanage-server ; argv[]=fixture ; }'}[field]
         if case == 'wrong-user' and field == 'User': value = 'other'
         if case == 'wrong-platform' and field == 'ExecStart': value = 'foreign binary'
         print(value); sys.exit(0)

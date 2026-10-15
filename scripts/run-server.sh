@@ -30,7 +30,7 @@ case "${1:-}" in
     pnpm --dir "$project_root/web" build
     pnpm --dir "$project_root/docs" install --frozen-lockfile --ignore-scripts
     pnpm --dir "$project_root/docs" build
-    if [[ -f "${HOME:?}/.local/share/easymanage/config/targets.json" ]]; then
+    if [[ -f "${HOME:?}/.easymanage/config/targets.json" ]]; then
       if ! python3 "$project_root/deploy/linux/operations/platform-release.py" publish --source "$project_root"; then
         printf '%s\n' 'Platform candidate was not published; check owner/ancestor permissions. Agent publication continues.' >&2
       fi
@@ -48,6 +48,6 @@ case "${1:-}" in
 esac
 binary_path="$project_root/target/release/easymanage-server"
 [[ -x "$binary_path" ]] || { printf 'Run ./scripts/run-server.sh --build first.\n' >&2; exit 1; }
-user_env="${HOME:?}/.local/share/easymanage/config/server.env"
+user_env="${HOME:?}/.easymanage/config/server.env"
 if [[ -r "$user_env" ]]; then export EASYMANAGE_ENV_FILE="${EASYMANAGE_ENV_FILE:-$user_env}"; fi
 exec "$binary_path"

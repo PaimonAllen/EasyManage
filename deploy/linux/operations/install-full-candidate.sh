@@ -5,10 +5,10 @@ set -Eeuo pipefail
 umask 0077
 (( EUID != 0 )) || exit 64
 bundle_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-[[ "$bundle_dir" =~ ^/tmp/easymanage-agent\.[a-zA-Z0-9_-]+$ ]] || exit 64
 account="$(id -un)"
 account_home="$(getent passwd "$account" | cut -d: -f6)"
-agent_base="$account_home/.local/share/easymanage"
+agent_base="$account_home/.easymanage"
+[[ "$bundle_dir" =~ ^/tmp/easymanage-agent\.[a-zA-Z0-9_-]+$ || "$bundle_dir" =~ ^"$agent_base"/staging/agent\.[a-zA-Z0-9]{8}$ ]] || exit 64
 [[ "$account" =~ ^[a-z_][a-z0-9_-]*$ && "$account_home" == "/home/$account" ]] || exit 64
 for path in "$bundle_dir/easymanage-agent" "$bundle_dir/SHA256SUMS" "$agent_base/bin/easymanage-agent"; do
   cursor="$path"

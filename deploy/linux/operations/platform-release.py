@@ -22,7 +22,7 @@ import time
 import urllib.request
 import uuid
 
-BASE = Path.home() / ".local/share/easymanage"
+BASE = Path.home() / ".easymanage"
 MAX_FILES = 20000
 MAX_BYTES = 512 * 1024 * 1024
 

@@ -15,7 +15,7 @@
 - `windows/`、`macos/`：原生安装与权限适配的接入清单，不表示已支持。
 - `local/`：Git 忽略的本机清单和私有配置，不随项目发布。
 
-系统级配置位于 `/etc/easymanage/`，二进制在 `/usr/local/sbin/`，Server 静态文件在 `/opt/easymanage/web/`，Agent SQLite 在 `/var/lib/easymanage-agent/`。普通用户的资产位于 `~/.local/share/easymanage/`，单元位于 `~/.config/systemd/user/`。目录整理不意味着迁移运行中的服务。Server 的运行模式和 Agent 的权限独立：用户 Server 可以管理 Full Agent。
+系统级配置位于 `/etc/easymanage/`，二进制在 `/usr/local/sbin/`，Server 静态文件在 `/opt/easymanage/web/`，Agent SQLite 在 `/var/lib/easymanage-agent/`。普通用户的资产位于 `~/.easymanage/`，单元位于 `~/.config/systemd/user/`。目录整理不意味着迁移运行中的服务。Server 的运行模式和 Agent 的权限独立：用户 Server 可以管理 Full Agent。
 
 `orchestration/fleet.py` 是可信 SSH 编排入口，构建脚本和 Agent 管理页面已同步引用。它能发布/暂存 Full 候选版本，也支持用户部署；不是仅支持 Basic 的部署器。已启用的 Full Agent 不通过普通用户更新路径降权，离线/失败的 Full 服务仍需管理员认证处理。新版 Server 优先新入口，同时兼容旧已发布包中的 `deploy/linux/fleet.py`。新发布写入新布局，但不自动删除已发布包的历史文件；本次整理不修改正在运行的包。
 

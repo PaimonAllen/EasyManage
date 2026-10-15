@@ -10,7 +10,7 @@ expected_node="${2:-}"
 operator_uid="$(id -u "$operator_user")"
 operator_home="$(getent passwd "$operator_user" | cut -d: -f6)"
 [[ "$operator_home" =~ ^/home/[a-zA-Z0-9_.-]+$ && "$operator_uid" != 0 ]] || exit 64
-agent_base="$operator_home/.local/share/easymanage"
+agent_base="$operator_home/.easymanage"
 assert_plain_path() {
   local item="$1"
   while [[ "$item" != / && "$item" != . ]]; do

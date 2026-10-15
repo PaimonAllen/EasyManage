@@ -88,7 +88,7 @@ class FleetTests(unittest.TestCase):
                 path.write_text("isolated fixture, never executed")
             ca = root / "ca.crt"
             ca.write_text("isolated CA fixture")
-            node = self.node() | {"agent_home": "/home/tester/.local/share/easymanage"}
+            node = self.node() | {"agent_home": "/home/tester/.easymanage"}
             with patch.object(fleet, "ROOT", source):
                 fleet.create_bundle(bundle, node, "a" * 64, "https://192.0.2.10:8443", ca)
             expected = {p.name for p in bundle.iterdir() if p.name != "SHA256SUMS"}

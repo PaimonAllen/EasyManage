@@ -1,6 +1,6 @@
 import type { LiveNodeListResponse, NodeListResponse, NodeMetricHistory, PermissionCheck, PlatformProcessMetric, PlatformStorageMetric } from "../types/monitoring";
 import type { CollectionPolicy } from "../types/monitoring";
-import { serializeMachineRequest, type MachineAuthentication } from "../lib/machineAuthentication";
+import { serializeMachineRequest, type MachineAuthentication, type MachineDeploymentMode } from "../lib/machineAuthentication";
 
 export interface CollectionSettingsStatus {
   policy: CollectionPolicy;
@@ -71,7 +71,7 @@ export async function probeMachine(host: string, port: number): Promise<{fingerp
   return readResponse(await fetch("/api/v1/machines/probe", { method: "POST", headers: {"Content-Type":"application/json"},
     body: JSON.stringify({host, port}), cache:"no-store", signal:AbortSignal.timeout(30_000) }));
 }
-export async function addMachine(request: {host: string; port: number; display_name: string; server_url: string; fingerprint: string; username: string} & MachineAuthentication): Promise<{job_id: string; job_key: string; node_id: string}> {
+export async function addMachine(request: {host: string; port: number; display_name: string; server_url: string; fingerprint: string; username: string; deployment_mode?: MachineDeploymentMode} & MachineAuthentication): Promise<{job_id: string; job_key: string; node_id: string}> {
   const body = serializeMachineRequest(request);
   return readResponse(await fetch("/api/v1/machines", { method:"POST", headers:{"Content-Type":"application/json"},
     body, cache:"no-store", signal:AbortSignal.timeout(20_000) }));

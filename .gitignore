@@ -48,6 +48,8 @@ Password
 /vendor_projects/
 
 # Platform / Agent runtime configuration and state (not public *.example.json)
+.easymanage/
+.easymanage-migration.*/
 targets.json
 staging.json
 managed-targets.json

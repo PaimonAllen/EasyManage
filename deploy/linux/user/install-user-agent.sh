@@ -11,8 +11,8 @@ operator_user="$(id -un)"
 operator_home="$(getent passwd "$operator_user" | cut -d: -f6)"
 [[ "$operator_home" =~ ^/home/[a-zA-Z0-9_.-]+$ && "${HOME:?}" == "$operator_home" ]] || exit 64
 bundle_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-[[ "$bundle_dir" =~ ^/tmp/easymanage-agent\.[a-zA-Z0-9_-]+$ ]] || exit 64
-agent_base="$operator_home/.local/share/easymanage"
+[[ "$bundle_dir" =~ ^/tmp/easymanage-agent\.[a-zA-Z0-9_-]+$ || "$bundle_dir" =~ ^"$operator_home"/\.easymanage/staging/agent\.[a-zA-Z0-9]{8}$ ]] || exit 64
+agent_base="$operator_home/.easymanage"
 unit_path="$operator_home/.config/systemd/user/easymanage-agent.service"
 assert_plain_path() {
   local item="$1"

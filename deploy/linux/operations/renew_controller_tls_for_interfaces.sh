@@ -21,7 +21,7 @@ operator_home="$(getent passwd "$operator_user" | cut -d: -f6)"
 operator_uid="$(id -u "$operator_user")"
 operator_gid="$(id -g "$operator_user")"
 [[ "$operator_home" =~ ^/home/[a-zA-Z0-9_.-]+$ && ! -L "$operator_home" ]] || exit 64
-user_config="$operator_home/.local/share/easymanage/config"
+user_config="$operator_home/.easymanage/config"
 [[ -d "$user_config" && ! -L "$user_config" ]] || exit 64
 for file in "$user_config/server.crt" "$user_config/server.key" "$user_config/ca.crt"; do
   [[ -f "$file" && ! -L "$file" ]] || { printf 'Missing or unsafe file: %s\n' "$file" >&2; exit 1; }

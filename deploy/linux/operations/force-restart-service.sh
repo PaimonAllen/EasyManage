@@ -26,7 +26,7 @@ force_restart() {
 if [[ "$action" == platform ]]; then
     unit=easymanage-server.service
     [[ "$(user_ctl show "$unit" -p LoadState --value)" == loaded ]] || exit 3
-    expected="/home/$owner/.local/share/easymanage/bin/easymanage-server"
+    expected="/home/$owner/.easymanage/bin/easymanage-server"
     exec_start=$(user_ctl show "$unit" -p ExecStart --value)
     [[ "$exec_start" == *"path=$expected ;"* ]] || exit 3
     # Run from the system manager, outside the platform's own cgroup/SSH request.

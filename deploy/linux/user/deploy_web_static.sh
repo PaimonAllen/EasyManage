@@ -6,7 +6,7 @@ set -Eeuo pipefail
 operator_user="$(id -un)"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 bundle="$script_dir/../../../web/dist"
-user_base="${HOME:?}/.local/share/easymanage"
+user_base="${HOME:?}/.easymanage"
 destination="$user_base/web"
 ca="$user_base/config/ca.crt"
 url="${EASYMANAGE_PLATFORM_URL:-https://127.0.0.1:8443}"

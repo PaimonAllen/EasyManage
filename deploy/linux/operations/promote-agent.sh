@@ -19,7 +19,7 @@ expected_ca="${6,,}"
 started_seconds=$SECONDS
 operator_home="$(getent passwd "$operator_user" | cut -d: -f6)"
 operator_uid="$(id -u "$operator_user")"
-[[ "$operator_home" == "/home/$operator_user" && "$agent_base" == "$operator_home/.local/share/easymanage" ]] || exit 64
+[[ "$operator_home" == "/home/$operator_user" && "$agent_base" == "$operator_home/.easymanage" ]] || exit 64
 
 die() { printf '%s\n' "$1" >&2; exit 1; }
 no_symlink_chain() {

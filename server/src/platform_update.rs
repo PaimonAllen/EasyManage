@@ -59,7 +59,7 @@ env_args=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="/home/$owner"
     XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus")
 user_ctl() { /usr/sbin/runuser -u "$owner" -- "${env_args[@]}" /usr/bin/systemctl --user "$@"; }
 [[ "$(user_ctl show easymanage-server.service -p LoadState --value)" == loaded ]] || exit 3
-expected="/home/$owner/.local/share/easymanage/bin/easymanage-server"
+expected="/home/$owner/.easymanage/bin/easymanage-server"
 [[ "$(user_ctl show easymanage-server.service -p ExecStart --value)" == *"path=$expected ;"* ]] || exit 3
 user_ctl is-active --quiet easymanage-server.service
 /usr/sbin/runuser -u "$owner" -- "${env_args[@]}" /usr/bin/python3 -c "$code" check --sha256 "$sha"

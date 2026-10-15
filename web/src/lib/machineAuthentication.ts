@@ -1,11 +1,13 @@
 export type MachineAuthMethod = "password" | "private_key";
-export type MachineAuthentication =
+export type MachineDeploymentMode = "basic" | "full";
+export type MachineAuthentication = {sudo_password?: string} & (
   | {auth_method: "password"; password: string}
-  | {auth_method: "private_key"; private_key: string; passphrase: string};
+  | {auth_method: "private_key"; private_key: string; passphrase: string});
 
 export const MAX_PRIVATE_KEY_BYTES = 12 * 1024;
 
 export function clearMachineAuthentication(value: MachineAuthentication): void {
+  if ("sudo_password" in value) value.sudo_password = "";
   if (value.auth_method === "password") value.password = "";
   else { value.private_key = ""; value.passphrase = ""; }
 }

@@ -27,7 +27,7 @@ if name=='systemd-run': sys.exit(1 if case=='already-scheduled' else 0)
 if name=='systemctl':
     if 'show' in args:
         field=args[args.index('-p')+1]
-        print('loaded' if field=='LoadState' else ('foreign' if case=='wrong-unit' else '{ path=/home/tester/.local/share/easymanage/bin/easymanage-server ; argv[]=fixture ; }'))
+        print('loaded' if field=='LoadState' else ('foreign' if case=='wrong-unit' else '{ path=/home/tester/.easymanage/bin/easymanage-server ; argv[]=fixture ; }'))
     sys.exit(0)
 sys.exit(1)
 '''

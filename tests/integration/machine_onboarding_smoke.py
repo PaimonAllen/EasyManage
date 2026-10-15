@@ -60,7 +60,7 @@ if action=="is-active":
 if action=="enable": (runtime/"enabled").write_text("yes")
 if action=="disable": (runtime/"enabled").unlink(missing_ok=True)
 if action=="restart":
-    base=pathlib.Path(os.environ["HOME"])/".local/share/easymanage"
+    base=pathlib.Path(os.environ["HOME"])/".easymanage"
     values=dict(line.split("=",1) for line in (base/"config/agent.env").read_text().splitlines() if "=" in line)
     env=os.environ|values|{"EASYMANAGE_ENV_FILE":str(base/"config/agent.env"),"RUST_LOG":"warn"}
     log=(runtime/"agent.log").open("ab")
@@ -88,6 +88,8 @@ sys.exit(0)
     failure = threading.Event()
     collision = threading.Event()
     attempts = []
+    sudo_checks = []
+    allow_full = threading.Event()
     stages = set()
     errors = []
     ssh_env = environment | {"HOME": str(home), "USER": current.pw_name,
@@ -122,13 +124,68 @@ sys.exit(0)
             elif "loginctl show-user" in command:
                 result = 1 if failure.is_set() else 0
                 if not result: channel.sendall(f"{current.pw_name}\n{home}\n{os.uname().machine}\n{os.getuid()}\n".encode())
+            elif "systemctl show-environment" in command:
+                channel.sendall(f"{current.pw_name}\n{home}\n{os.uname().machine}\n{os.getuid()}\n".encode()); result=0
+            elif command == "/usr/bin/sudo -k -S -p '' /usr/bin/true":
+                submitted=bytearray()
+                while not submitted.endswith(b"\n"):
+                    data=channel.recv(1024)
+                    if not data: break
+                    submitted.extend(data)
+                sudo_checks.append(secrets.compare_digest(submitted.rstrip(b"\n"),password.encode()))
+                for index in range(len(submitted)): submitted[index]=0
+                result=0 if allow_full.is_set() else 1  # No host sudo/systemd.
+            elif command.startswith('test ! -e "$HOME/.local/share/easymanage/'):
+                result=0
             elif "test ! -e /etc/easymanage/agent.env" in command:
                 result=1 if collision.is_set() else 0
-            elif "mktemp -d /tmp/easymanage-agent." in command:
-                import tempfile
-                stage=Path(tempfile.mkdtemp(prefix="easymanage-agent.",dir="/tmp"))
+            elif 'mktemp -d "$HOME/.easymanage/staging/agent.' in command:
+                stage=home/".easymanage/staging"/("agent."+secrets.token_hex(4))
+                stage.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+                stage.mkdir(mode=0o700)
                 stages.add(stage)
                 channel.sendall((str(stage)+"\n").encode()); result=0
+            elif command.startswith("/usr/bin/sudo -k -S -p '' /usr/bin/timeout"):
+                # Execute the actual fixed Full installer as namespace-root,
+                # sharing only the already-isolated loopback for a real Agent.
+                # No sudo or production systemd is ever executed by this fixture.
+                submitted=bytearray()
+                while not submitted.endswith(b"\n"):
+                    data=channel.recv(1024)
+                    if not data: break
+                    submitted.extend(data)
+                if not secrets.compare_digest(submitted.rstrip(b"\n"),password.encode()): raise RuntimeError("Fixture sudo authentication failed")
+                for index in range(len(submitted)): submitted[index]=0
+                tokens=shlex.split(command)
+                invocation=tokens[tokens.index("/usr/bin/timeout"):]
+                source_stage=Path(tokens[tokens.index("--")+1])
+                full=mock/"full"
+                full.mkdir(mode=0o700)
+                (full/"systemctl").write_text('''#!/usr/bin/python3
+import os,pathlib,subprocess,sys
+root=pathlib.Path('/tmp/full-fixture')
+args=sys.argv[1:]
+if 'show' in args: print('not-found')
+if 'start' in args:
+ env=os.environ|{'EASYMANAGE_ENV_FILE':'/etc/easymanage/agent.env','EASYMANAGE_ADMIN_POLICY':'require','RUST_LOG':'warn'}
+ log=(root/'agent.log').open('ab')
+ subprocess.Popen(['/usr/local/sbin/easymanage-agent'],env=env,stdout=log,stderr=subprocess.STDOUT)
+sys.exit(0)
+''')
+                (full/"systemctl").chmod(0o700)
+                log=(full/"installer.log").open("ab")
+                runner="import subprocess,sys,time; r=subprocess.run(sys.argv[1:]); time.sleep(8 if r.returncode==0 else 0); sys.exit(r.returncode)"
+                result=subprocess.run(["bwrap","--unshare-user","--unshare-pid","--unshare-ipc","--unshare-uts","--die-with-parent","--uid","0",
+                    "--ro-bind","/","/","--dev","/dev","--proc","/proc","--tmpfs","/usr",
+                    "--ro-bind","/usr/bin","/usr/bin","--ro-bind","/usr/lib","/usr/lib","--ro-bind","/usr/lib64","/usr/lib64",
+                    "--dir","/usr/local/sbin","--ro-bind",str(full/"systemctl"),"/usr/bin/systemctl",
+                    "--tmpfs","/var","--dir","/var/lib","--tmpfs","/etc","--dir","/etc/systemd/system",
+                    "--tmpfs","/run","--tmpfs","/home","--tmpfs","/root","--tmpfs","/tmp",
+                    "--dir","/tmp/full-fixture","--bind",str(full),"/tmp/full-fixture",
+                    "--ro-bind",str(source_stage),str(source_stage),
+                    "/usr/bin/python3","-c",runner,*invocation],stdout=log,stderr=subprocess.STDOUT,timeout=100).returncode
+                log.close()
+                channel.sendall(b"namespace Full installer finished\n")
             elif "/bin/bash" in command and "install-user-agent.sh" in command:
                 log=(runtime/"installer.log").open("ab")
                 result=subprocess.run(shlex.split(command),env=ssh_env,stdout=log,stderr=subprocess.STDOUT,timeout=100).returncode
@@ -221,6 +278,14 @@ sys.exit(0)
                     label+" is rejected without uploading or persisting a key")
             require(key_phrase not in json.dumps(result) and ed_private not in json.dumps(result),"SSH key errors do not expose key material or passphrases")
         failure.clear()
+        require(request("/api/v1/machines",payload|{"username":"root"})[0]==400,
+                "Basic mode rejects root before any deployment")
+        for credentials in [payload,key_payload|{"sudo_password":password}]:
+            status,created=request("/api/v1/machines",credentials|{"deployment_mode":"full"})
+            result=wait_job(created) if status==200 else None
+            require(result and result["status"]=="failed" and not any("已上传" in e["message"] for e in result["events"]),
+                    "Full first deployment verifies sudo before files/identity; refusal cannot become Basic fallback")
+        require(sudo_checks==[True,True],"SSH password reuse and explicit key-login sudo password travel only through SSH stdin")
         status,created=request("/api/v1/machines",key_payload)
         require(status==200,"encrypted OpenSSH Ed25519 onboarding returns a bounded background deployment task")
         require(request("/api/v1/machines/jobs/"+created["job_id"])[0]==401,"deployment logs require their per-job capability")
@@ -229,11 +294,12 @@ sys.exit(0)
             # Workflow messages are public/sanitized. Never print installer/Agent logs.
             print("DIAGNOSTIC onboarding:", [event["message"] for event in job["events"]], "fixture errors:",errors,flush=True)
         require(job["status"]=="success","real SCP, checksum installer and actual Basic heartbeat complete onboarding")
-        values=dict(line.split("=",1) for line in (home/".local/share/easymanage/config/agent.env").read_text().splitlines() if "=" in line)
+        require(all(stage.parent==home/".easymanage/staging" for stage in stages),"all Basic deployment staging stays inside the SSH user's ~/.easymanage")
+        values=dict(line.split("=",1) for line in (home/".easymanage/config/agent.env").read_text().splitlines() if "=" in line)
         require(values["EASYMANAGE_ENROLLMENT_TOKEN"]!=enrollment,"target receives only a scoped token, never the platform enrollment secret")
         require(all(secret not in json.dumps(job) for secret in [password,key_phrase,ed_private,values["EASYMANAGE_ENROLLMENT_TOKEN"]]),"deployment progress/logs exclude passwords, private keys, passphrases and enrollment secrets")
         sensitive=[password.encode(),key_phrase.encode(),ed_private.encode(),plain_output.getvalue().encode(),encrypted_output.getvalue().encode()]
-        installed=home/".local/share/easymanage"
+        installed=home/".easymanage"
         files=[p for p in installed.rglob("*") if p.is_file() and p.stat().st_size<2*1024*1024]
         files.extend(root.glob("*.log"))
         files.extend(root.glob("*.json"))
@@ -248,7 +314,7 @@ sys.exit(0)
         scoped=values["EASYMANAGE_ENROLLMENT_TOKEN"]
         enroll={"protocol_version":1,"requested_node_id":node_id,"agent_version":"0.5.0","inventory":real_node}
         require(request("/api/v1/agent/enroll",enroll,{"x-easymanage-enrollment-token":scoped})[0]==401,"single-node onboarding token cannot be reused after enrollment")
-        with sqlite3.connect("file:"+str(home/".local/share/easymanage/state/state.db")+"?mode=ro",uri=True) as db:
+        with sqlite3.connect("file:"+str(home/".easymanage/state/state.db")+"?mode=ro",uri=True) as db:
             identity_before=dict(db.execute("SELECT key,value FROM metadata WHERE key IN ('node_id','agent_token')"))
         change={"username":current.pw_name,"password":password,"auth_scope":"target","confirmation":node_id,"display_name":"Renamed SSH fixture","note":"fixture note"}
         require(request(f"/api/v1/machines/{node_id}/manage",change|{"action":"delete","password":"wrong"})[0]==401,"soft deletion requires successful SSH authentication")
@@ -256,7 +322,7 @@ sys.exit(0)
         require(request(f"/api/v1/machines/{node_id}/manage",change|{"action":"delete"})[0]==200,"SSH-authenticated deletion is soft, not a remote uninstall")
         _,listing=request("/api/v1/nodes")
         require(not any(node["id"]==node_id for node in listing["nodes"]),"soft-deleted node is hidden from current monitoring")
-        require((home/".local/share/easymanage/state/state.db").is_file(),"soft deletion retains the target's SQLite identity and Agent files")
+        require((home/".easymanage/state/state.db").is_file(),"soft deletion retains the target's SQLite identity and Agent files")
         require(request("/api/v1/agent/enroll",enroll,{"x-easymanage-enrollment-token":enrollment})[0]==401,"even the historical global enroll secret cannot resurrect a soft-deleted UUID")
         _,history=request(f"/api/v1/nodes/{node_id}/history")
         require(bool(history["points"]),"soft deletion preserves historical metrics")
@@ -269,7 +335,7 @@ sys.exit(0)
             if any(node["id"]==node_id and node["online"] and node["hostname"]=="Renamed SSH fixture" for node in listing["nodes"]): break
             time.sleep(0.25)
         require(any(node["id"]==node_id and node["hostname"]=="Renamed SSH fixture" for node in listing["nodes"]),"restored machine keeps its display name and original UUID")
-        with sqlite3.connect("file:"+str(home/".local/share/easymanage/state/state.db")+"?mode=ro",uri=True) as db:
+        with sqlite3.connect("file:"+str(home/".easymanage/state/state.db")+"?mode=ro",uri=True) as db:
             identity_after=dict(db.execute("SELECT key,value FROM metadata WHERE key IN ('node_id','agent_token')"))
         require(identity_after==identity_before,"restore preserves the exact SQLite identity and original Agent credential")
         collision.set()
@@ -281,6 +347,18 @@ sys.exit(0)
         failure.set()
         status,failed=request("/api/v1/machines",payload|{"host":"10.222.0.10"})
         require(status==200 and wait_job(failed)["status"]=="failed","missing user-service/linger prerequisites fail instead of reporting deployment success")
+        failure.clear()
+        allow_full.set()
+        status,full_created=request("/api/v1/machines",key_payload|{"host":"10.222.0.10","deployment_mode":"full","sudo_password":password})
+        full_job=wait_job(full_created) if status==200 else None
+        if not full_job or full_job["status"]!="success":
+            print("DIAGNOSTIC Full onboarding:",status,[event["message"] for event in (full_job or {}).get("events",[])],"fixture errors:",errors,flush=True)
+        require(full_job and full_job["status"]=="success","first Full SSH deployment runs fixed installer and confirms real namespace-root Agent heartbeat without Basic/linger")
+        _,listing=request("/api/v1/nodes")
+        full_node=next(node for node in listing["nodes"] if node["id"]==full_created["node_id"])
+        require(full_node["metrics"]["privilege"]["uid"]==0 and full_node["metrics"]["privilege"]["mode"]=="full",
+                "Full deployment success requires the selected privilege and UID 0, not a Basic heartbeat")
+        require(all(secret not in json.dumps(full_job) for secret in (password,key_phrase,ed_private)),"Full deployment logs exclude SSH keys, sudo passwords and private-key passphrases")
     finally:
         alive.clear();listener.close()
         for transport in transports: transport.close()
