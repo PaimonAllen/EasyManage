@@ -1,0 +1,890 @@
+use crate::config::ServerConfig;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use chrono::{DateTime, Duration, Utc};
+use easymanage_protocol::{
+    AGENT_TOKEN_HEADER, AgentLiveReport, AgentReport, AgentReportResponse, ENROLLMENT_TOKEN_HEADER,
+    EnrollmentRequest, EnrollmentResponse, ErrorResponse, GpuMetric, HealthResponse, LiveNode,
+    LiveNodeListResponse, MetricsSnapshot, NodeListResponse, NodeSummary, PROTOCOL_VERSION,
+};
+use serde::Serialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use sqlx::postgres::PgRow;
+use sqlx::{PgPool, Row};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use subtle::ConstantTimeEq;
+use tokio::sync::RwLock;
+use tower_http::compression::CompressionLayer;
+use tower_http::services::{ServeDir, ServeFile};
+use tower_http::trace::TraceLayer;
+use tracing::{info, warn};
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub config: Arc<ServerConfig>,
+    pub live: Arc<RwLock<HashMap<Uuid, LiveNode>>>,
+    pub collection: crate::collection_settings::CollectionSettings,
+}
+
+pub fn router(state: AppState) -> Router {
+    let index = state.config.web_root.join("index.html");
+    let static_files =
+        ServeDir::new(&state.config.web_root).not_found_service(ServeFile::new(index));
+
+    Router::new()
+        .route("/api/v1/health/live", get(live))
+        .route("/api/v1/health/ready", get(ready))
+        .route("/api/v1/nodes", get(list_nodes))
+        .route("/api/v1/nodes/live", get(list_live_nodes))
+        .route("/api/v1/nodes/{node_id}/history", get(node_history))
+        .route("/api/v1/platform", get(platform))
+        .route("/api/v1/agent/enroll", post(enroll_agent))
+        .route("/api/v1/agent/report", post(report_metrics))
+        .route("/api/v1/agent/live", post(report_live_metrics))
+        .fallback_service(static_files)
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(CompressionLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+async fn platform() -> Json<Value> {
+    Json(json!({
+        "documentation_url": "/guide/easymanage.html",
+        "operations_enabled": true,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn live() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_owned(),
+        service: "easymanage-server".to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        timestamp: Utc::now(),
+    })
+}
+
+async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
+    sqlx::query("SELECT 1")
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::database)?;
+    Ok(live().await)
+}
+
+async fn list_live_nodes(
+    State(state): State<AppState>,
+) -> Result<Json<LiveNodeListResponse>, ApiError> {
+    let generated_at = Utc::now();
+    let cutoff = generated_at
+        - Duration::seconds(
+            i64::try_from(state.collection.current().live_seconds + 3).unwrap_or(63),
+        );
+    let active: HashSet<Uuid> = sqlx::query_scalar("SELECT id FROM nodes WHERE deleted_at IS NULL")
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::database)?
+        .into_iter()
+        .collect();
+    let nodes = state
+        .live
+        .read()
+        .await
+        .values()
+        .filter(|node| node.received_at >= cutoff && active.contains(&node.node_id))
+        .cloned()
+        .collect();
+    Ok(Json(LiveNodeListResponse {
+        generated_at,
+        nodes,
+    }))
+}
+
+async fn report_live_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<AgentLiveReport>,
+) -> Result<StatusCode, ApiError> {
+    verify_protocol(report.protocol_version)?;
+    let provided_token = header_value(&headers, AGENT_TOKEN_HEADER)?;
+    authenticate_agent(&state.pool, report.node_id, provided_token).await?;
+
+    let metrics = &report.metrics;
+    if !metrics.cpu_usage_percent.is_finite()
+        || !(0.0..=100.0).contains(&metrics.cpu_usage_percent)
+        || metrics.memory_total_bytes == 0
+        || metrics.memory_used_bytes > metrics.memory_total_bytes
+        || !metrics.network_received_bytes_per_second.is_finite()
+        || metrics.network_received_bytes_per_second < 0.0
+        || !metrics.network_transmitted_bytes_per_second.is_finite()
+        || metrics.network_transmitted_bytes_per_second < 0.0
+    {
+        return Err(ApiError::bad_request("invalid live metrics"));
+    }
+    let now = Utc::now();
+    let mut live = state.live.write().await;
+    if live.len() > 1024 {
+        let cutoff = now - Duration::minutes(1);
+        live.retain(|_, node| node.received_at >= cutoff);
+    }
+    live.insert(
+        report.node_id,
+        LiveNode {
+            node_id: report.node_id,
+            received_at: now,
+            metrics: report.metrics,
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn enroll_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EnrollmentRequest>,
+) -> Result<Json<EnrollmentResponse>, ApiError> {
+    let provided = header_value(&headers, ENROLLMENT_TOKEN_HEADER)?;
+    verify_protocol(request.protocol_version)?;
+
+    let node_id = request.requested_node_id;
+    let agent_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let token_hash = hash_token(&agent_token);
+    let now = Utc::now();
+    let mut transaction = state.pool.begin().await.map_err(ApiError::database)?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(node_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+    let deleted: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL)",
+    )
+    .bind(node_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+    if deleted {
+        return Err(ApiError::unauthorized());
+    }
+    let bootstrap = sqlx::query("DELETE FROM machine_enrollments WHERE node_id=$1 AND token_hash=$2 AND expires_at>NOW() RETURNING expected_user")
+        .bind(node_id).bind(hash_token(provided)).fetch_optional(&mut *transaction).await.map_err(ApiError::database)?;
+    if bootstrap.is_none() {
+        let pending: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM machine_enrollments WHERE node_id=$1)")
+                .bind(node_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(ApiError::database)?;
+        if pending {
+            return Err(ApiError::unauthorized());
+        }
+        verify_header_secret(
+            &headers,
+            ENROLLMENT_TOKEN_HEADER,
+            &state.config.enrollment_token,
+        )?;
+    }
+
+    sqlx::query(
+        r"
+        INSERT INTO nodes (
+            id, hostname, os_name, os_version, kernel_version, architecture, cpu_model,
+            cpu_logical_cores, cpu_physical_cores, agent_version, last_seen
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (id) DO UPDATE SET
+            hostname = EXCLUDED.hostname,
+            os_name = EXCLUDED.os_name,
+            os_version = EXCLUDED.os_version,
+            kernel_version = EXCLUDED.kernel_version,
+            architecture = EXCLUDED.architecture,
+            cpu_model = EXCLUDED.cpu_model,
+            cpu_logical_cores = EXCLUDED.cpu_logical_cores,
+            cpu_physical_cores = EXCLUDED.cpu_physical_cores,
+            agent_version = EXCLUDED.agent_version,
+            last_seen = EXCLUDED.last_seen,
+            updated_at = NOW()
+        ",
+    )
+    .bind(node_id)
+    .bind(&request.inventory.hostname)
+    .bind(&request.inventory.os_name)
+    .bind(&request.inventory.os_version)
+    .bind(&request.inventory.kernel_version)
+    .bind(&request.inventory.architecture)
+    .bind(&request.inventory.cpu_model)
+    .bind(i64::from(request.inventory.cpu_logical_cores))
+    .bind(request.inventory.cpu_physical_cores.map(i64::from))
+    .bind(&request.agent_version)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+
+    sqlx::query(
+        r"
+        INSERT INTO agents (node_id, token_hash, enabled, enrolled_at)
+        VALUES ($1, $2, TRUE, $3)
+        ON CONFLICT (node_id) DO UPDATE SET
+            token_hash = EXCLUDED.token_hash,
+            enabled = TRUE,
+            enrolled_at = EXCLUDED.enrolled_at
+        ",
+    )
+    .bind(node_id)
+    .bind(token_hash)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+
+    sqlx::query(
+        r"
+        INSERT INTO audit_logs (actor_type, actor_id, action, target_type, target_id, details)
+        VALUES ('agent', $1, 'agent.enroll', 'node', $1, $2)
+        ",
+    )
+    .bind(node_id.to_string())
+    .bind(json!({ "hostname": request.inventory.hostname }))
+    .execute(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+
+    transaction.commit().await.map_err(ApiError::database)?;
+    info!(%node_id, hostname = %request.inventory.hostname, "agent enrolled");
+
+    Ok(Json(EnrollmentResponse {
+        node_id,
+        agent_token,
+        report_interval_seconds: state.config.report_interval_seconds,
+    }))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep one report's atomic database transaction together"
+)]
+async fn report_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<AgentReport>,
+) -> Result<Json<AgentReportResponse>, ApiError> {
+    verify_protocol(report.protocol_version)?;
+    let provided_token = header_value(&headers, AGENT_TOKEN_HEADER)?;
+    authenticate_agent(&state.pool, report.node_id, provided_token).await?;
+
+    if report
+        .metrics
+        .hardware_details
+        .as_ref()
+        .is_some_and(|details| !details.valid())
+    {
+        return Err(ApiError::bad_request("hardware inventory exceeds limits"));
+    }
+    if let Some(process) = &report.metrics.platform_process {
+        let valid_percent = process
+            .cpu_percent_of_host
+            .is_none_or(|value| value.is_finite() && (0.0..=100.0).contains(&value));
+        let valid_rate =
+            |value: Option<f64>| value.is_none_or(|value| value.is_finite() && value >= 0.0);
+        if process.pid == 0
+            || !valid_percent
+            || !valid_rate(process.disk_read_bytes_per_second)
+            || !valid_rate(process.disk_written_bytes_per_second)
+            || process
+                .resident_memory_bytes
+                .is_some_and(|bytes| i64::try_from(bytes).is_err())
+        {
+            return Err(ApiError::bad_request("invalid platform process metrics"));
+        }
+    }
+    if let Some(storage) = &report.metrics.platform_storage {
+        let valid_size =
+            |value: Option<u64>| value.is_none_or(|bytes| i64::try_from(bytes).is_ok());
+        if !valid_size(storage.binary_bytes)
+            || !valid_size(storage.state_bytes)
+            || !valid_size(storage.total_bytes)
+            || storage.web_bytes.is_some()
+            || storage.database_bytes.is_some()
+            || storage.total_bytes.is_some_and(|total| {
+                storage
+                    .binary_bytes
+                    .zip(storage.state_bytes)
+                    .and_then(|(binary, state)| binary.checked_add(state))
+                    != Some(total)
+            })
+        {
+            return Err(ApiError::bad_request("invalid Agent storage footprint"));
+        }
+    }
+
+    if let Some(policy) = &report.metrics.collection_policy {
+        policy.validate().map_err(ApiError::bad_request)?;
+    }
+    if let Some(temperatures) = &report.metrics.temperatures {
+        let valid = |value: f32| value.is_finite() && (0.0..=150.0).contains(&value);
+        if temperatures.cpu_celsius.is_some_and(|value| !valid(value))
+            || temperatures.ssds.len() > 128
+            || temperatures.ssds.iter().any(|ssd| {
+                ssd.device.is_empty() || ssd.device.len() > 64 || !valid(ssd.temperature_celsius)
+            })
+        {
+            return Err(ApiError::bad_request("invalid temperature metrics"));
+        }
+    }
+
+    let metrics_json = serde_json::to_value(&report.metrics)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let network_received = report
+        .metrics
+        .networks
+        .iter()
+        .map(|metric| metric.received_bytes_per_second)
+        .sum::<f64>();
+    let network_transmitted = report
+        .metrics
+        .networks
+        .iter()
+        .map(|metric| metric.transmitted_bytes_per_second)
+        .sum::<f64>();
+    let (disk_read, disk_written) = if report.metrics.disk_collected_at.is_some() {
+        aggregate_disk_io(&report.metrics.disks)
+    } else {
+        (None, None)
+    };
+    let gpu_json = serde_json::to_value(&report.metrics.gpus)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let memory_used = i64::try_from(report.metrics.memory_used_bytes)
+        .map_err(|_| ApiError::bad_request("memory_used_bytes exceeds PostgreSQL BIGINT"))?;
+    let now = Utc::now();
+    let mut transaction = state.pool.begin().await.map_err(ApiError::database)?;
+
+    sqlx::query(
+        r"
+        UPDATE nodes SET
+            hostname = $2, os_name = $3, os_version = $4, kernel_version = $5,
+            architecture = $6, cpu_model = $7, cpu_logical_cores = $8,
+            cpu_physical_cores = $9, agent_version = $10, last_seen = $11,
+            updated_at = NOW()
+        WHERE id = $1 AND NOT EXISTS (
+            SELECT 1 FROM metrics_latest
+            WHERE node_id = $1 AND collected_at > $12
+        )
+        ",
+    )
+    .bind(report.node_id)
+    .bind(&report.inventory.hostname)
+    .bind(&report.inventory.os_name)
+    .bind(&report.inventory.os_version)
+    .bind(&report.inventory.kernel_version)
+    .bind(&report.inventory.architecture)
+    .bind(&report.inventory.cpu_model)
+    .bind(i64::from(report.inventory.cpu_logical_cores))
+    .bind(report.inventory.cpu_physical_cores.map(i64::from))
+    .bind(&report.agent_version)
+    .bind(now)
+    .bind(report.metrics.collected_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+
+    // Historical catch-up still proves connectivity, but must not roll back inventory/version.
+    sqlx::query("UPDATE nodes SET last_seen = $2 WHERE id = $1")
+        .bind(report.node_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+
+    sqlx::query(
+        r"
+        INSERT INTO metrics_latest (node_id, collected_at, metrics, updated_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (node_id) DO UPDATE SET
+            collected_at = EXCLUDED.collected_at,
+            metrics = EXCLUDED.metrics,
+            updated_at = NOW()
+        WHERE EXCLUDED.collected_at >= metrics_latest.collected_at
+        ",
+    )
+    .bind(report.node_id)
+    .bind(report.metrics.collected_at)
+    .bind(metrics_json)
+    .execute(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+
+    crate::permission_reviews::invalidate_changed(&mut transaction, report.node_id)
+        .await
+        .map_err(ApiError::database)?;
+
+    sqlx::query(
+        r"
+        INSERT INTO metrics_samples (
+            node_id, collected_at, cpu_usage_percent, memory_used_bytes,
+            network_received_bytes_per_second, network_transmitted_bytes_per_second, gpu_metrics,
+            disk_collected_at, disk_read_bytes_per_second, disk_written_bytes_per_second,
+            agent_pid, agent_cpu_percent_of_host, agent_resident_memory_bytes,
+            agent_disk_read_bytes_per_second, agent_disk_written_bytes_per_second, gpu_collected_at, fast_collected_at, temperatures
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        ",
+    )
+    .bind(report.node_id)
+    .bind(report.metrics.collected_at)
+    .bind(f64::from(report.metrics.cpu_usage_percent))
+    .bind(memory_used)
+    .bind(network_received)
+    .bind(network_transmitted)
+    .bind(gpu_json)
+    .bind(report.metrics.disk_collected_at)
+    .bind(disk_read)
+    .bind(disk_written)
+    .bind(
+        report
+            .metrics
+            .platform_process
+            .as_ref()
+            .map(|process| i64::from(process.pid)),
+    )
+    .bind(
+        report
+            .metrics
+            .platform_process
+            .as_ref()
+            .and_then(|process| process.cpu_percent_of_host),
+    )
+    .bind(
+        report
+            .metrics
+            .platform_process
+            .as_ref()
+            .and_then(|process| process.resident_memory_bytes)
+            .and_then(|bytes| i64::try_from(bytes).ok()),
+    )
+    .bind(
+        report
+            .metrics
+            .platform_process
+            .as_ref()
+            .and_then(|process| process.disk_read_bytes_per_second),
+    )
+    .bind(
+        report
+            .metrics
+            .platform_process
+            .as_ref()
+            .and_then(|process| process.disk_written_bytes_per_second),
+    )
+    .bind(report.metrics.gpu_collected_at)
+    .bind(report.metrics.fast_collected_at)
+    .bind(report.metrics.temperatures.as_ref().map(serde_json::to_value).transpose()
+        .map_err(|error| ApiError::internal(error.to_string()))?)
+    .execute(&mut *transaction)
+    .await
+    .map_err(ApiError::database)?;
+
+    if let Some(storage) = &report.metrics.platform_storage
+        && storage.collected_at >= now - Duration::days(30)
+        && storage.collected_at <= now + Duration::minutes(5)
+    {
+        sqlx::query(
+            "INSERT INTO agent_storage_samples (node_id, sampled_at, binary_bytes, state_bytes, total_bytes) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (node_id, sampled_at) DO NOTHING",
+        )
+        .bind(report.node_id)
+        .bind(storage.collected_at)
+        .bind(storage.binary_bytes.and_then(|bytes| i64::try_from(bytes).ok()))
+        .bind(storage.state_bytes.and_then(|bytes| i64::try_from(bytes).ok()))
+        .bind(storage.total_bytes.and_then(|bytes| i64::try_from(bytes).ok()))
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+    }
+
+    sqlx::query("UPDATE agents SET last_authenticated_at = $2 WHERE node_id = $1")
+        .bind(report.node_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+
+    transaction.commit().await.map_err(ApiError::database)?;
+    Ok(Json(AgentReportResponse {
+        accepted_at: now,
+        collection_policy: Some(state.collection.current()),
+    }))
+}
+
+async fn list_nodes(State(state): State<AppState>) -> Result<Json<NodeListResponse>, ApiError> {
+    let rows = sqlx::query(
+        r"
+        SELECT n.id, COALESCE(NULLIF(n.display_name,''),n.hostname) AS hostname, n.os_name, n.os_version, n.kernel_version, n.architecture,
+               n.cpu_model, n.cpu_logical_cores, n.cpu_physical_cores, n.agent_version,
+               n.last_seen, m.metrics
+        FROM nodes n
+        LEFT JOIN metrics_latest m ON m.node_id = n.id
+        WHERE n.deleted_at IS NULL
+        ORDER BY n.hostname, n.id
+        ",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::database)?;
+
+    let online_cutoff = Utc::now() - Duration::seconds(state.config.online_window_seconds);
+    let nodes = rows
+        .iter()
+        .map(|row| map_node(row, online_cutoff))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(NodeListResponse {
+        generated_at: Utc::now(),
+        nodes,
+    }))
+}
+
+#[derive(Serialize)]
+struct HistoryGpu {
+    index: u32,
+    utilization_percent: f32,
+    memory_used_bytes: u64,
+    memory_total_bytes: u64,
+    temperature_celsius: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct HistoryPoint {
+    temperatures: Option<easymanage_protocol::HostTemperatures>,
+    collected_at: DateTime<Utc>,
+    gpu_collected_at: Option<DateTime<Utc>>,
+    fast_collected_at: Option<DateTime<Utc>>,
+    cpu_usage_percent: f64,
+    memory_used_bytes: u64,
+    network_received_bytes_per_second: f64,
+    network_transmitted_bytes_per_second: f64,
+    disk_collected_at: Option<DateTime<Utc>>,
+    disk_read_bytes_per_second: Option<f64>,
+    disk_written_bytes_per_second: Option<f64>,
+    gpus: Vec<HistoryGpu>,
+}
+
+#[derive(Serialize)]
+struct NodeHistoryResponse {
+    node_id: Uuid,
+    generated_at: DateTime<Utc>,
+    window_seconds: u32,
+    points: Vec<HistoryPoint>,
+}
+
+async fn node_history(
+    State(state): State<AppState>,
+    Path(node_id): Path<Uuid>,
+) -> Result<Json<NodeHistoryResponse>, ApiError> {
+    const WINDOW_SECONDS: u32 = 10 * 60;
+    let generated_at = Utc::now();
+    let rows = sqlx::query(
+        "SELECT collected_at, cpu_usage_percent, memory_used_bytes, \
+         network_received_bytes_per_second, network_transmitted_bytes_per_second, gpu_metrics, \
+         disk_collected_at, disk_read_bytes_per_second, disk_written_bytes_per_second, gpu_collected_at, fast_collected_at, temperatures \
+         FROM metrics_samples WHERE node_id = $1 AND collected_at >= $2 \
+         ORDER BY collected_at DESC, id DESC LIMIT 180",
+    )
+    .bind(node_id)
+    .bind(generated_at - Duration::seconds(i64::from(WINDOW_SECONDS)))
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::database)?;
+    let mut points = Vec::with_capacity(rows.len());
+    for row in rows {
+        let collected_at: DateTime<Utc> =
+            row.try_get("collected_at").map_err(ApiError::database)?;
+        if points
+            .last()
+            .is_some_and(|point: &HistoryPoint| point.collected_at == collected_at)
+        {
+            continue;
+        }
+        let gpus: Vec<GpuMetric> =
+            serde_json::from_value(row.try_get("gpu_metrics").map_err(ApiError::database)?)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        let memory_used_bytes: i64 = row
+            .try_get("memory_used_bytes")
+            .map_err(ApiError::database)?;
+        points.push(HistoryPoint {
+            temperatures: row
+                .try_get::<Option<serde_json::Value>, _>("temperatures")
+                .map_err(ApiError::database)?
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+            collected_at,
+            gpu_collected_at: row
+                .try_get("gpu_collected_at")
+                .map_err(ApiError::database)?,
+            fast_collected_at: row
+                .try_get("fast_collected_at")
+                .map_err(ApiError::database)?,
+            cpu_usage_percent: row
+                .try_get("cpu_usage_percent")
+                .map_err(ApiError::database)?,
+            memory_used_bytes: memory_used_bytes
+                .try_into()
+                .map_err(|_| ApiError::internal("negative historical memory usage"))?,
+            network_received_bytes_per_second: row
+                .try_get("network_received_bytes_per_second")
+                .map_err(ApiError::database)?,
+            network_transmitted_bytes_per_second: row
+                .try_get("network_transmitted_bytes_per_second")
+                .map_err(ApiError::database)?,
+            disk_collected_at: row
+                .try_get("disk_collected_at")
+                .map_err(ApiError::database)?,
+            disk_read_bytes_per_second: row
+                .try_get("disk_read_bytes_per_second")
+                .map_err(ApiError::database)?,
+            disk_written_bytes_per_second: row
+                .try_get("disk_written_bytes_per_second")
+                .map_err(ApiError::database)?,
+            gpus: gpus
+                .into_iter()
+                .map(|gpu| HistoryGpu {
+                    index: gpu.index,
+                    utilization_percent: gpu.utilization_percent,
+                    memory_used_bytes: gpu.memory_used_bytes,
+                    memory_total_bytes: gpu.memory_total_bytes,
+                    temperature_celsius: gpu.temperature_celsius,
+                })
+                .collect(),
+        });
+    }
+    points.reverse();
+    Ok(Json(NodeHistoryResponse {
+        node_id,
+        generated_at,
+        window_seconds: WINDOW_SECONDS,
+        points,
+    }))
+}
+
+fn aggregate_disk_io(disks: &[easymanage_protocol::DiskMetric]) -> (Option<f64>, Option<f64>) {
+    let mut seen = HashSet::new();
+    let mut read = None;
+    let mut written = None;
+    for disk in disks {
+        // Several mount points can refer to the same block device. Count its I/O once.
+        if !seen.insert(disk.name.as_str()) {
+            continue;
+        }
+        if let Some(rate) = disk
+            .read_bytes_per_second
+            .filter(|rate| rate.is_finite() && *rate >= 0.0)
+        {
+            *read.get_or_insert(0.0) += rate;
+        }
+        if let Some(rate) = disk
+            .written_bytes_per_second
+            .filter(|rate| rate.is_finite() && *rate >= 0.0)
+        {
+            *written.get_or_insert(0.0) += rate;
+        }
+    }
+    (read, written)
+}
+
+fn map_node(row: &PgRow, online_cutoff: chrono::DateTime<Utc>) -> Result<NodeSummary, ApiError> {
+    let last_seen = row.try_get("last_seen").map_err(ApiError::database)?;
+    let metrics = row
+        .try_get::<Option<Value>, _>("metrics")
+        .map_err(ApiError::database)?
+        .map(serde_json::from_value::<MetricsSnapshot>)
+        .transpose()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+
+    Ok(NodeSummary {
+        id: row.try_get("id").map_err(ApiError::database)?,
+        hostname: row.try_get("hostname").map_err(ApiError::database)?,
+        os_name: row.try_get("os_name").map_err(ApiError::database)?,
+        os_version: row.try_get("os_version").map_err(ApiError::database)?,
+        kernel_version: row.try_get("kernel_version").map_err(ApiError::database)?,
+        architecture: row.try_get("architecture").map_err(ApiError::database)?,
+        cpu_model: row.try_get("cpu_model").map_err(ApiError::database)?,
+        cpu_logical_cores: row
+            .try_get::<i32, _>("cpu_logical_cores")
+            .map_err(ApiError::database)?
+            .try_into()
+            .map_err(|_| ApiError::internal("invalid cpu_logical_cores"))?,
+        cpu_physical_cores: row
+            .try_get::<Option<i32>, _>("cpu_physical_cores")
+            .map_err(ApiError::database)?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| ApiError::internal("invalid cpu_physical_cores"))?,
+        agent_version: row.try_get("agent_version").map_err(ApiError::database)?,
+        last_seen,
+        online: last_seen >= online_cutoff,
+        metrics,
+    })
+}
+
+async fn authenticate_agent(pool: &PgPool, node_id: Uuid, token: &str) -> Result<(), ApiError> {
+    let expected_hash = sqlx::query_scalar::<_, String>(
+        "SELECT a.token_hash FROM agents a JOIN nodes n ON n.id=a.node_id WHERE a.node_id = $1 AND a.enabled = TRUE AND n.deleted_at IS NULL",
+    )
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(ApiError::database)?
+    .ok_or_else(ApiError::unauthorized)?;
+    let provided_hash = hash_token(token);
+    if constant_time_equal(expected_hash.trim(), &provided_hash) {
+        Ok(())
+    } else {
+        warn!(%node_id, "agent authentication failed");
+        Err(ApiError::unauthorized())
+    }
+}
+
+fn verify_protocol(version: u16) -> Result<(), ApiError> {
+    if version == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("unsupported protocol version"))
+    }
+}
+
+fn verify_header_secret(
+    headers: &HeaderMap,
+    header_name: &str,
+    expected: &str,
+) -> Result<(), ApiError> {
+    let provided = header_value(headers, header_name)?;
+    if constant_time_equal(provided, expected) {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized())
+    }
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, ApiError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(ApiError::unauthorized)
+}
+
+pub(crate) fn constant_time_equal(left: &str, right: &str) -> bool {
+    left.as_bytes().ct_eq(right.as_bytes()).into()
+}
+
+pub(crate) fn hash_token(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: "authentication failed".to_owned(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn database(error: sqlx::Error) -> Self {
+        tracing::error!(%error, "database operation failed");
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "数据库暂不可用，请检查 PostgreSQL；Agent 管理中的强制重启仍可使用".into(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let mut response = Json(ErrorResponse {
+            error: self.message,
+        })
+        .into_response();
+        *response.status_mut() = self.status;
+        response
+    }
+}
+
+pub async fn attach_request_id(
+    mut request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let documentation =
+        request.uri().path() == "/guide" || request.uri().path().starts_with("/guide/");
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .cloned()
+        .unwrap_or_else(|| {
+            HeaderValue::from_str(&Uuid::new_v4().to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("generated-request-id"))
+        });
+    request
+        .headers_mut()
+        .insert("x-request-id", request_id.clone());
+
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert("x-request-id", request_id);
+    headers.insert(
+        "strict-transport-security",
+        HeaderValue::from_static("max-age=31536000"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "x-frame-options",
+        HeaderValue::from_static(if documentation { "SAMEORIGIN" } else { "DENY" }),
+    );
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(if documentation {
+            // VitePress emits small inline bootstrap scripts in its trusted, repository-built HTML.
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; \
+             frame-ancestors 'self'"
+        } else {
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self'; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; \
+             frame-ancestors 'none'"
+        }),
+    );
+    response
+}
