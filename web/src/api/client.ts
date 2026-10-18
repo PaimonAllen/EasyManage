@@ -56,6 +56,8 @@ export interface ManagedMachine {
   node_id: string; hostname: string; display_name: string | null; note: string;
   deleted_at: string | null; last_seen: string; host: string | null; port: number | null;
   username: string | null; manageable: boolean;
+  connection_mode?: "auto" | "direct" | "ssh";
+  ssh_transport?: {status: string; connections: number; limit: number; remote_port: number | null; reconnects: number} | null;
 }
 export interface MachineStatus {
   machines: ManagedMachine[]; candidate_available: boolean; ca_available: boolean; registry_writable: boolean;
@@ -71,10 +73,15 @@ export async function probeMachine(host: string, port: number): Promise<{fingerp
   return readResponse(await fetch("/api/v1/machines/probe", { method: "POST", headers: {"Content-Type":"application/json"},
     body: JSON.stringify({host, port}), cache:"no-store", signal:AbortSignal.timeout(30_000) }));
 }
-export async function addMachine(request: {host: string; port: number; display_name: string; server_url: string; fingerprint: string; username: string; deployment_mode?: MachineDeploymentMode} & MachineAuthentication): Promise<{job_id: string; job_key: string; node_id: string}> {
+export async function addMachine(request: {host: string; port: number; display_name: string; server_url: string; fingerprint: string; username: string; deployment_mode?: MachineDeploymentMode; connection_mode?: "auto" | "direct" | "ssh"} & MachineAuthentication): Promise<{job_id: string; job_key: string; node_id: string}> {
   const body = serializeMachineRequest(request);
   return readResponse(await fetch("/api/v1/machines", { method:"POST", headers:{"Content-Type":"application/json"},
     body, cache:"no-store", signal:AbortSignal.timeout(20_000) }));
+}
+export async function manageMachineSsh(id: string, request: {action: "connect" | "disconnect"; username: string} & MachineAuthentication): Promise<{message:string}> {
+  const body=serializeMachineRequest(request);
+  return readResponse(await fetch(`/api/v1/machines/${encodeURIComponent(id)}/ssh`, {method:"POST", headers:{"Content-Type":"application/json"},
+    body, cache:"no-store", signal:AbortSignal.timeout(110_000)}));
 }
 export async function fetchMachineJob(id: string, key: string, signal?: AbortSignal): Promise<MachineDeployment> {
   return readResponse(await fetch(`/api/v1/machines/jobs/${encodeURIComponent(id)}`, { headers:{Authorization:`Bearer ${key}`}, cache:"no-store", signal }));

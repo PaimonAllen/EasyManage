@@ -38,6 +38,7 @@ struct LinkTarget {
     hostname: String,
     host: IpAddr,
     port: u16,
+    ssh_persistent_connected: Option<bool>,
 }
 
 pub fn router(
@@ -90,7 +91,7 @@ pub fn router(
 }
 
 fn targets(path: &PathBuf) -> Result<Vec<LinkTarget>, &'static str> {
-    crate::operations::health_targets(path).map(|targets| targets.into_iter().map(|(node_id,hostname,host,port)|LinkTarget{node_id,hostname,host,port}).collect())
+    crate::operations::health_targets(path).map(|targets| targets.into_iter().map(|(node_id,hostname,host,port,ssh_persistent_connected)|LinkTarget{node_id,hostname,host,port,ssh_persistent_connected}).collect())
 }
 
 async fn platform_health(State(state): State<InsightState>) -> Json<Value> {
@@ -152,6 +153,7 @@ async fn platform_health_uncached(state: InsightState) -> Json<Value> {
     let mut checks = JoinSet::new();
     for target in configured {
         checks.spawn(async move {
+            if let Some(connected) = target.ssh_persistent_connected { return (target, connected); }
             let connected = tokio::time::timeout(
                 Duration::from_secs(2),
                 TcpStream::connect(SocketAddr::new(target.host, target.port)),

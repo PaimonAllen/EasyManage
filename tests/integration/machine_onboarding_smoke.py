@@ -6,7 +6,7 @@ is real and must report to the temporary HTTPS/PG platform. No host services,
 network configuration, private keys or credentials are read/changed.
 """
 import hashlib
-from isolated_smoke import parse_timestamp
+from isolated_smoke import parse_timestamp, print_isolated_log_tail, stop_process
 import io
 import json
 import logging
@@ -105,6 +105,7 @@ sys.exit(2)
     allow_full = threading.Event()
     stages = set()
     errors = []
+    full_processes = []
     ssh_env = environment | {"HOME": str(home), "USER": current.pw_name,
         "PATH": str(commands) + ":/usr/bin:/bin", "MACHINE_FIXTURE_RUNTIME": str(runtime)}
 
@@ -150,9 +151,22 @@ sys.exit(2)
                 result=0 if allow_full.is_set() else 1  # No host sudo/systemd.
             elif command.startswith('test ! -e "$HOME/.local/share/easymanage/'):
                 result=0
+            elif command.startswith("python3 -c ") and ("/api/v1/health/ready" in command or "/proc/net/tcp" in command):
+                completed=subprocess.run(shlex.split(command),env=ssh_env,capture_output=True,timeout=8)
+                channel.sendall(completed.stdout);result=completed.returncode
+            elif command.startswith("/usr/bin/python3 -I -c "):
+                payload=bytearray()
+                while True:
+                    data=channel.recv(4096)
+                    if not data: break
+                    payload.extend(data)
+                    if len(payload)>8192: raise RuntimeError("Fixture network payload limit")
+                completed=subprocess.run(shlex.split(command),input=payload,env=ssh_env,capture_output=True,timeout=15)
+                for index in range(len(payload)): payload[index]=0
+                channel.sendall(completed.stdout);result=completed.returncode
             elif "test ! -e /etc/easymanage/agent.env" in command:
                 result=1 if collision.is_set() else 0
-            elif 'mktemp -d "$HOME/.easymanage/staging/agent.' in command:
+            elif command.startswith('umask 077;') and 'mktemp -d ' in command and '.easymanage/staging/agent.' in command:
                 stage=home/".easymanage/staging"/("agent."+secrets.token_hex(4))
                 stage.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
                 stage.mkdir(mode=0o700)
@@ -187,8 +201,8 @@ sys.exit(0)
 ''')
                 (full/"systemctl").chmod(0o700)
                 log=(full/"installer.log").open("ab")
-                runner="import subprocess,sys,time; r=subprocess.run(sys.argv[1:]); time.sleep(8 if r.returncode==0 else 0); sys.exit(r.returncode)"
-                result=subprocess.run(["bwrap","--unshare-user","--unshare-pid","--unshare-ipc","--unshare-uts","--die-with-parent","--uid","0",
+                runner="import pathlib,subprocess,sys,time; r=subprocess.run(sys.argv[1:]); pathlib.Path('/tmp/full-fixture/install-result').write_text(str(r.returncode)); time.sleep(120 if r.returncode==0 else 0); sys.exit(r.returncode)"
+                process=subprocess.Popen(["bwrap","--unshare-user","--unshare-pid","--unshare-ipc","--unshare-uts","--die-with-parent","--uid","0",
                     "--ro-bind","/","/","--dev","/dev","--proc","/proc","--tmpfs","/usr",
                     "--ro-bind","/usr/bin","/usr/bin","--ro-bind","/usr/lib","/usr/lib","--ro-bind","/usr/lib64","/usr/lib64",
                     "--dir","/usr/local/sbin","--ro-bind",str(full/"systemctl"),"/usr/bin/systemctl",
@@ -196,14 +210,28 @@ sys.exit(0)
                     "--tmpfs","/run","--tmpfs","/home","--tmpfs","/root","--tmpfs","/tmp",
                     "--dir","/tmp/full-fixture","--bind",str(full),"/tmp/full-fixture",
                     "--ro-bind",str(source_stage),str(source_stage),
-                    "/usr/bin/python3","-c",runner,*invocation],stdout=log,stderr=subprocess.STDOUT,timeout=100).returncode
-                log.close()
+                    "/usr/bin/python3","-c",runner,*invocation],stdout=log,stderr=subprocess.STDOUT)
+                full_processes.append(process)
+                deadline=time.monotonic()+95
+                while not (full/"install-result").exists() and process.poll() is None and time.monotonic()<deadline: time.sleep(0.1)
+                if not (full/"install-result").exists(): raise RuntimeError("Full fixture installer did not finish")
+                result=int((full/"install-result").read_text())
                 channel.sendall(b"namespace Full installer finished\n")
+                channel.send_exit_status(result);channel.shutdown_write();channel.close()
+                # A real system service survives the installation SSH channel.
+                # Keep namespace init alive until the fixture explicitly stops it,
+                # not for a fixed eight-second race with initial inventory.
+                while alive.is_set() and process.poll() is None: time.sleep(0.1)
+                stop_process(process);log.close()
+                return
             elif "/bin/bash" in command and "install-user-agent.sh" in command:
                 log=(runtime/"installer.log").open("ab")
                 result=subprocess.run(shlex.split(command),env=ssh_env,stdout=log,stderr=subprocess.STDOUT,timeout=100).returncode
                 log.close()
                 channel.sendall(b"fixture installer finished\n")
+            elif command.startswith("/usr/bin/timeout ") and "agent-user-control.py" in command:
+                completed=subprocess.run(shlex.split(command),env=ssh_env,capture_output=True,timeout=45)
+                channel.sendall(completed.stdout);result=completed.returncode
             elif "agent-user-control.py" in command and command.endswith(" describe"):
                 completed=subprocess.run(shlex.split(command),env=ssh_env,capture_output=True,timeout=5)
                 channel.sendall(completed.stdout); result=completed.returncode
@@ -214,12 +242,55 @@ sys.exit(0)
             channel.send_exit_status(result)
             channel.shutdown_write()
         except Exception as error:
-            errors.append(type(error).__name__)
+            errors.append(type(error).__name__ + (":" + str(error) if isinstance(error,RuntimeError) else ""))
             channel.send_exit_status(1)
         finally:
             channel.close()
 
+    allow_forward = threading.Event()
+    allow_forward.set()
+    max_connections = [0]
+    def bridge(channel, connection):
+        import select
+        try:
+            channel.settimeout(1); connection.settimeout(1)
+            while alive.is_set():
+                readable,_,_=select.select([channel,connection],[],[],0.2)
+                for source in readable:
+                    data=source.recv(16384)
+                    if not data: return
+                    destination=connection if source is channel else channel
+                    destination.sendall(data)
+        except (OSError,EOFError): pass
+        finally: channel.close();connection.close()
+
     class Server(paramiko.ServerInterface):
+        def __init__(self, transport):
+            self.transport=transport
+            self.forwards={}
+        def check_port_forward_request(self, address, port):
+            if not allow_forward.is_set() or address!="127.0.0.1": return False
+            listener=socket.socket()
+            listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+            try: listener.bind((address,port));listener.listen(8);listener.settimeout(0.2)
+            except OSError: listener.close();return False
+            actual=listener.getsockname()[1]
+            self.forwards[actual]=listener
+            def accept_forward():
+                while alive.is_set() and self.transport.is_active() and actual in self.forwards:
+                    try: connection,origin=listener.accept()
+                    except socket.timeout: continue
+                    except OSError: break
+                    try:
+                        channel=self.transport.open_forwarded_tcpip_channel(origin,(address,actual))
+                        threading.Thread(target=bridge,args=(channel,connection),daemon=True).start()
+                    except Exception: connection.close();break
+                listener.close()
+            threading.Thread(target=accept_forward,daemon=True).start()
+            return actual
+        def check_cancel_port_forward_request(self, address, port):
+            listener=self.forwards.pop(port,None)
+            if listener: listener.close()
         def check_auth_password(self, username, provided):
             attempts.append(username)  # Never save/log passwords, even fake ones.
             return paramiko.AUTH_SUCCESSFUL if username == current.pw_name and secrets.compare_digest(provided,password) else paramiko.AUTH_FAILED
@@ -243,8 +314,9 @@ sys.exit(0)
             except OSError: break
             transport=paramiko.Transport(client)
             transports.append(transport)
+            max_connections[0]=max(max_connections[0],sum(t.is_active() for t in transports)+1)
             transport.add_server_key(key)
-            try: transport.start_server(server=Server())
+            try: transport.start_server(server=Server(transport))
             except Exception: transport.close()
     threading.Thread(target=accept,daemon=True).start()
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=context))
@@ -302,7 +374,7 @@ sys.exit(0)
             require(result and result["status"]=="failed" and not any("已上传" in e["message"] for e in result["events"]),
                     "Full first deployment verifies sudo before files/identity; refusal cannot become Basic fallback")
         require(sudo_checks==[True,True],"SSH password reuse and explicit key-login sudo password travel only through SSH stdin")
-        status,created=request("/api/v1/machines",key_payload)
+        status,created=request("/api/v1/machines",key_payload|{"server_url":"https://10.222.0.254:58443","connection_mode":"auto"})
         require(status==200,"encrypted OpenSSH Ed25519 onboarding returns a bounded background deployment task")
         require(request("/api/v1/machines/jobs/"+created["job_id"])[0]==401,"deployment logs require their per-job capability")
         job=wait_job(created)
@@ -313,18 +385,62 @@ sys.exit(0)
         launch=json.loads((home/".easymanage/config/agent-launch.json").read_text())
         require(launch["backend"]=="compatibility","Linger=no / missing user manager installs a real Basic compatibility supervisor")
         require(any("兼容守护" in event["message"] for event in job["events"]),"deployment log reports compatibility backend and actual autostart limitations")
+        # Auto onboarding used an actually unreachable HTTPS URL; all real
+        # heartbeats above therefore traversed the reverse SSH HTTPS stream.
+        node_id=created["node_id"]
+        ssh_auth={"username":current.pw_name,"auth_method":"private_key","private_key":ed_private,"passphrase":key_phrase}
+        _,machines=request("/api/v1/machines")
+        persistent=next(machine for machine in machines["machines"] if machine["node_id"]==node_id)
+        require(persistent["connection_mode"]=="ssh" and persistent["ssh_transport"]["connections"]==2,"control and reverse HTTPS use exactly two long TCP SSH connections")
+        dial_count=len(transports)
+        for _ in range(3):
+            require(request("/api/v1/machines/probe",{"host":"10.222.0.9","port":2222})[0]==200,"repeated fingerprint reads reuse the authenticated control handshake")
+            request("/api/v1/platform-health")
+        require(len(transports)==dial_count,"status/fingerprint/health inspection does not initiate more SSH connections")
         for transport in transports: transport.close()
-        transports.clear()
         after_disconnect=time.time()
-        deadline=time.monotonic()+25
+        deadline=time.monotonic()+65
         while time.monotonic()<deadline:
             _,snapshot=request("/api/v1/nodes")
             resumed=next((node for node in snapshot["nodes"] if node["id"]==created["node_id"]),None)
             if resumed and parse_timestamp(resumed["last_seen"]).timestamp()>after_disconnect: break
             time.sleep(0.25)
-        require(resumed and parse_timestamp(resumed["last_seen"]).timestamp()>after_disconnect,"Basic Agent continues actual reporting after all deployment SSH transports close")
+        if not resumed or parse_timestamp(resumed["last_seen"]).timestamp()<=after_disconnect:
+            _,machines=request("/api/v1/machines")
+            print("DIAGNOSTIC SSH recovery:",next((m.get("ssh_transport") for m in machines["machines"] if m["node_id"]==node_id),None),"fixture errors:",errors,flush=True)
+        require(resumed and parse_timestamp(resumed["last_seen"]).timestamp()>after_disconnect,"tunnel and control reconnect with backoff and resume real Agent reports after SSH disconnect")
+        _,machines=request("/api/v1/machines")
+        persistent=next(machine for machine in machines["machines"] if machine["node_id"]==node_id)
+        require(persistent["ssh_transport"]["connections"]<=3 and persistent["ssh_transport"]["reconnects"]>=1,"recovery remains within the three-SSH budget")
+        dial_count=len(transports)
+        restart_status,restart_result=request(f"/api/v1/nodes/{node_id}/agent/restart",{})
+        if restart_status!=200: print("DIAGNOSTIC pooled restart:",restart_status,restart_result,errors,flush=True)
+        require(restart_status==200,"Basic restart executes over the persistent control connection")
+        require(len(transports)==dial_count,"Basic restart does not launch a new SSH process/handshake")
+        candidate=root/"controller-home/.easymanage/releases/current/target/release/easymanage-agent"
+        candidate.write_bytes(candidate.read_bytes()+b'\0isolated-new-release')
+        registry_path=root/"managed-targets.json"
+        overlay=json.loads(registry_path.read_text())
+        for target in overlay["targets"]:
+            if target["node_id"]==node_id: target["release_sha256"]=hashlib.sha256(candidate.read_bytes()).hexdigest()
+        registry_path.write_text(json.dumps(overlay));registry_path.chmod(0o600)
+        update_status,update_result=request(f"/api/v1/nodes/{node_id}/agent/update",{})
+        if update_status!=200: print("DIAGNOSTIC pooled update:",update_status,update_result,errors,flush=True)
+        require(update_status==200 and len(transports)==dial_count,"real binary update/SCP and Basic restart reuse control without a new SSH handshake")
+        require(max_connections[0]<=3,"all observed SSH handshakes including probes stay within the connection cap")
+        require(request(f"/api/v1/machines/{node_id}/ssh",ssh_auth|{"action":"disconnect"})[0]==200,"explicit disconnect stops the tunnel and releases its credential worker")
+        time.sleep(0.5)
+        allow_forward.clear()
+        require(request(f"/api/v1/machines/{node_id}/ssh",ssh_auth|{"action":"connect"})[0]!=200,"disabled SSH forwarding is reported without modifying sshd or bypassing policy")
+        allow_forward.set()
+        require(request(f"/api/v1/machines/{node_id}/ssh",ssh_auth|{"action":"connect"})[0]==200,"same machine can reconnect after forwarding is explicitly allowed")
         require((runtime/"crontab").read_text().count("# BEGIN EasyManage Agent compatibility")==1,"compatibility autostart updates only its managed user-cron block")
-        old_agent=json.loads((home/".easymanage/state/compat-process.json").read_text())["agent_pid"]
+        deadline=time.monotonic()+10
+        while time.monotonic()<deadline:
+            old_agent=json.loads((home/".easymanage/state/compat-process.json").read_text()).get("agent_pid")
+            if old_agent: break
+            time.sleep(0.1)
+        require(bool(old_agent),"pending network/restart operation starts a real Agent child before crash recovery test")
         os.kill(old_agent,signal.SIGKILL)  # Exact disposable Agent, never a host PID.
         deadline=time.monotonic()+30
         while time.monotonic()<deadline:
@@ -367,6 +483,16 @@ sys.exit(0)
         _,machines=request("/api/v1/machines")
         require(any(machine["node_id"]==node_id and machine["deleted_at"] for machine in machines["machines"]),"archived machine remains listed with its original ID")
         require(request(f"/api/v1/machines/{node_id}/manage",change|{"action":"restore"})[0]==200,"restore re-enables the original machine credential without reinstalling")
+        # Restoring does not persist SSH secrets. Reattach explicitly with the
+        # original key; original Agent token and SQLite UUID must be unchanged.
+        time.sleep(1)
+        deadline=time.monotonic()+75
+        while True:
+            restore_status,restore_result=request(f"/api/v1/machines/{node_id}/ssh",ssh_auth|{"action":"connect"})
+            if restore_status!=429 or time.monotonic()>=deadline: break
+            time.sleep(5)  # Respect the existing HTTP/SSH-operation rate limits.
+        if restore_status!=200: print("DIAGNOSTIC restored SSH:",restore_status,restore_result,errors,flush=True)
+        require(restore_status==200,"restored SSH node reconnects explicitly using original authentication")
         deadline=time.monotonic()+25
         while time.monotonic()<deadline:
             _,listing=request("/api/v1/nodes")
@@ -376,6 +502,7 @@ sys.exit(0)
         with sqlite3.connect("file:"+str(home/".easymanage/state/state.db")+"?mode=ro",uri=True) as db:
             identity_after=dict(db.execute("SELECT key,value FROM metadata WHERE key IN ('node_id','agent_token')"))
         require(identity_after==identity_before,"restore preserves the exact SQLite identity and original Agent credential")
+        require(max_connections[0]<=3,"credentialed management and recovery never exceed three observed SSH connections")
         collision.set()
         status,blocked=request("/api/v1/machines",payload|{"host":"10.222.0.10"})
         blocked_job=wait_job(blocked) if status==200 else None
@@ -391,6 +518,10 @@ sys.exit(0)
         full_job=wait_job(full_created) if status==200 else None
         if not full_job or full_job["status"]!="success":
             print("DIAGNOSTIC Full onboarding:",status,[event["message"] for event in (full_job or {}).get("events",[])],"fixture errors:",errors,flush=True)
+            for path in (mock/"full/agent.log",mock/"full/installer.log"):
+                if path.is_file():
+                    with path.open("rb") as log:
+                        print_isolated_log_tail(log,"private Full fixture "+path.name,[password,key_phrase,ed_private,enrollment])
         require(full_job and full_job["status"]=="success","first Full SSH deployment runs fixed installer and confirms real namespace-root Agent heartbeat without Basic/linger")
         _,listing=request("/api/v1/nodes")
         full_node=next(node for node in listing["nodes"] if node["id"]==full_created["node_id"])
@@ -401,6 +532,7 @@ sys.exit(0)
         helper=home/".easymanage/bin/agent-user-control.py"
         if helper.is_file(): subprocess.run(["/usr/bin/python3",str(helper),"stop"],env=ssh_env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=25)
         alive.clear();listener.close()
+        for process in full_processes: stop_process(process)
         for transport in transports: transport.close()
         pidfile=runtime/"agent.pid"
         if pidfile.exists():

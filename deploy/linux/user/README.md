@@ -18,6 +18,8 @@ EASYMANAGE_OPERATOR_USER=operator bash deploy/linux/migrations/migrate_platform_
 
 ## 用户平台维护
 
+只允许目标 SSH 端口时，可在 GUI 使用 SSH 长连接：平台通常维持控制和回环 HTTPS 上报两条连接，含附加管理员身份最多三条；不依赖目标回连平台。需目标允许 SSH 远程回环转发，平台证书包含 `127.0.0.1`。凭据仅驻留平台内存，重启后重新鉴权；不会自动修改 sshd 或降低 Full 权限。见 [部署说明](../../../docs/deployment.md#仅开放-ssh-端口的机器)。
+
 `deploy_web_static.sh` 只更新已有用户平台静态资源，保留旧资源和回滚文件，不重启服务；默认 URL `https://127.0.0.1:8443`，可设 `EASYMANAGE_PLATFORM_URL`。目标目录必须与当前用户的配置匹配。
 
 `../operations/renew_controller_tls_for_interfaces.sh --apply` 由 root 显式执行，要求 `EASYMANAGE_OPERATOR_USER`；复用 CA / 私钥，按本机物理及虚拟网卡地址重签叶证书并短暂重启用户平台。失败尝试恢复；不是日常更新步骤。页面与 API 必须同 HTTPS 主机和端口，签入证书不代表浏览器已信任 CA。

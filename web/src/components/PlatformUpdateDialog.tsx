@@ -81,6 +81,7 @@ export function PlatformUpdateDialog({candidate, onClose}: {candidate: PlatformU
       <p className="hint">候选发布于 {formatDate(candidate.published_at || "")}<br />SHA-256：<code style={{overflowWrap: "anywhere"}}>{candidate.candidate_sha256}</code></p>
       {!submitted && <>
         <p className="form-error">平台将短暂离线。失败时回退平台文件，但已执行的数据库迁移不能自动回退。</p>
+        <p className="hint">平台重启后，SSH 长连接节点需在设备总览重新提交鉴权；不保存 SSH 密码或私钥到磁盘。</p>
         <label>平台服务器管理员用户名<input required autoFocus autoComplete="off" maxLength={64} disabled={busy} value={username} onChange={(event) => setUsername(event.target.value)} /></label>
         <label>管理员密码<input required type="password" autoComplete="off" maxLength={1024} disabled={busy} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
         <label className="machine-confirm"><input type="checkbox" disabled={busy} checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> 我已确认候选版本、数据库备份和短暂离线风险</label>

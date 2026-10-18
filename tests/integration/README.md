@@ -1,5 +1,9 @@
 # 隔离集成测试
 
+SSH 长连接回归复用 `--machine-onboarding`：目标上报地址实际不可达时自动使用真实反向 HTTPS 通道，要求收到真实 Agent 心跳；检查稳定两条连接、指纹/健康查询与重启不新增握手、连接中断后的退避恢复、三连接硬上限、禁用转发时明确失败、显式断开/重连及软删除恢复后身份不变。端口转发由隔离 Paramiko fixture 提供，不修改生产 sshd，也不代表生产管理员已允许转发。`test_ssh_network_config.py` 检查配置切换的原 UUID/额外设置保留、私有备份、CA/身份/URL/注入/符号链接拒绝与秘密不回显。Rust 单测补充握手预算与有界重连退避；前端 SSR 检查自动/直连/SSH 三种选项、最多三连接说明及 TLS 校验提示。
+
+`full_ssh_update_smoke.py` 同样传入宿主 net/mnt ID，在嵌套私有 root namespace 中检查固定 Full 更新器的正常替换、错误摘要/UUID 拒绝、服务重启失败回退，以及从未有 Basic 配置的 Full 节点切换网络。所有情况保留原 SQLite 字节；使用 mock systemd，不接触生产 root 服务。
+
 生产主机不直接运行测试。`isolated_smoke.py` 必须在独立网络和挂载命名空间、私有 `/tmp`、非 root 用户下执行；它会拒绝原主机命名空间。该环境不是完整虚拟机。
 
 先在工作区编译，测试程序不在此步骤运行：

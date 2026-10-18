@@ -275,6 +275,10 @@ try {
   console.log("PASS overview machine management entry, safe default Basic, archive list and unavailable-candidate protection");
   const connectionSettings = renderToStaticMarkup(React.createElement(AgentConnectionSettings,{url:"https://platform.example:8443",busy:false,onChange:()=>{}}));
   assert.ok(connectionSettings.includes("自动写入 Agent 配置") && connectionSettings.includes('value="https://platform.example:8443"'));
+  assert.ok(connectionSettings.includes('value="auto" selected=""') && connectionSettings.includes("最多 3 条 SSH"));
+  assert.ok(connectionSettings.includes("不为每次采集重新登录") && connectionSettings.includes("需管理员允许 SSH 回环端口转发"));
+  const sshSettings=renderToStaticMarkup(React.createElement(AgentConnectionSettings,{url:"https://platform.example:8443",mode:"ssh",busy:false,onChange:()=>{},onModeChange:()=>{}}));
+  assert.ok(sshSettings.includes('value="ssh" selected=""') && sshSettings.includes("隧道继续校验 CA/证书"));
   assert.match(connectionSettings, /<details><summary>高级网络设置（通常无需修改）<\/summary>/);
   assert.ok(!connectionSettings.includes("<details open") && connectionSettings.includes("不是目标机器地址"));
   const busyConnection = renderToStaticMarkup(React.createElement(AgentConnectionSettings,{url:"https://platform.example:8443",busy:true,onChange:()=>{}}));

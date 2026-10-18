@@ -15,6 +15,17 @@ SPEC.loader.exec_module(fleet)
 
 
 class FleetTests(unittest.TestCase):
+    def test_persistent_targets_never_open_separate_cli_ssh(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary, patch.object(fleet,"BASE",Path(temporary)), patch.object(fleet,"run") as run:
+            node=self.node()|{"connection_mode":"ssh"}
+            with self.assertRaises(RuntimeError): fleet.node_preflight(node)
+            with self.assertRaises(RuntimeError): fleet.control_agent(node,"restart")
+            config=Path(temporary)/"config";config.mkdir()
+            (config/"managed-targets.json").write_text(json.dumps({"targets":[node]}))
+            node.pop("connection_mode")
+            with self.assertRaises(RuntimeError): fleet.node_preflight(node)
+            run.assert_not_called()
+
     def node(self):
         return {"node_id": "00000000-0000-4000-8000-000000000001", "hostname": "fixture",
                 "host": "192.0.2.10", "port": 22, "user": "tester", "ssh_target": "fixture"}
@@ -123,12 +134,21 @@ class FleetTests(unittest.TestCase):
                                      "host": node["host"], "port": node["port"],
                                      "default_user": node["user"], "agent_sha256": "old-running-hash"}]}
             (base / "config/targets.json").write_text(json.dumps(registry))
+            managed = base / "config/managed-targets.json"
+            managed.write_text(json.dumps({"targets":[{"node_id":"11111111-2222-4333-8444-555555555555",
+                "agent_sha256":"old-managed-running-hash","connection_mode":"ssh","ssh_remote_port":18443}]}))
+            managed.chmod(0o600)
             with patch.object(fleet, "ROOT", source), patch.object(fleet, "BASE", base):
                 fleet.publish({"nodes": [node]}, inventory)
             published = json.loads((base / "config/targets.json").read_text())["targets"][0]
             self.assertEqual(published["agent_sha256"], "old-running-hash")
             self.assertEqual(published["ssh_target"], "fixture")
             self.assertEqual(published["release_sha256"], hashlib.sha256(b"isolated fixture").hexdigest())
+            overlay=json.loads(managed.read_text())["targets"][0]
+            self.assertEqual(overlay["release_sha256"],published["release_sha256"])
+            self.assertEqual(overlay["agent_sha256"],"old-managed-running-hash")
+            self.assertEqual(overlay["connection_mode"],"ssh")
+            self.assertEqual(overlay["ssh_remote_port"],18443)
             self.assertEqual(json.loads((base / "releases/current/deploy/local/fleet.json").read_text()), {"nodes": [node]})
             self.assertTrue((base / "releases/current/deploy/orchestration/fleet.py").is_file())
             self.assertTrue((base / "releases/current/deploy/linux/user/install-user-agent.sh").is_file())

@@ -135,6 +135,7 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
           {platformUpdate?.published_at && <> · 发布于 {formatDate(platformUpdate.published_at)}</>}</p>
         {platformUpdate?.last_result?.message && <p className={`hint agent-management-hint ${platformUpdate.last_result.status === "failed" ? "form-error" : ""}`}>{platformUpdate.last_result.message}</p>}
         <p className="hint agent-management-hint">先以平台普通用户运行 <code>./scripts/run-server.sh --build</code> 构建并发布候选（不会重启），再在此验证管理员并确认更新。平台将短暂离线；失败回退文件，不回退数据库迁移。</p>
+        <p className="hint agent-management-hint">使用 SSH 长连接上报的机器会在平台重启后断开；SSH 凭据不落盘，请到设备总览的「SSH 长连接」重新鉴权。Agent 的安装、身份和 Full / Basic 权限仍保留。</p>
       </article>
       <article className="data-panel">
         <header className="panel-header"><div><h2>应急重启</h2><p>支持数据库异常或节点离线；每次均需管理员验证。</p></div>

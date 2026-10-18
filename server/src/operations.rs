@@ -30,6 +30,9 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_os = "linux")]
 mod machines;
 
+#[path = "ssh_transport.rs"]
+mod ssh_transport;
+
 #[path = "platform_update.rs"]
 #[cfg(target_os = "linux")]
 mod platform_update;
@@ -112,6 +115,12 @@ struct Target {
     ssh_alias: Option<String>,
     #[serde(default)]
     disabled: bool,
+    #[serde(default)]
+    connection_mode: ssh_transport::Mode,
+    #[serde(default)]
+    ssh_remote_port: Option<u16>,
+    #[serde(default)]
+    agent_mode: Option<String>,
 }
 
 impl Target {
@@ -130,7 +139,7 @@ impl Target {
         if self.release_sha256.is_none() {
             return "not_published";
         }
-        if self.ssh_alias.is_none() {
+        if self.ssh_alias.is_none() && self.connection_mode != ssh_transport::Mode::Ssh {
             return "untrusted_target";
         }
         match (&self.release_sha256, &self.agent_sha256) {
@@ -143,7 +152,7 @@ impl Target {
     }
 
     fn restart_available(&self) -> bool {
-        self.default_user != "root" && self.ssh_alias.is_some()
+        (self.default_user != "root" && self.ssh_alias.is_some()) || self.connection_mode == ssh_transport::Mode::Ssh
     }
 }
 
@@ -279,6 +288,7 @@ pub fn router(
     initialized: crate::database::Initialized,
     config: Arc<crate::config::ServerConfig>,
 ) -> Router {
+    ssh_transport::maintenance();
     #[cfg(not(target_os = "linux"))]
     drop(config);
     let state = OperationsState {
@@ -533,6 +543,13 @@ fn load_all_targets(path: &FsPath) -> Result<Vec<Target>, OperationsError> {
             // edits must not freeze an old candidate hash in the overlay.
             previous.hostname = target.hostname;
             previous.disabled = target.disabled;
+            if target.connection_mode == ssh_transport::Mode::Ssh {
+                previous.connection_mode = target.connection_mode;
+                previous.ssh_remote_port = target.ssh_remote_port;
+                previous.server_url = target.server_url;
+                previous.agent_mode = target.agent_mode;
+                previous.agent_sha256 = target.agent_sha256;
+            }
         } else {
             targets.push(target);
         }
@@ -545,12 +562,16 @@ fn load_all_targets(path: &FsPath) -> Result<Vec<Target>, OperationsError> {
 
 pub(crate) fn health_targets(
     path: &FsPath,
-) -> Result<Vec<(Uuid, String, IpAddr, u16)>, &'static str> {
+) -> Result<Vec<(Uuid, String, IpAddr, u16, Option<bool>)>, &'static str> {
     load_targets(path)
         .map(|targets| {
             targets
                 .into_iter()
-                .map(|target| (target.node_id, target.hostname, target.host, target.port))
+                .map(|target| {
+                    let connected = (target.connection_mode == ssh_transport::Mode::Ssh)
+                        .then(|| ssh_transport::status(&target)["status"] == "connected");
+                    (target.node_id, target.hostname, target.host, target.port, connected)
+                })
                 .collect()
         })
         .map_err(|_| "可信节点清单不可读取")
@@ -576,6 +597,7 @@ fn read_target_file(path: &FsPath) -> Result<Vec<Target>, OperationsError> {
     for target in &targets {
         if !identifiers.insert(target.node_id)
             || target.port == 0
+            || target.ssh_remote_port == Some(0)
             || !valid_username(&target.default_user)
             || !valid_agent_home(&target.agent_home, &target.default_user)
             || !target.known_hosts.is_absolute()
@@ -679,7 +701,7 @@ async fn update_agent(
     let binary = root.join("target/release/easymanage-agent");
     let script = release_fleet_script(&root);
     check_release_file(&binary)?;
-    check_private_file(&script)?;
+    if target.connection_mode != ssh_transport::Mode::Ssh { check_private_file(&script)?; }
     let release_hash = hex::encode(Sha256::digest(
         std::fs::read(&binary).map_err(|_| OperationsError::registry())?,
     ));
@@ -717,18 +739,26 @@ async fn update_agent(
     .await?;
     let cancellation = Arc::new(Cancellation::default());
     let _cancel_guard = CancelOnDrop(Arc::clone(&cancellation));
+    let worker_state = state.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let _lease = lease;
         let action = if full { "stage-full" } else { "deploy-agent" };
-        run_deployment(&script, &root, node_id, action)?;
-        if full {
+        if target.connection_mode == ssh_transport::Mode::Ssh {
+            let stage = machines::update_over_ssh(&target, &binary, full)?;
+            if full {
+                machines::finish_full_ssh_update(&target, credentials.ok_or(OperationsError::registry())?, stage.as_deref().ok_or(OperationsError::registry())?, &release_hash, &cancellation)?;
+            }
+        } else {
+            run_deployment(&script, &root, node_id, action)?;
+            if full {
+                target.agent_sha256 = Some(release_hash.clone());
+                promote_agent(&target, credentials.ok_or(OperationsError::registry())?, &cancellation)?;
+                run_deployment(&script, &root, node_id, "record-full")?;
+            }
+        }
+        if target.connection_mode == ssh_transport::Mode::Ssh {
             target.agent_sha256 = Some(release_hash);
-            promote_agent(
-                &target,
-                credentials.ok_or(OperationsError::registry())?,
-                &cancellation,
-            )?;
-            run_deployment(&script, &root, node_id, "record-full")?;
+            machines::save_target(&worker_state, &target)?;
         }
         Ok::<_, OperationsError>(())
     });
@@ -787,7 +817,7 @@ async fn restart_agent(
         }
         None
     };
-    let release = if full {
+    let release = if full || target.connection_mode == ssh_transport::Mode::Ssh {
         None
     } else {
         let root = release_root()?;
@@ -820,6 +850,10 @@ async fn restart_agent(
                 credentials.ok_or(OperationsError::registry())?,
                 &cancellation,
             )
+        } else if target.connection_mode == ssh_transport::Mode::Ssh {
+            let session = ssh_transport::primary(&target)?;
+            session.set_timeout(50_000);
+            machines::restart_basic_on(&session, &target)
         } else {
             let (root, script) = release.ok_or(OperationsError::registry())?;
             run_deployment(&script, &root, node_id, "restart-agent")
@@ -1136,60 +1170,8 @@ fn ssh_connect(
     target: &Target,
     credentials: &Credentials,
     cancellation: &Cancellation,
-) -> Result<Session, OperationsError> {
-    check_private_file(&target.known_hosts)?;
-    let socket =
-        TcpStream::connect_timeout(&SocketAddr::new(target.host, target.port), SSH_TIMEOUT)
-            .map_err(|_| OperationsError::ssh("SSH 连接失败，请检查目标机地址和端口"))?;
-    let duplicate = socket
-        .try_clone()
-        .map_err(|_| OperationsError::ssh("SSH 连接初始化失败"))?;
-    *cancellation
-        .socket
-        .lock()
-        .map_err(|_| OperationsError::busy())? = Some(duplicate);
-    if cancellation.is_cancelled() {
-        cancellation.cancel();
-        return Err(OperationsError::ssh("操作已取消"));
-    }
-    let mut session = Session::new().map_err(|_| OperationsError::ssh("SSH 初始化失败"))?;
-    session.set_tcp_stream(socket);
-    session.set_timeout(10_000);
-    session
-        .handshake()
-        .map_err(|_| OperationsError::ssh("SSH 握手失败"))?;
-    let mut known_hosts = session
-        .known_hosts()
-        .map_err(|_| OperationsError::registry())?;
-    known_hosts
-        .read_file(&target.known_hosts, KnownHostFileKind::OpenSSH)
-        .map_err(|_| OperationsError::ssh("无法读取可信 SSH 主机密钥"))?;
-    let (host_key, _) = session
-        .host_key()
-        .ok_or(OperationsError::ssh("目标机没有提供 SSH 主机密钥"))?;
-    if !matches!(
-        known_hosts.check_port(&target.host.to_string(), target.port, host_key),
-        CheckResult::Match
-    ) {
-        return Err(OperationsError::ssh(
-            "SSH 主机密钥未受信任或发生变化，请由管理员核验 known_hosts",
-        ));
-    }
-    session
-        .userauth_password(&credentials.username, &credentials.password)
-        .map_err(|_| {
-            OperationsError(
-                StatusCode::UNAUTHORIZED,
-                "SSH 用户名或密码无效，或目标机未启用密码登录",
-            )
-        })?;
-    if !session.authenticated() {
-        return Err(OperationsError(
-            StatusCode::UNAUTHORIZED,
-            "SSH 身份认证失败",
-        ));
-    }
-    Ok(session)
+) -> Result<ssh_transport::SessionLease, OperationsError> {
+    ssh_transport::operation(target, credentials, cancellation)
 }
 
 async fn elevate(
@@ -2022,6 +2004,9 @@ mod tests {
             release_sha256: Some("A".repeat(64)),
             ssh_alias: Some("fixture".to_owned()),
             disabled: false,
+            connection_mode: ssh_transport::Mode::Direct,
+            ssh_remote_port: None,
+            agent_mode: None,
         };
         assert_eq!(target.update_state(), "current");
         assert!(!target.update_available());

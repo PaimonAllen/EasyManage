@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Trusted fleet orchestration with Linux user/system deployment backends."""
 import argparse
+import fcntl
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
@@ -74,8 +75,25 @@ def require_linux(node):
         raise ValueError("Fleet deployment currently supports Linux targets only")
 
 
+def reject_persistent_cli(node):
+    # Persistent sessions belong to the running controller. A separate CLI
+    # process must not silently create extra SSH logins outside its budget.
+    if node.get("connection_mode") == "ssh":
+        raise RuntimeError("Persistent SSH target: use the platform GUI connection pool, not fleet SSH")
+    for name in ("targets.json", "managed-targets.json"):
+        path = BASE / "config" / name
+        if path.exists():
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError("Unsafe target registry; refusing separate SSH")
+            data = json.loads(path.read_text())
+            targets = data if isinstance(data, list) else data["targets"]
+            if any(target.get("node_id") == node.get("node_id") and target.get("connection_mode") == "ssh" for target in targets):
+                raise RuntimeError("Persistent SSH target: use the platform GUI connection pool, not fleet SSH")
+
+
 def node_preflight(node):
     require_linux(node)
+    reject_persistent_cli(node)
     uuid.UUID(node["node_id"])
     ipaddress.ip_address(node["host"])
     if not isinstance(node["port"], int) or not 1 <= node["port"] <= 65535:
@@ -134,6 +152,7 @@ def create_bundle(directory, node, enrollment, server_url, ca):
 
 
 def stage(node, enrollment, server_url, ca, prepare, full_candidate=False):
+    reject_persistent_cli(node)
     staging = BASE / "staging"
     staging.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(prefix="bundle-", dir=staging) as temporary:
@@ -209,6 +228,24 @@ def publish(manifest, inventory):
     next_path.write_text(json.dumps(existing, indent=2))
     next_path.chmod(0o600)
     next_path.replace(registry_path)
+    managed = registry_path.with_name("managed-targets.json")
+    if managed.exists():
+        descriptor = os.open(managed.with_name("managed-targets.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "a+") as lock:
+            if os.fstat(lock.fileno()).st_uid != os.getuid() or os.fstat(lock.fileno()).st_mode & 0o077:
+                raise RuntimeError("Managed target lock must be private")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            info = managed.lstat()
+            if managed.is_symlink() or not managed.is_file() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise RuntimeError("Managed target registry must be private and owned by the platform user")
+            overlay = json.loads(managed.read_text())
+            for target in overlay["targets"]:
+                target["release_sha256"] = digest
+            with tempfile.NamedTemporaryFile(mode="w", dir=managed.parent, prefix=".managed-publish-", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(json.dumps(overlay, indent=2))
+            temporary.chmod(0o600)
+            temporary.replace(managed)
     print(f"Published Agent candidate SHA-256 {digest}; running services were not changed.")
 
 
@@ -383,6 +420,7 @@ def verify_heartbeats(manifest, started):
 
 def control_agent(node, action):
     require_linux(node)
+    reject_persistent_cli(node)
     compat = ('[ -f "$HOME/.easymanage/config/agent-launch.json" ] && '
               'python3 -c \'import json; from pathlib import Path; d=json.loads((Path.home()/".easymanage/config/agent-launch.json").read_text()); raise SystemExit(0 if d.get("backend")=="compatibility" else 1)\'')
     # A promoted Full agent is intentionally not restarted/downgraded through a user service.
