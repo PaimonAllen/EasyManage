@@ -14,7 +14,7 @@ MOCK = '''#!/usr/bin/python3
 import pathlib,sys
 root=pathlib.Path('/tmp/fixture')
 args=sys.argv[1:]
-if 'show' in args: print('root');sys.exit(0)
+if 'show' in args: print('loaded' if 'LoadState' in args else ('' if (root/'implicit-root').exists() else 'root'));sys.exit(0)
 if 'restart' in args and (root/'case').read_text()=='start-failure': sys.exit(1)
 sys.exit(0)
 '''
@@ -40,6 +40,9 @@ if case=='valid':
  assert not pathlib.Path('/home/tester/.easymanage/config/agent.env').exists()
  assert state.read_bytes()==b'private unchanged Full identity'
  assert config.stat().st_mode&0o777==0o600
+ (root/'implicit-root').write_text('yes')
+ result=subprocess.run(['/usr/bin/python3','/tmp/fixture/network.py','/home/tester/.easymanage',node,'https://127.0.0.1:18444',sha(ca),'full'],input=json.dumps({'enrollment_token':None}).encode(),capture_output=True,timeout=10)
+ assert result.returncode==0,'systemd empty User= defaults to root and must not reject an existing loaded Full service'
 '''
 
 for case in ("valid", "bad-hash", "wrong-node", "start-failure"):

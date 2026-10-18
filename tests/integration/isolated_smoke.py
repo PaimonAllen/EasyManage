@@ -188,6 +188,8 @@ def exercise_api(base_url, context, enrollment_token, node_id):
                  "fingerprint":"fixture","username":"tester","password":"fixture"}
     require(request("/api/v1/machines",add_fixture,{"Origin":"https://foreign.invalid"})[0]==403,
             "cross-origin machine deployment is rejected before credential use")
+    require(request(f"/api/v1/machines/{node_id}/redeploy",{"password":"fixture-secret-marker"},{"Origin":"https://foreign.invalid"})[0]==403,
+            "cross-origin redeployment is rejected before credentials, SSH or database mutation")
     for invalid in [add_fixture|{"auth_method":"fixture-secret-marker"},
                     add_fixture|{"auth_method":"private_key","private_key":"fixture-secret-marker"},
                     add_fixture|{"password":["fixture-secret-marker"]}]:
@@ -747,7 +749,18 @@ def smoke(args):
                     exercise_agent(args.agent_binary, root, env, base_url, ca_certificate, enrollment)
                 if args.machine_onboarding:
                     from machine_onboarding_smoke import exercise
-                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require)
+                    def restart_controller():
+                        nonlocal server
+                        stop_process(server)
+                        server = subprocess.Popen([str(args.server_binary.resolve())], cwd=root, env=server_env, stdout=log, stderr=subprocess.STDOUT)
+                        deadline=time.monotonic()+25
+                        while time.monotonic()<deadline:
+                            try:
+                                with opener.open(base_url+'/api/v1/health/ready',timeout=2) as response:
+                                    if response.status==200:return
+                            except OSError:time.sleep(0.1)
+                        raise RuntimeError('Isolated controller restart failed')
+                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment)
                 with opener.open(base_url + "/api/v1/operations/targets", timeout=2) as response:
                     expected_target_count = len(json.load(response)["targets"])
                 # Reproduce PostgreSQL outage and restart the Server with DB down.
@@ -827,6 +840,9 @@ if __name__ == "__main__":
     parser.add_argument("--server-binary", type=Path, required=True)
     parser.add_argument("--agent-binary", type=Path)
     parser.add_argument("--machine-onboarding", action="store_true", help="Opt-in SSH/SCP fixture with mocked systemd and a real installed Agent; temporary Paramiko venv required")
+    parser.add_argument("--machine-redeployment",action="store_true",help="Add real same-UUID uninstalled Agent redeployment coverage; skips the separate three-minute retry-exhaustion scenario")
     parser.add_argument("--host-netns", required=True)
     parser.add_argument("--host-mntns", required=True)
-    smoke(parser.parse_args())
+    args=parser.parse_args()
+    if args.machine_redeployment:args.machine_onboarding=True
+    smoke(args)

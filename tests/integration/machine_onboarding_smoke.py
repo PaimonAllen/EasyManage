@@ -25,12 +25,15 @@ import urllib.error
 import urllib.request
 
 
-def exercise(binary, root, environment, base_url, context, enrollment, require):
+def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False):
     import paramiko
     logging.getLogger("paramiko").setLevel(logging.CRITICAL)
     mounts = Path("/proc/self/mountinfo").read_text().splitlines()
     if not any(line.split()[4] == "/home" and line.split(" - ")[1].startswith("tmpfs ") for line in mounts):
         raise RuntimeError("Refusing SSH fixture without a private /home tmpfs")
+    for path in ['/var','/etc/easymanage','/etc/systemd/system','/usr/local/sbin']:
+        if not any(line.split()[4]==path and line.split(' - ')[1].startswith('tmpfs ') for line in mounts):
+            raise RuntimeError('Refusing SSH file checks without masked production Agent paths')
     current = pwd.getpwuid(os.getuid())
     home = Path(current.pw_dir)
     if home.parent != Path("/home"):
@@ -48,7 +51,7 @@ import json, os, pathlib, subprocess, sys
 runtime=pathlib.Path(os.environ["MACHINE_FIXTURE_RUNTIME"])
 args=sys.argv[1:]
 if "--user" not in args:
-    if "show" in args: print("inactive"); sys.exit(0)
+    if "show" in args: print("not-found" if "LoadState" in args else "inactive"); sys.exit(0)
     sys.exit(1)
 args.remove("--user")
 action=args[0]
@@ -164,8 +167,21 @@ sys.exit(2)
                 completed=subprocess.run(shlex.split(command),input=payload,env=ssh_env,capture_output=True,timeout=15)
                 for index in range(len(payload)): payload[index]=0
                 channel.sendall(completed.stdout);result=completed.returncode
+            elif command.startswith("/usr/bin/python3 -c ") and "EasyManage redeploy preflight" in command:
+                completed=subprocess.run(shlex.split(command),env=ssh_env,capture_output=True,timeout=10)
+                channel.sendall(completed.stdout);result=completed.returncode
             elif "test ! -e /etc/easymanage/agent.env" in command:
-                result=1 if collision.is_set() else 0
+                if collision.is_set(): result=1
+                elif allow_full.is_set():
+                    # The second logical target gets its own root filesystem
+                    # below. Its actual Full installer repeats all existence
+                    # checks there, not in target one's shared Basic home.
+                    result=0
+                else:
+                    # The outer namespace masks production /var and system
+                    # Agent paths. Execute real file-presence checks here.
+                    completed=subprocess.run(shlex.split(command),env=ssh_env,capture_output=True,timeout=10)
+                    channel.sendall(completed.stdout);result=completed.returncode
             elif command.startswith('umask 077;') and 'mktemp -d ' in command and '.easymanage/staging/agent.' in command:
                 stage=home/".easymanage/staging"/("agent."+secrets.token_hex(4))
                 stage.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -319,7 +335,9 @@ sys.exit(0)
             try: transport.start_server(server=Server(transport))
             except Exception: transport.close()
     threading.Thread(target=accept,daemon=True).start()
-    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=context))
+    import http.cookiejar
+    cookies=http.cookiejar.CookieJar()
+    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=context),urllib.request.HTTPCookieProcessor(cookies))
     def request(path,body=None,headers=None):
         data=None if body is None else json.dumps(body).encode()
         headers={"Content-Type":"application/json"}|(headers or {})
@@ -337,6 +355,12 @@ sys.exit(0)
             if job["status"]!="running": return job
             time.sleep(0.25)
         raise AssertionError("Onboarding fixture timed out")
+    def begin_redeployment(node_id,body):
+        deadline=time.monotonic()+75
+        while True:
+            status,result=request(f'/api/v1/machines/{node_id}/redeploy',body)
+            if status!=429 or time.monotonic()>=deadline:return status,result
+            time.sleep(5)  # Respect per-node operation limits from earlier tests.
     try:
         _,probe=request("/api/v1/machines/probe",{"host":"10.222.0.9","port":2222})
         require("fingerprint" in probe and not attempts,"onboarding fingerprint probe never sends SSH credentials")
@@ -392,6 +416,16 @@ sys.exit(0)
         _,machines=request("/api/v1/machines")
         persistent=next(machine for machine in machines["machines"] if machine["node_id"]==node_id)
         require(persistent["connection_mode"]=="ssh" and persistent["ssh_transport"]["connections"]==2,"control and reverse HTTPS use exactly two long TCP SSH connections")
+        require(persistent["credentials_saved"] and persistent["saved_credentials_usable"],"successful verified onboarding encrypts credentials and authorizes only this browser")
+        require(persistent['deployment_mode']=='basic' and not persistent['redeploy_available'],"online machines expose their original mode but cannot be redeployed")
+        redeploy_request={'confirmation':node_id,'username':current.pw_name,'use_saved':True,'connection_mode':'ssh','server_url':base_url}
+        require(request(f'/api/v1/machines/{node_id}/redeploy',redeploy_request)[0]==400,"redeploy refuses a machine with recent actual heartbeats before any upload")
+        no_cookie=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=context))
+        try:
+            no_cookie.open(urllib.request.Request(base_url+f"/api/v1/machines/{node_id}/ssh",data=json.dumps({"action":"disconnect","username":current.pw_name,"use_saved":True}).encode(),headers={"Content-Type":"application/json","Origin":base_url}),timeout=5)
+        except urllib.error.HTTPError as error:
+            require(error.code==401,"knowing node UUID and same origin is insufficient to use saved credentials from an unauthorized browser")
+        else: raise AssertionError("Saved credential capability was not enforced")
         dial_count=len(transports)
         for _ in range(3):
             require(request("/api/v1/machines/probe",{"host":"10.222.0.9","port":2222})[0]==200,"repeated fingerprint reads reuse the authenticated control handshake")
@@ -399,7 +433,7 @@ sys.exit(0)
         require(len(transports)==dial_count,"status/fingerprint/health inspection does not initiate more SSH connections")
         for transport in transports: transport.close()
         after_disconnect=time.time()
-        deadline=time.monotonic()+65
+        deadline=time.monotonic()+110
         while time.monotonic()<deadline:
             _,snapshot=request("/api/v1/nodes")
             resumed=next((node for node in snapshot["nodes"] if node["id"]==created["node_id"]),None)
@@ -408,7 +442,7 @@ sys.exit(0)
         if not resumed or parse_timestamp(resumed["last_seen"]).timestamp()<=after_disconnect:
             _,machines=request("/api/v1/machines")
             print("DIAGNOSTIC SSH recovery:",next((m.get("ssh_transport") for m in machines["machines"] if m["node_id"]==node_id),None),"fixture errors:",errors,flush=True)
-        require(resumed and parse_timestamp(resumed["last_seen"]).timestamp()>after_disconnect,"tunnel and control reconnect with backoff and resume real Agent reports after SSH disconnect")
+        require(resumed and parse_timestamp(resumed["last_seen"]).timestamp()>after_disconnect,"tunnel and control reconnect after one minute and resume real Agent reports after SSH disconnect")
         _,machines=request("/api/v1/machines")
         persistent=next(machine for machine in machines["machines"] if machine["node_id"]==node_id)
         require(persistent["ssh_transport"]["connections"]<=3 and persistent["ssh_transport"]["reconnects"]>=1,"recovery remains within the three-SSH budget")
@@ -428,12 +462,13 @@ sys.exit(0)
         if update_status!=200: print("DIAGNOSTIC pooled update:",update_status,update_result,errors,flush=True)
         require(update_status==200 and len(transports)==dial_count,"real binary update/SCP and Basic restart reuse control without a new SSH handshake")
         require(max_connections[0]<=3,"all observed SSH handshakes including probes stay within the connection cap")
-        require(request(f"/api/v1/machines/{node_id}/ssh",ssh_auth|{"action":"disconnect"})[0]==200,"explicit disconnect stops the tunnel and releases its credential worker")
+        saved_auth={"username":current.pw_name,"use_saved":True}
+        require(request(f"/api/v1/machines/{node_id}/ssh",saved_auth|{"action":"disconnect"})[0]==200,"authorized browser disconnects without resending its private key and pauses automatic restore")
         time.sleep(0.5)
         allow_forward.clear()
-        require(request(f"/api/v1/machines/{node_id}/ssh",ssh_auth|{"action":"connect"})[0]!=200,"disabled SSH forwarding is reported without modifying sshd or bypassing policy")
+        require(request(f"/api/v1/machines/{node_id}/ssh",saved_auth|{"action":"connect"})[0]!=200,"disabled SSH forwarding is reported without modifying sshd or bypassing policy")
         allow_forward.set()
-        require(request(f"/api/v1/machines/{node_id}/ssh",ssh_auth|{"action":"connect"})[0]==200,"same machine can reconnect after forwarding is explicitly allowed")
+        require(request(f"/api/v1/machines/{node_id}/ssh",saved_auth|{"action":"connect"})[0]==200,"same machine reconnects from encrypted saved key after forwarding is explicitly allowed")
         require((runtime/"crontab").read_text().count("# BEGIN EasyManage Agent compatibility")==1,"compatibility autostart updates only its managed user-cron block")
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
@@ -458,6 +493,7 @@ sys.exit(0)
         files.extend(root.glob("*.log"))
         files.extend(root.glob("*.json"))
         files.extend(runtime.glob("*.log"))
+        files.extend((root/"ssh-vault").glob("*.enc"))
         for file in files:
             content=file.read_bytes()
             require(not any(secret in content for secret in sensitive),"credentials absent from persisted fixture file: "+file.name)
@@ -483,12 +519,12 @@ sys.exit(0)
         _,machines=request("/api/v1/machines")
         require(any(machine["node_id"]==node_id and machine["deleted_at"] for machine in machines["machines"]),"archived machine remains listed with its original ID")
         require(request(f"/api/v1/machines/{node_id}/manage",change|{"action":"restore"})[0]==200,"restore re-enables the original machine credential without reinstalling")
-        # Restoring does not persist SSH secrets. Reattach explicitly with the
-        # original key; original Agent token and SQLite UUID must be unchanged.
+        # Soft deletion pauses auto-recovery but retains encrypted credentials.
+        # Explicit restoration/reattach must keep original SQLite identity.
         time.sleep(1)
         deadline=time.monotonic()+75
         while True:
-            restore_status,restore_result=request(f"/api/v1/machines/{node_id}/ssh",ssh_auth|{"action":"connect"})
+            restore_status,restore_result=request(f"/api/v1/machines/{node_id}/ssh",saved_auth|{"action":"connect"})
             if restore_status!=429 or time.monotonic()>=deadline: break
             time.sleep(5)  # Respect the existing HTTP/SSH-operation rate limits.
         if restore_status!=200: print("DIAGNOSTIC restored SSH:",restore_status,restore_result,errors,flush=True)
@@ -503,6 +539,88 @@ sys.exit(0)
             identity_after=dict(db.execute("SELECT key,value FROM metadata WHERE key IN ('node_id','agent_token')"))
         require(identity_after==identity_before,"restore preserves the exact SQLite identity and original Agent credential")
         require(max_connections[0]<=3,"credentialed management and recovery never exceed three observed SSH connections")
+        if redeployment:
+            _,before_nodes=request('/api/v1/nodes')
+            _,before_history=request(f'/api/v1/nodes/{node_id}/history')
+            preserved_points={point['collected_at'] for point in before_history['points']}
+            require(preserved_points,"redeployment fixture starts with real persisted history")
+            subprocess.run(['/usr/bin/python3',str(home/'.easymanage/bin/agent-user-control.py'),'stop'],env=ssh_env,check=True,capture_output=True,timeout=25)
+            deadline=time.monotonic()+70
+            while time.monotonic()<deadline:
+                _,machines=request('/api/v1/machines')
+                inactive=next(machine for machine in machines['machines'] if machine['node_id']==node_id)
+                if inactive['redeploy_available']:break
+                time.sleep(0.5)
+            require(inactive['redeploy_available'],"offline original node becomes eligible after the actual online window expires")
+            # A stopped installation still contains identity: it must not be
+            # silently overwritten, and the existing browser capability survives.
+            original_env=(home/'.easymanage/config/agent.env').read_bytes()
+            original_db=(home/'.easymanage/state/state.db').read_bytes()
+            status,blocked=begin_redeployment(node_id,redeploy_request)
+            blocked_job=wait_job(blocked) if status==200 else None
+            if not blocked_job or blocked_job['status']!='failed' or any('已上传' in event['message'] for event in blocked_job['events']):
+                print('DIAGNOSTIC residual redeploy:',status,blocked.get('message') if status!=200 else [event['message'] for event in blocked_job['events']],errors,flush=True)
+            require(blocked_job and blocked_job['status']=='failed' and not any('已上传' in event['message'] for event in blocked_job['events']),"stopped residual Agent configuration/identity refuses redeploy before upload")
+            require((home/'.easymanage/config/agent.env').read_bytes()==original_env and (home/'.easymanage/state/state.db').read_bytes()==original_db,"failed redeployment does not rewrite existing target config or SQLite bytes")
+            _,machines=request('/api/v1/machines')
+            require(next(machine for machine in machines['machines'] if machine['node_id']==node_id)['saved_credentials_usable'],"failed preflight does not revoke the authorized browser's saved-credential capability")
+            archive=home/('.easymanage-uninstalled-'+secrets.token_hex(4))
+            (home/'.easymanage').rename(archive)  # Only this isolated fixture.
+            require(request(f'/api/v1/machines/{node_id}/redeploy',redeploy_request|{'confirmation':'wrong'})[0]==400,"redeployment requires explicit confirmation of the original UUID")
+            require(request(f'/api/v1/machines/{node_id}/redeploy',redeploy_request|{'host':'10.222.0.10'})[0]==400,"redeployment cannot replace the trusted target address through request fields")
+            dial_count=len(transports)
+            status,recreated=begin_redeployment(node_id,redeploy_request)
+            if status!=200:print('DIAGNOSTIC recreate request:',status,recreated.get('message'),flush=True)
+            require(status==200 and recreated['node_id']==node_id,"redeployment creates a new scoped task for the original UUID, not another node")
+            require(request('/api/v1/machines/jobs/'+created['job_id'],headers={'Authorization':'Bearer '+created['job_key']})[0]==401,"replacing a completed deployment task rotates its log capability")
+            require(request(f'/api/v1/machines/{node_id}/redeploy',redeploy_request)[0]==429,"a running redeploy task cannot be started twice")
+            recreated_job=wait_job(recreated)
+            if recreated_job['status']!='success':print('DIAGNOSTIC redeployment:',[event['message'] for event in recreated_job['events']],errors,flush=True)
+            require(recreated_job['status']=='success',"uninstalled Basic node redeploys over real SCP/checksums and requires a new real Agent heartbeat")
+            require(len(transports)==dial_count and max_connections[0]<=3,"redeployment reuses the existing control and reverse HTTPS sessions without another SSH handshake")
+            _,after_nodes=request('/api/v1/nodes')
+            _,after_history=request(f'/api/v1/nodes/{node_id}/history')
+            _,machines=request('/api/v1/machines')
+            restored=next(machine for machine in machines['machines'] if machine['node_id']==node_id)
+            require(len(after_nodes['nodes'])==len(before_nodes['nodes']) and restored['display_name']=='Renamed SSH fixture' and restored['note']=='fixture note',"redeploy preserves node count, original display name and management note")
+            require(preserved_points<={point['collected_at'] for point in after_history['points']},"redeploy retains every existing historical metric point")
+            with sqlite3.connect('file:'+str(home/'.easymanage/state/state.db')+'?mode=ro',uri=True) as db:
+                new_identity=dict(db.execute("SELECT key,value FROM metadata WHERE key IN ('node_id','agent_token')"))
+            require(new_identity['node_id']==identity_before['node_id'] and new_identity['agent_token']!=identity_before['agent_token'],"fresh installation reuses UUID and rotates only the lost/old Agent credential")
+            old_report={'protocol_version':1,'node_id':node_id,'agent_version':'0.5.0','inventory':real_node,'metrics':real_node['metrics']}
+            require(request('/api/v1/agent/report',old_report,{'x-easymanage-agent-token':identity_before['agent_token']})[0]==401,"old archived Agent token can no longer report after redeployment enrollment")
+            require((archive/'state/state.db').read_bytes()==original_db,"the isolated uninstall archive is not touched by the platform")
+        if restart_controller and not redeployment:
+            since=time.time()
+            restart_controller()
+            deadline=time.monotonic()+35
+            while time.monotonic()<deadline:
+                _,listing=request('/api/v1/nodes')
+                restored=next((node for node in listing['nodes'] if node['id']==node_id),None)
+                if restored and parse_timestamp(restored['last_seen']).timestamp()>since: break
+                time.sleep(0.25)
+            require(restored and parse_timestamp(restored['last_seen']).timestamp()>since,"real platform restart reloads encrypted key and resumes actual Agent heartbeats without resubmitting SSH credentials")
+            _,machines=request('/api/v1/machines')
+            persisted=next(machine for machine in machines['machines'] if machine['node_id']==node_id)
+            require(persisted['saved_credentials_usable'] and persisted['ssh_transport']['connections']==2,"browser capability and two-session transport survive platform restart")
+        if not redeployment:
+            # Exercise the actual production retry policy, without a fake clock.
+            allow_forward.clear()
+            for transport in transports: transport.close()
+            failed_at=time.monotonic()
+            deadline=failed_at+250
+            while time.monotonic()<deadline:
+                _,machines=request('/api/v1/machines')
+                retry=next(machine['ssh_transport'] for machine in machines['machines'] if machine['node_id']==node_id)
+                if retry['status']=='retry_exhausted': break
+                time.sleep(0.5)
+            require(retry['status']=='retry_exhausted' and retry['retry_attempt']==3 and retry['connections']==0,"three real one-minute reconnect failures stop and release every SSH connection")
+            require(time.monotonic()-failed_at>=180,"retry policy never starts three reconnect attempts sooner than three minutes")
+            dial_count=len(transports)
+            time.sleep(2)
+            require(len(transports)==dial_count,"retry exhaustion stops further SSH handshakes until explicit manual reconnect")
+            allow_forward.set()
+            require(request(f'/api/v1/machines/{node_id}/ssh',saved_auth|{'action':'connect'})[0]==200,"manual retry after exhaustion reuses encrypted credentials without a password prompt")
         collision.set()
         status,blocked=request("/api/v1/machines",payload|{"host":"10.222.0.10"})
         blocked_job=wait_job(blocked) if status==200 else None

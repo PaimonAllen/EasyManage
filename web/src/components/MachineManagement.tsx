@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
-import { addMachine, changeMachine, fetchMachineJob, fetchMachines, probeMachine, manageMachineSsh } from "../api/client";
+import { addMachine, changeMachine, fetchMachineJob, fetchMachines, probeMachine, manageMachineSsh, redeployMachine } from "../api/client";
 import type { ManagedMachine, MachineDeployment, MachineStatus } from "../api/client";
 import { formatDate } from "../lib/format";
 import { MAX_PRIVATE_KEY_BYTES, clearMachineAuthentication, type MachineAuthentication, type MachineAuthMethod, type MachineDeploymentMode } from "../lib/machineAuthentication";
@@ -10,6 +10,7 @@ export function MachineManagement({ onRefresh }: { onRefresh: () => void }) {
   const [message,setMessage]=useState("");
   const [adding,setAdding]=useState(false);
   const [sshMachine,setSshMachine]=useState<ManagedMachine|null>(null);
+  const [redeployTarget,setRedeployTarget]=useState<ManagedMachine|null>(null);
   const [selected,setSelected]=useState<{machine:ManagedMachine;action:"edit"|"delete"|"restore"}|null>(null);
   const [job,setJob]=useState<{id:string;key:string}|null>(null);
   const [progress,setProgress]=useState<MachineDeployment|null>(null);
@@ -51,16 +52,71 @@ export function MachineManagement({ onRefresh }: { onRefresh: () => void }) {
         {status?.machines.map(machine=><tr key={machine.node_id}><td><strong>{machine.display_name||machine.hostname}</strong><small className="block">{machine.note||machine.hostname}</small></td>
           <td>{machine.host?`${machine.host}:${machine.port}`:"未配置可信目标"}<small className="block">{machine.username}</small></td>
           <td>{machine.deleted_at?"已软删除":Date.now()-Date.parse(machine.last_seen)<45_000?"在线":"离线 / 等待部署"}
-            {machine.connection_mode==="ssh"&&<small className="block">SSH · {sshLabel(machine.ssh_transport?.status)} · {machine.ssh_transport?.connections??0}/3 条连接</small>}</td>
+            {machine.connection_mode==="ssh"&&<small className="block">SSH · {sshLabel(machine.ssh_transport?.status)} · {machine.ssh_transport?.connections??0}/3 条连接{machine.ssh_transport?.status==="reconnecting"?` · 重试 ${machine.ssh_transport.retry_attempt??0}/3（每 60 秒）`:""}</small>}
+            {machine.ssh_transport?.last_error&&<small className="block">{machine.ssh_transport.last_error}</small>}
+            {machine.credentials_saved&&<small className="block">SSH 凭据已加密保存</small>}</td>
           <td><div className="machine-actions"><button className="button button--small button--secondary" disabled={!machine.manageable||!!job} onClick={()=>setSelected({machine,action:"edit"})}>编辑</button>
             <button className="button button--small button--secondary" disabled={!machine.manageable||!!job} onClick={()=>setSelected({machine,action:machine.deleted_at?"restore":"delete"})}>{machine.deleted_at?"恢复":"软删除"}</button>
-            {!machine.deleted_at&&machine.host&&<button className="button button--small button--secondary" disabled={!!job} onClick={()=>setSshMachine(machine)}>SSH 长连接</button>}</div></td></tr>)}
+            {!machine.deleted_at&&machine.host&&<><button className="button button--small button--secondary" disabled={!!job} onClick={()=>setSshMachine(machine)}>SSH 长连接</button>
+              <button className="button button--small button--secondary" disabled={!!job||!machine.redeploy_available||!status?.candidate_available||!status.ca_available||!status.registry_writable}
+                title="仅用于已卸载的离线节点；保留原机器 ID 和历史，不覆盖仍存在的身份数据" onClick={()=>setRedeployTarget(machine)}>重新部署</button></>}</div></td></tr>)}
       </tbody></table></div>
     </details>
     {adding&&<AddMachineDialog onClose={()=>setAdding(false)} onStarted={started=>{setAdding(false);setProgress({node_id:started.node_id,status:"running",progress:0,events:[]});setJob({id:started.job_id,key:started.job_key});}}/>}
     {selected&&<ChangeMachineDialog {...selected} onClose={()=>setSelected(null)} onDone={message=>{setMessage(message);setSelected(null);void refresh();onRefresh();}}/>}
     {sshMachine&&<MachineSshDialog machine={sshMachine} onClose={()=>setSshMachine(null)} onDone={message=>{setMessage(message);setSshMachine(null);void refresh();onRefresh();}}/>}
+    {redeployTarget&&<RedeployMachineDialog machine={redeployTarget} onClose={()=>setRedeployTarget(null)} onStarted={started=>{
+      setRedeployTarget(null);setProgress({node_id:started.node_id,status:"running",progress:0,events:[]});setJob({id:started.job_id,key:started.job_key});
+    }}/>}
   </article>;
+}
+
+export function RedeployMachineDialog({machine,onClose,onStarted}:{machine:ManagedMachine;onClose:()=>void;onStarted:(job:{job_id:string;job_key:string;node_id:string})=>void}){
+  const dialog=useRef<HTMLDialogElement>(null);
+  const [useSaved,setUseSaved]=useState(!!machine.saved_credentials_usable);
+  const [method,setMethod]=useState<MachineAuthMethod>("password");
+  const [connectionMode,setConnectionMode]=useState<"auto"|"direct"|"ssh">(machine.connection_mode==="ssh"?"ssh":"auto");
+  const [url,setUrl]=useState(typeof window==="undefined"?"https://127.0.0.1:8443":window.location.origin);
+  const [confirmed,setConfirmed]=useState(false);const [busy,setBusy]=useState(false);const [error,setError]=useState("");
+  const password=useRef<HTMLInputElement>(null);const key=useRef<HTMLInputElement>(null);const phrase=useRef<HTMLInputElement>(null);const sudo=useRef<HTMLInputElement>(null);
+  function clear(){for(const input of [password.current,key.current,phrase.current,sudo.current])if(input)input.value="";}
+  useEffect(()=>{dialog.current?.showModal();return clear;},[]);
+  async function submit(){
+    if(busy||!confirmed)return;setBusy(true);setError("");let auth:MachineAuthentication|undefined;
+    try{
+      const request={confirmation:machine.node_id,username:machine.username||"",server_url:url.trim(),connection_mode:connectionMode};
+      let pending:ReturnType<typeof redeployMachine>;
+      if(useSaved)pending=redeployMachine(machine.node_id,{...request,use_saved:true});
+      else{
+        if(method==="password")auth={auth_method:"password",password:password.current?.value||""};
+        else{
+          const file=key.current?.files?.[0];
+          if(!file||!file.size||file.size>MAX_PRIVATE_KEY_BYTES||/\.(pub|ppk)$/i.test(file.name))throw new Error("请选择不超过 12 KiB 的 OpenSSH / PEM 私钥文件");
+          auth={auth_method:"private_key",private_key:await file.text(),passphrase:phrase.current?.value||""};
+        }
+        if(machine.deployment_mode==="full"&&machine.username!=="root")auth.sudo_password=sudo.current?.value||"";
+        pending=redeployMachine(machine.node_id,{...request,...auth});
+        clearMachineAuthentication(auth);
+      }
+      clear();onStarted(await pending);
+    }catch(error){setError(error instanceof Error?error.message:"重新部署未启动");}
+    finally{if(auth)clearMachineAuthentication(auth);clear();setBusy(false);}
+  }
+  return <dialog ref={dialog} className="credentials-dialog" onCancel={event=>{if(busy)event.preventDefault();else onClose();}}><form autoComplete="off" onSubmit={event=>{event.preventDefault();void submit();}}>
+    <div className="dialog-title"><h2>重新部署 Agent · {machine.display_name||machine.hostname}</h2><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭">×</button></div>
+    <p>{machine.username}@{machine.host}:{machine.port}</p>
+    <div className="notice"><strong>保留原机器 ID、历史、名称和备注</strong><code className="block">{machine.node_id}</code>
+      <p>保持原权限：{machine.deployment_mode==="full"?"管理员 Full（root 系统服务）":"普通用户 Basic（全部位于原 SSH 用户 ~/.easymanage 内）"}。此入口不更换地址、账户、主机公钥或权限级别。</p></div>
+    <p className="hint">仅用于已经卸载的离线节点。平台下发最新候选，重新安装并等待新的真实心跳；注册成功后旧 Agent 凭据失效。若仍有进程、配置、服务或身份库，将拒绝覆盖，请使用更新或 SSH 重连。不会删除旧文件、强杀进程或重启目标机器。</p>
+    <AgentConnectionSettings url={url} busy={busy} onChange={setUrl} mode={connectionMode} onModeChange={setConnectionMode}/>
+    {machine.saved_credentials_usable&&<label className="machine-confirm"><input type="checkbox" checked={useSaved} disabled={busy} onChange={event=>{clear();setUseSaved(event.target.checked);}}/>使用平台已加密保存的 SSH 凭据</label>}
+    {!useSaved&&<SshAuthenticationFields method={method} onMethodChange={value=>{clear();setMethod(value);}} busy={busy} required passwordRef={password} keyRef={key} passphraseRef={phrase}/>}
+    {!useSaved&&machine.deployment_mode==="full"&&machine.username!=="root"&&<label>sudo 密码（如需）<input ref={sudo} type="password" autoComplete="off" maxLength={1024} disabled={busy}/><small>密码登录时留空复用 SSH 密码；私钥登录可单独提供 sudo 密码。</small></label>}
+    <label className="machine-confirm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event=>setConfirmed(event.target.checked)}/>确认原 Agent 已卸载；按以上原机器 ID 重新部署，不新增机器。</label>
+    <p className="hint">凭据仅以密文保存在平台，不回传明文、不写日志；复用可信 SSH，最多 3 条长连接。任务进度和日志会显示在机器管理中。</p>
+    {error&&<p className="form-error" role="alert">{error}</p>}
+    <div className="dialog-actions"><button type="button" className="button button--secondary" disabled={busy} onClick={onClose}>取消</button><button className="button" disabled={busy||!confirmed}>{busy?"提交中…":"确认重新部署"}</button></div>
+  </form></dialog>;
 }
 
 function AddMachineDialog({onClose,onStarted}:{onClose:()=>void;onStarted:(job:{job_id:string;job_key:string;node_id:string})=>void}){
@@ -115,7 +171,7 @@ function AddMachineDialog({onClose,onStarted}:{onClose:()=>void;onStarted:(job:{
     {fingerprint&&<><div className="notice"><strong>SSH 主机指纹</strong><code className="block">{fingerprint}</code><p>请在目标机核对对应主机公钥的 ssh-keygen -lf 输出；首次连接不等于可信。</p></div>
       <label className="machine-confirm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event=>setConfirmed(event.target.checked)}/>我已核验指纹，确认此目标可安装并启动{deploymentMode==="full"?"管理员 Full 系统服务":"普通用户 Basic Agent"}</label>
     </>}
-    <p className="hint">确认指纹前不发送鉴权凭据。SSH / sudo 密码、私钥和口令不保存到数据库、配置或日志。SSH 长连接期间为断线重连保留 SSH 凭据于平台内存，断开后清理；平台重启后须重新鉴权。请确保平台证书可信。</p>
+    <p className="hint">确认指纹前不发送鉴权凭据。验证成功后，SSH 密码、私钥及口令使用平台专用主密钥加密保存，不回传浏览器、不写入日志；平台重启后可恢复已启用的 SSH 长连接。请确保平台证书可信。</p>
     {error&&<p className="form-error" role="alert">{error}</p>}
     <div className="dialog-actions"><button type="button" className="button button--secondary" disabled={busy} onClick={onClose}>取消</button><button className="button" disabled={busy||!!fingerprint&&!confirmed}>{busy?"处理中…":fingerprint?"确认下发并启动":"检查 SSH 主机指纹"}</button></div>
   </form></dialog>;
@@ -157,18 +213,20 @@ export function SshAuthenticationFields({method,onMethodChange,busy,required,pas
     {method==="password"?<label>SSH 密码<input ref={passwordRef} required={required} type="password" autoComplete="off" maxLength={1024} disabled={busy}/></label>:<>
       <label>SSH 私钥文件（OpenSSH / PEM，最大 12 KiB）<input ref={keyRef} required={required} type="file" disabled={busy}/></label>
       <label>私钥口令（如有）<input ref={passphraseRef} type="password" autoComplete="off" maxLength={1024} disabled={busy}/></label>
-      <p className="hint">选择私钥文件，不是 .pub 公钥；支持带口令私钥，私钥内容不会展示或写入服务器文件。</p>
+      <p className="hint">选择私钥文件，不是 .pub 公钥；支持带口令私钥，私钥内容不会展示，平台仅保存加密副本。</p>
     </>}
   </>;
 }
 
 function sshLabel(status?:string){
-  return ({connected:"已连接",reconnecting:"断线重连中",authentication_required:"需重新鉴权",disconnected:"已断开"} as Record<string,string>)[status??""]??"等待连接";
+  return ({connected:"已连接",reconnecting:"断线重连中",retry_exhausted:"3 次重连失败，已停止自动尝试",authentication_required:"凭据失效或主机密钥变化",disconnected:"已断开"} as Record<string,string>)[status??""]??"等待连接";
 }
 
-function MachineSshDialog({machine,onClose,onDone}:{machine:ManagedMachine;onClose:()=>void;onDone:(message:string)=>void}){
+export function MachineSshDialog({machine,onClose,onDone}:{machine:ManagedMachine;onClose:()=>void;onDone:(message:string)=>void}){
   const dialog=useRef<HTMLDialogElement>(null);
-  const [action,setAction]=useState<"connect"|"disconnect">(machine.ssh_transport&&machine.ssh_transport.status!=="disconnected"?"disconnect":"connect");
+  const [action,setAction]=useState<"connect"|"disconnect"|"forget">(machine.ssh_transport?.status==="connected"?"disconnect":"connect");
+  const [savedUsable,setSavedUsable]=useState(!!machine.saved_credentials_usable);
+  const [useSaved,setUseSaved]=useState(!!machine.saved_credentials_usable);
   const [method,setMethod]=useState<MachineAuthMethod>("password");
   const [busy,setBusy]=useState(false);const [error,setError]=useState("");const [confirmed,setConfirmed]=useState(false);
   const password=useRef<HTMLInputElement>(null);const key=useRef<HTMLInputElement>(null);const phrase=useRef<HTMLInputElement>(null);const sudo=useRef<HTMLInputElement>(null);
@@ -177,6 +235,10 @@ function MachineSshDialog({machine,onClose,onDone}:{machine:ManagedMachine;onClo
   async function submit(){
     if(busy||!confirmed)return;setBusy(true);setError("");let auth:MachineAuthentication|undefined;
     try{
+      if(useSaved){
+        const pending=manageMachineSsh(machine.node_id,{action,username:machine.username||"",use_saved:true});
+        clear();onDone((await pending).message);return;
+      }
       if(method==="password")auth={auth_method:"password",password:password.current?.value||""};
       else{
         const file=key.current?.files?.[0];
@@ -187,17 +249,25 @@ function MachineSshDialog({machine,onClose,onDone}:{machine:ManagedMachine;onClo
       const pending=manageMachineSsh(machine.node_id,{action,username:machine.username||"",...auth});
       clearMachineAuthentication(auth);clear();
       onDone((await pending).message);
-    }catch(error){setError(error instanceof Error?error.message:"SSH 网络切换失败");}
+    }catch(error){
+      setError(error instanceof Error?error.message:"SSH 网络切换失败");
+      // SSH authentication can succeed even when the later network preflight
+      // fails. Its secure cookie lets the next attempt reuse encrypted secrets.
+      try {const current=(await fetchMachines()).machines.find(item=>item.node_id===machine.node_id);
+        setSavedUsable(!!current?.saved_credentials_usable);setUseSaved(!!current?.saved_credentials_usable);
+      }catch{/* Preserve the original operation error. */}
+    }
     finally{if(auth)clearMachineAuthentication(auth);clear();setBusy(false);}
   }
   return <dialog ref={dialog} className="credentials-dialog" onCancel={event=>{if(busy)event.preventDefault();else onClose();}}><form autoComplete="off" onSubmit={event=>{event.preventDefault();void submit();}}>
     <div className="dialog-title"><h2>SSH 长连接 · {machine.display_name||machine.hostname}</h2><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭">×</button></div>
     <p>{machine.username}@{machine.host}:{machine.port} · {sshLabel(machine.ssh_transport?.status)} · {machine.ssh_transport?.connections??0}/3 条连接</p>
-    <label>操作<select value={action} disabled={busy} onChange={event=>{setAction(event.target.value as typeof action);clear();setConfirmed(false);}}><option value="connect">建立 SSH 长连接并切换上报（会重启 Agent）</option><option value="disconnect">断开 SSH 长连接并释放内存凭据</option></select></label>
-    <p className="hint">复用已核验主机密钥及原机器 ID。切换不会重装、降权或删除 SQLite；已断开/平台重启后须重新提交 SSH 鉴权。连接存在时请先断开再重连。</p>
-    <SshAuthenticationFields method={method} onMethodChange={value=>{clear();setMethod(value);}} busy={busy} required passwordRef={password} keyRef={key} passphraseRef={phrase}/>
-    {action==="connect"&&machine.username!=="root"&&<label>已有 Full 服务的 sudo 密码（如需）<input ref={sudo} type="password" autoComplete="off" disabled={busy} maxLength={1024}/><small>Basic 留空；已有 Full 使用密码鉴权时留空复用 SSH 密码，密钥鉴权时可单独填写。</small></label>}
-    <p className="notice">SSH 凭据仅驻留平台运行内存，用于断线退避重连，不落盘。监控通常占用 2 条、最多 3 条 SSH 连接；需目标允许回环端口转发。平台重启会中断隧道，不会自动恢复凭据。</p>
+    <label>操作<select value={action} disabled={busy} onChange={event=>{setAction(event.target.value as typeof action);clear();setConfirmed(false);}}><option value="connect">建立 / 重连 SSH 长连接并切换上报（会重启 Agent）</option><option value="disconnect">断开并暂停自动恢复（保留加密凭据）</option><option value="forget">断开并删除平台保存的凭据</option></select></label>
+    <p className="hint">复用已核验主机密钥及原机器 ID，不重装、不降权、不删除 SQLite。平台重启后自动恢复此前启用的连接；手动断开不会自动恢复。</p>
+    {savedUsable&&<label className="machine-confirm"><input type="checkbox" checked={useSaved} disabled={busy} onChange={event=>{clear();setUseSaved(event.target.checked);}}/>使用平台已加密保存的 SSH 凭据（无需重复输入）</label>}
+    {!useSaved&&<SshAuthenticationFields method={method} onMethodChange={value=>{clear();setMethod(value);}} busy={busy} required passwordRef={password} keyRef={key} passphraseRef={phrase}/>}
+    {!useSaved&&action==="connect"&&machine.username!=="root"&&<label>已有 Full 服务的 sudo 密码（如需）<input ref={sudo} type="password" autoComplete="off" disabled={busy} maxLength={1024}/><small>Basic 留空；已有 Full 使用密码鉴权时留空复用 SSH 密码，密钥鉴权时可单独填写并加密保存。</small></label>}
+    <p className="notice">凭据以 AES-256-GCM 加密保存在平台私有保险库，不返回明文。断线每 60 秒重试，最多 3 次；失败后停止，可手动重连。监控通常占用 2 条、最多 3 条 SSH 连接，需允许回环端口转发。新浏览器需验证一次 SSH。</p>
     <label className="machine-confirm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event=>setConfirmed(event.target.checked)}/>确认操作此机器；断开后经隧道上报会暂停，安装及身份仍保留。</label>
     {error&&<p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button type="button" className="button button--secondary" disabled={busy} onClick={onClose}>取消</button><button className="button" disabled={busy||!confirmed}>{busy?"处理中…":"确认"}</button></div>
   </form></dialog>;

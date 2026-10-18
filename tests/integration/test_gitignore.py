@@ -25,6 +25,7 @@ class GitignoreTests(unittest.TestCase):
             "deploy/local/fleet.json", "Notes/private.txt", "Password/private.txt", "服务器连接方式.md",
             "AGENTS.md", "CLAUDE.md", ".claude/settings.local.json", "config/targets.json",
             "config/managed-targets.json", "config/.managed-targets-123.next", "config/staging.json",
+            "config/ssh-vault/master.key", "config/ssh-vault/synthetic-node.enc", "ssh-vault/.vault-temporary",
             "config/machine-test.known_hosts", "config/known_hosts", "config/id_ed25519",
             "config/ca.crt", "config/server.key", "config/key.pem", "config/identity.p12",
             "platform-update-result.json", "platform-update.lock", "state/node.json",
@@ -44,7 +45,7 @@ class GitignoreTests(unittest.TestCase):
     def test_sources_templates_locks_and_reserved_platforms_remain_visible(self):
         self.assert_paths([
             "Cargo.toml", "Cargo.lock", "agent/src/main.rs", "agent/src/platform/linux/inventory.rs",
-            "server/src/platform_update.rs", "deploy/linux/operations/platform-release.py",
+            "server/src/platform_update.rs", "server/src/ssh_vault.rs", "deploy/linux/operations/platform-release.py",
             "migrations/0008_machine_management.sql", "web/src/components/PlatformUpdateDialog.tsx",
             "web/pnpm-lock.yaml", "docs/pnpm-lock.yaml", "web/package-lock.json", ".python-version",
             ".env.example", ".env.production.example", "server/config/server.env.example",

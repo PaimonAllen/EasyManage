@@ -53,6 +53,7 @@ Password
 targets.json
 staging.json
 managed-targets.json
+ssh-vault/
 .managed-targets-*.next
 platform-update-result.json
 platform-update.lock

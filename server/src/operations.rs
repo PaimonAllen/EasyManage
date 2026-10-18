@@ -1,5 +1,6 @@
 //! Browser operations are separate from unauthenticated, read-only monitoring.
-//! Targets come only from the operator-owned registry. Credentials are transient,
+//! Targets come only from the operator-owned registry. SSH reconnect credentials
+//! use the owner-only encrypted vault; other request credentials are transient.
 //! SSH host keys are verified before authentication, and terminal contents are
 //! never written to the application log or audit table.
 
@@ -32,6 +33,10 @@ mod machines;
 
 #[path = "ssh_transport.rs"]
 mod ssh_transport;
+
+#[path = "ssh_vault.rs"]
+#[cfg(target_os = "linux")]
+mod ssh_vault;
 
 #[path = "platform_update.rs"]
 #[cfg(target_os = "linux")]
@@ -306,6 +311,8 @@ pub fn router(
         #[cfg(target_os = "linux")]
         platform_update_cache: platform_update::Cache::default(),
     };
+    #[cfg(target_os = "linux")]
+    machines::restore_ssh(state.clone());
     Router::new()
         .route("/api/v1/operations/targets", get(list_targets))
         .route("/api/v1/operations/recovery", get(recovery_status))
@@ -1074,7 +1081,11 @@ fn target_and_lease(
             StatusCode::NOT_FOUND,
             "此节点尚未配置可信 SSH 运维目标",
         ))?;
-    let mut limits = state.limits.lock().map_err(|_| OperationsError::busy())?;
+    Ok((target,acquire_node_lease(&state.limits,node_id,elevation,true)?))
+}
+
+fn acquire_node_lease(shared: &Arc<Mutex<Limits>>,node_id: Uuid,elevation: bool,count_attempt: bool) -> Result<Lease,OperationsError> {
+    let mut limits = shared.lock().map_err(|_| OperationsError::busy())?;
     let now = Instant::now();
     while limits
         .attempts
@@ -1084,31 +1095,29 @@ fn target_and_lease(
         limits.attempts.pop_front();
     }
     if limits.active.values().sum::<usize>() >= 8
-        || (elevation && limits.elevating.contains(&node_id))
+        || limits.elevating.contains(&node_id)
+        || (elevation && limits.active.get(&node_id).copied().unwrap_or_default()>0)
         || limits.active.get(&node_id).copied().unwrap_or_default() >= 2
-        || limits.attempts.len() >= 30
-        || limits
+        || (count_attempt && limits.attempts.len() >= 30)
+        || (count_attempt && limits
             .attempts
             .iter()
             .filter(|(_, id)| *id == node_id)
             .count()
-            >= 6
+            >= 6)
     {
         return Err(OperationsError::busy());
     }
-    limits.attempts.push_back((now, node_id));
+    if count_attempt { limits.attempts.push_back((now, node_id)); }
     *limits.active.entry(node_id).or_default() += 1;
     if elevation {
         limits.elevating.insert(node_id);
     }
-    Ok((
-        target,
-        Lease {
-            limits: Arc::clone(&state.limits),
+    Ok(Lease {
+            limits: Arc::clone(shared),
             node_id,
             elevation,
-        },
-    ))
+    })
 }
 
 async fn audit(
@@ -1887,6 +1896,7 @@ impl OutputDecoder {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct OperationsError(StatusCode, &'static str);
 
 impl OperationsError {
@@ -1922,6 +1932,31 @@ impl IntoResponse for OperationsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_mutations_are_exclusive_and_drop_releases_the_lease() {
+        let limits=Arc::new(Mutex::new(Limits::default()));let id=Uuid::new_v4();
+        let read=acquire_node_lease(&limits,id,false,true).unwrap();
+        let second_read=acquire_node_lease(&limits,id,false,true).unwrap();
+        assert!(acquire_node_lease(&limits,id,true,true).is_err());
+        drop(read);drop(second_read);
+        let mutation=acquire_node_lease(&limits,id,true,false).unwrap();
+        assert!(acquire_node_lease(&limits,id,false,true).is_err());
+        assert!(acquire_node_lease(&limits,id,true,true).is_err());
+        drop(mutation);
+        assert!(acquire_node_lease(&limits,id,true,true).is_ok());
+    }
+
+    #[test]
+    fn registry_edit_lease_does_not_double_charge_existing_ssh_attempt_budget() {
+        let limits=Arc::new(Mutex::new(Limits::default()));let id=Uuid::new_v4();
+        for _ in 0..6 {drop(acquire_node_lease(&limits,id,true,true).unwrap());}
+        assert!(acquire_node_lease(&limits,id,true,true).is_err());
+        let edit=acquire_node_lease(&limits,id,true,false).unwrap();
+        assert_eq!(limits.lock().unwrap().attempts.len(),6);
+        drop(edit);
+        assert!(acquire_node_lease(&limits,id,true,true).is_err());
+    }
 
     #[test]
     #[cfg(target_os = "linux")]

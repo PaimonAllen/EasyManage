@@ -1,5 +1,5 @@
-//! Password/public-key onboarding. Secrets live only in transient request/worker
-//! memory; job logs contain fixed workflow messages, never raw SSH output.
+//! Password/public-key onboarding and original-identity redeployment. Credentials
+//! at rest use the private vault; logs never contain secrets or raw SSH output.
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use chrono::{DateTime, Utc};
@@ -51,6 +51,20 @@ struct Job {
 }
 
 impl Tasks {
+    fn begin(&self, id: Uuid, host: IpAddr) -> Result<Zeroizing<String>, OperationsError> {
+        let key = Zeroizing::new(format!("{}{}",Uuid::new_v4().simple(),Uuid::new_v4().simple()));
+        let mut jobs = self.jobs.lock().map_err(|_|OperationsError::busy())?;
+        jobs.retain(|_,job|job.created.elapsed()<JOB_TTL || job.status=="running");
+        if (jobs.len()>=32 && !jobs.contains_key(&id)) || jobs.values().any(|job|job.host==host && job.status=="running") {
+            return Err(OperationsError::busy());
+        }
+        // A redeploy replaces only a completed transient job, never history or
+        // a running worker. Rotating its capability invalidates old log access.
+        jobs.insert(id,Job {created:Instant::now(),key_hash:crate::api::hash_token(&key),node_id:id,
+            host,status:"running".into(),progress:0,events:vec![]});
+        Ok(key)
+    }
+
     fn rate_limit(&self) -> Result<(), OperationsError> {
         let mut attempts = self.attempts.lock().map_err(|_| OperationsError::busy())?;
         attempts.retain(|at| at.elapsed() < Duration::from_secs(60));
@@ -247,6 +261,150 @@ pub(super) fn router() -> Router<OperationsState> {
         .route("/api/v1/machines/jobs/{id}", get(job))
         .route("/api/v1/machines/{id}/manage", post(change))
         .route("/api/v1/machines/{id}/ssh", post(manage_ssh))
+        .route("/api/v1/machines/{id}/redeploy", post(redeploy))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedeployRequest {
+    confirmation: String,
+    username: String,
+    server_url: String,
+    #[serde(default="ssh_transport::automatic")]
+    connection_mode: ssh_transport::Mode,
+    #[serde(default)]
+    use_saved: bool,
+    #[serde(default)]
+    auth_method: AuthMethod,
+    #[serde(default,deserialize_with="deserialize_secret")]
+    password: Zeroizing<String>,
+    #[serde(default,deserialize_with="deserialize_secret")]
+    private_key: Zeroizing<String>,
+    #[serde(default,deserialize_with="deserialize_secret")]
+    passphrase: Zeroizing<String>,
+    #[serde(default,deserialize_with="deserialize_secret")]
+    sudo_password: Zeroizing<String>,
+}
+
+fn preserved_mode(target: &Target, observed: Option<&str>) -> DeploymentMode {
+    if target.default_user=="root" || target.agent_mode.as_deref()==Some("full") || observed==Some("full") {
+        DeploymentMode::Full
+    } else { DeploymentMode::Basic }
+}
+
+async fn redeploy(State(state): State<OperationsState>, Path(id): Path<Uuid>, uri: Uri, headers: HeaderMap,
+    payload: Result<Json<RedeployRequest>,axum::extract::rejection::JsonRejection>) -> Result<Response,OperationsError> {
+    validate_origin(&headers,&uri)?;
+    let Json(request) = payload.map_err(|_|OperationsError::bad_request("重新部署请求格式错误；凭据不会回显"))?;
+    if request.confirmation!=id.to_string() { return Err(OperationsError::bad_request("请明确确认重新部署此原机器 ID")); }
+    state.machines.rate_limit()?;
+    let (target,lease) = target_and_lease(&state,id,true)?;
+    if target.ssh_alias.as_deref()==Some("local") {
+        return Err(OperationsError::bad_request("平台本机 Agent 受保护，请使用更新或管理员维护流程，不支持从此入口重新部署"));
+    }
+    if request.username!=target.default_user {
+        return Err(OperationsError::bad_request("重新部署必须使用原登记 SSH 账户、地址和主机公钥，不能更换机器身份"));
+    }
+    let row = sqlx::query("SELECT n.deleted_at,n.last_seen,COALESCE(n.display_name,n.hostname) AS name,m.metrics->'privilege'->>'mode' AS mode FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.id=$1")
+        .bind(id).fetch_optional(&state.pool).await.map_err(|_|OperationsError::busy())?
+        .ok_or(OperationsError::bad_request("原机器不存在，不能重新部署"))?;
+    let deleted: Option<DateTime<Utc>> = row.get("deleted_at");
+    if deleted.is_some() { return Err(OperationsError::bad_request("请先恢复已软删除的机器，再按原 ID 重新部署")); }
+    let last_seen: DateTime<Utc> = row.get("last_seen");
+    if last_seen>Utc::now()-chrono::Duration::seconds(state.config.online_window_seconds) {
+        return Err(OperationsError::bad_request("机器仍有近期心跳；重新部署仅用于已卸载的离线机器，在线机器请使用更新或重启"));
+    }
+    let observed: Option<String> = row.get("mode");
+    let mode = preserved_mode(&target,observed.as_deref());
+    let mut install = AddMachine {host:target.host,port:target.port,display_name:row.get("name"),
+        server_url:controller_address(&request.server_url)?,connection_mode:request.connection_mode,
+        fingerprint:String::new(),username:request.username,deployment_mode:mode,sudo_password:request.sudo_password,
+        auth_method:request.auth_method,password:request.password,private_key:request.private_key,passphrase:request.passphrase};
+    let mut browser_token = None;
+    if request.use_saved {
+        if !install.password.is_empty() || !install.private_key.is_empty() || !install.passphrase.is_empty() || !install.sudo_password.is_empty() {
+            return Err(OperationsError::bad_request("使用已保存凭据时不要同时提交新凭据"));
+        }
+        let saved = ssh_vault::load(&state.registry,&target)?;
+        if !ssh_vault::authorized(&saved,&target,&headers) {
+            return Err(OperationsError(StatusCode::UNAUTHORIZED,"此浏览器尚未获准使用已保存凭据，请验证一次 SSH"));
+        }
+        browser_token=ssh_vault::browser_token(&saved,&target,&headers);
+        install.auth_method=if saved.key.is_empty(){AuthMethod::Password}else{AuthMethod::PrivateKey};
+        install.password=saved.password;install.private_key=saved.key;install.passphrase=saved.passphrase;
+        if mode==DeploymentMode::Full { install.sudo_password=saved.sudo_password; }
+    }
+    if browser_token.is_none() && let Ok(saved)=ssh_vault::load(&state.registry,&target) {
+        browser_token=ssh_vault::browser_token(&saved,&target,&headers);
+    }
+    install.validate_authentication()?;
+    check_parent(&state.registry)?;
+    candidate()?;agent_ca(&state)?;
+    let permit=state.machines.permits.clone().try_acquire_owned().map_err(|_|OperationsError::busy())?;
+    audit(&state.pool,id,&install.username,"machine.redeploy.request","requested").await?;
+    let key=state.machines.begin(id,target.host)?;
+    state.machines.event(id,0,"running","重新部署任务已创建：复用原机器 ID，保留历史、名称和备注；拒绝覆盖仍存在的 Agent 身份，保持原 Basic / Full 权限");
+    launch_deployment(state,id,install,permit,&key,DeploymentContext {existing:Some(target),lease:Some(lease),browser_token})
+}
+
+/// Restore only previously enabled tunnels. Never reinstall/reconfigure remote
+/// services, authenticate a soft-deleted target, or invent another node identity.
+pub(super) fn restore_ssh(state: OperationsState) {
+    tokio::spawn(async move {
+        crate::database::wait_for_initialization(&state.initialized).await;
+        let Ok(targets) = load_all_targets(&state.registry) else { return; };
+        for target in targets.into_iter().filter(|t| !t.disabled && t.connection_mode==ssh_transport::Mode::Ssh) {
+            let active = sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM nodes WHERE id=$1 AND deleted_at IS NULL)")
+                .bind(target.node_id).fetch_one(&state.pool).await.unwrap_or(false);
+            if !active { continue; }
+            match ssh_vault::load(&state.registry,&target) {
+                Ok(saved) if saved.enabled => {},
+                Ok(_) => continue,
+                Err(error) => {
+                    ssh_transport::restore_status(&target,"authentication_required",0,error.1);
+                    continue;
+                }
+            }
+            let state = state.clone();
+            let handle = tokio::runtime::Handle::current();
+            // A sleeping restore worker must not hold Tokio runtime shutdown
+            // open for two minutes when the platform itself is restarted.
+            std::thread::spawn(move || {
+                for attempt in 1..=ssh_transport::RETRY_LIMIT {
+                    if ssh_transport::status(&target)["status"]=="connected" { return; }
+                    let result = (|| {
+                        // Release the GUI lease before waiting between attempts.
+                        let _lease = target_and_lease(&state,target.node_id,true)?;
+                        let saved = ssh_vault::load(&state.registry,&target)?;
+                        if !saved.enabled { return Err(OperationsError::bad_request("SSH 自动恢复已暂停")); }
+                        let port = target.ssh_remote_port.ok_or(OperationsError::registry())?;
+                        if target.server_url.as_deref()!=Some(format!("https://127.0.0.1:{port}").as_str()) {
+                            return Err(OperationsError::registry());
+                        }
+                        let ca = agent_ca(&state)?;
+                        let local = checked_local_https(&state,&handle,&ca)?;
+                        let mut session = ssh_transport::onboarding(SocketAddr::new(target.host,target.port))?;
+                        ssh_transport::verify_lease(&session,&target)?;
+                        let auth = saved.auth();
+                        auth.authenticate(&session)?;
+                        ssh_transport::start(&target,auth,&mut session,local)?;
+                        Ok::<_,OperationsError>(())
+                    })();
+                    match result {
+                        Ok(()) => return,
+                        Err(error) if matches!(error.0,StatusCode::UNAUTHORIZED|StatusCode::CONFLICT|StatusCode::BAD_REQUEST) => {
+                            ssh_transport::restore_status(&target,"authentication_required",attempt,error.1);
+                            return;
+                        }
+                        Err(error) => {
+                            ssh_transport::restore_status(&target,if attempt==ssh_transport::RETRY_LIMIT {"retry_exhausted"}else{"reconnecting"},attempt,error.1);
+                            if attempt<ssh_transport::RETRY_LIMIT { std::thread::sleep(ssh_transport::RETRY_INTERVAL); }
+                        }
+                    }
+                }
+            });
+        }
+    });
 }
 
 #[derive(Deserialize)]
@@ -254,6 +412,8 @@ pub(super) fn router() -> Router<OperationsState> {
 struct SshRequest {
     action: String,
     username: String,
+    #[serde(default)]
+    use_saved: bool,
     #[serde(default)]
     auth_method: AuthMethod,
     #[serde(default, deserialize_with="deserialize_secret")]
@@ -267,10 +427,10 @@ struct SshRequest {
 }
 
 async fn manage_ssh(State(state): State<OperationsState>, Path(id): Path<Uuid>, uri: Uri, headers: HeaderMap,
-    payload: Result<Json<SshRequest>, axum::extract::rejection::JsonRejection>) -> Result<Json<serde_json::Value>, OperationsError> {
+    payload: Result<Json<SshRequest>, axum::extract::rejection::JsonRejection>) -> Result<Response, OperationsError> {
     validate_origin(&headers, &uri)?;
     let Json(request) = payload.map_err(|_| OperationsError::bad_request("SSH 连接请求格式错误；鉴权内容不会回显"))?;
-    if !matches!(request.action.as_str(), "connect" | "disconnect") { return Err(OperationsError::bad_request("SSH 连接操作不正确")); }
+    if !matches!(request.action.as_str(), "connect" | "disconnect" | "forget") { return Err(OperationsError::bad_request("SSH 连接操作不正确")); }
     state.machines.rate_limit()?;
     let (mut target, lease) = target_and_lease(&state, id, true)?;
     if request.username != target.default_user { return Err(OperationsError::bad_request("请使用首次部署登记的 SSH 账户重连；不会更换机器身份")); }
@@ -280,32 +440,71 @@ async fn manage_ssh(State(state): State<OperationsState>, Path(id): Path<Uuid>, 
     let observed_mode: Option<String> = sqlx::query_scalar("SELECT (SELECT metrics->'privilege'->>'mode' FROM metrics_latest WHERE node_id=$1)")
         .bind(id).fetch_one(&state.pool).await.map_err(|_| OperationsError::busy())?;
     let full = observed_mode.as_deref().or(target.agent_mode.as_deref())==Some("full");
+    let saved = if request.use_saved {
+        if !request.password.is_empty() || !request.private_key.is_empty() || !request.passphrase.is_empty() || !request.sudo_password.is_empty() {
+            return Err(OperationsError::bad_request("使用已保存凭据时不要同时发送新凭据"));
+        }
+        let saved = ssh_vault::load(&state.registry, &target)?;
+        if !ssh_vault::authorized(&saved, &target, &headers) {
+            return Err(OperationsError(StatusCode::UNAUTHORIZED,"此浏览器尚未获准使用已保存凭据，请验证一次 SSH；不会返回保存的密码或私钥"));
+        }
+        Some(saved)
+    } else { None };
     let action = request.action;
     let mut authentication = AddMachine { host: target.host, port: target.port, display_name: target.hostname.clone(),
         server_url: target.server_url.clone().unwrap_or_default(), connection_mode: ssh_transport::Mode::Ssh,
         fingerprint: String::new(), username: request.username, deployment_mode: if full { DeploymentMode::Full } else { DeploymentMode::Basic },
         sudo_password: request.sudo_password, auth_method: request.auth_method, password: request.password,
         private_key: request.private_key, passphrase: request.passphrase };
+    if let Some(saved) = saved {
+        authentication.auth_method = if saved.key.is_empty() { AuthMethod::Password } else { AuthMethod::PrivateKey };
+        authentication.password = saved.password;
+        authentication.private_key = saved.key;
+        authentication.passphrase = saved.passphrase;
+        authentication.sudo_password = if full { saved.sudo_password } else { Zeroizing::new(String::new()) };
+    }
     authentication.validate_authentication()?;
     audit(&state.pool, id, &authentication.username, &format!("machine.ssh.{action}.request"), "requested").await?;
     let actor = authentication.username.clone();
     let worker_state = state.clone();
     let handle = tokio::runtime::Handle::current();
-    let disconnect = action == "disconnect";
+    let disconnect = action != "connect";
+    let forget = action == "forget";
+    let use_saved = request.use_saved;
+    let browser_cookie = Arc::new(Mutex::new(None::<String>));
+    let worker_cookie = browser_cookie.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let _lease = lease;
         let auth = ssh_auth(&authentication);
         if disconnect {
-            let _session = ssh_transport::authenticated(&target, &auth, &Cancellation::default())?;
+            if !use_saved {
+                let mut direct = target.clone();
+                direct.connection_mode = ssh_transport::Mode::Direct;
+                let _session = ssh_transport::authenticated(&direct, &auth, &Cancellation::default())?;
+            }
             ssh_transport::stop(&target)?;
+            if ssh_vault::exists(&worker_state.registry, &target) {
+                if forget { ssh_vault::forget(&worker_state.registry, &target)?; }
+                else { ssh_vault::set_enabled(&worker_state.registry, &target, false)?; }
+            }
             return Ok::<_,OperationsError>(());
         }
+        // Prove a fresh/manual credential before allowing it to stop a live tunnel.
+        if !use_saved && matches!(ssh_transport::status(&target)["status"].as_str(),Some("connected"|"reconnecting")) {
+            let _proof = ssh_transport::authenticated(&target,&auth,&Cancellation::default())?;
+        }
+        // Explicit reconnect stops the old worker before reusing its slot budget.
+        ssh_transport::stop(&target)?;
         let mut session = ssh_transport::onboarding(SocketAddr::new(target.host, target.port))?;
         ssh_transport::verify_lease(&session, &target)?;
         if full && authentication.username!="root" && authentication.sudo_password.is_empty() && authentication.auth_method==AuthMethod::Password {
             authentication.sudo_password = authentication.password.clone();
         }
         authenticate(&session, &mut authentication)?;
+        if !use_saved {
+            let token = ssh_vault::save(&worker_state.registry, &target, &auth, &authentication.sudo_password, false)?;
+            *worker_cookie.lock().map_err(|_| OperationsError::busy())? = Some(ssh_vault::cookie(&target, &token));
+        }
         let ca = agent_ca(&worker_state)?;
         let local = checked_local_https(&worker_state, &handle, &ca)?;
         let port = ssh_transport::start(&target, auth, &mut session, local)?;
@@ -328,6 +527,7 @@ async fn manage_ssh(State(state): State<OperationsState>, Path(id): Path<Uuid>, 
             // Same authenticated control connection; no new SSH invocation.
             admin_command(&session, &authentication, "/usr/bin/systemctl restart easymanage-agent.service")?;
         } else { restart_basic_on(&session, &target)?; }
+        ssh_vault::set_enabled(&worker_state.registry, &target, true)?;
         setup.commit();
         Ok(())
     });
@@ -335,8 +535,16 @@ async fn manage_ssh(State(state): State<OperationsState>, Path(id): Path<Uuid>, 
         Ok(Ok(result)) => result, _ => Err(OperationsError::ssh("SSH 网络切换超时；请检查连接状态和目标私有日志，不推断已回滚"))
     };
     let _ = audit(&state.pool, id, &actor, &format!("machine.ssh.{action}.result"), if result.is_ok(){"success"}else{"failed"}).await;
-    result?;
-    Ok(Json(json!({"message":if disconnect {"SSH 长连接已断开；连接 worker 退出时清理内存凭据，远端安装和机器身份保留"} else {"SSH 长连接已建立，Agent 已按原权限重启；请以真实新心跳确认接入成功"}})))
+    let mut response = match result {
+        Ok(()) => Json(json!({"message":if forget {"SSH 长连接已断开并删除平台保存的凭据；远端安装和机器身份保留"}
+            else if disconnect {"SSH 长连接已断开并暂停自动恢复；加密凭据保留，可一键重连"}
+            else {"SSH 长连接已建立，凭据已加密保存；请以真实新心跳确认接入成功"}})).into_response(),
+        Err(error) => error.into_response(),
+    };
+    if let Some(cookie) = browser_cookie.lock().map_err(|_| OperationsError::busy())?.take() {
+        response.headers_mut().insert(axum::http::header::SET_COOKIE, cookie.parse().map_err(|_| OperationsError::busy())?);
+    }
+    Ok(response)
 }
 
 fn configure_network(session: &Session, request: &AddMachine, target: &Target, url: &str, token: Option<&str>) -> Result<(), OperationsError> {
@@ -357,8 +565,18 @@ fn configure_network(session: &Session, request: &AddMachine, target: &Target, u
     (&mut channel).take(8193).read_to_end(&mut discarded).map_err(|_|OperationsError::ssh("网络配置读取失败"))?;
     if discarded.len()>8192 { return Err(OperationsError::ssh("网络配置输出超过上限")); }
     channel.wait_close().map_err(|_|OperationsError::ssh("网络配置通道中断"))?;
-    if channel.exit_status().unwrap_or(-1)!=0 { return Err(OperationsError::ssh("网络配置切换失败；检查原账户、CA、机器 ID 及已有 Full 服务；私有恢复文件保留")); }
-    Ok(())
+    let reason = match channel.exit_status().unwrap_or(-1) {
+        0 => return Ok(()),
+        20 => "未找到原 Agent 配置；可能已卸载或从未完成安装，请使用原机器的「重新部署」，不能仅切换网络或生成新机器 ID",
+        21 => "原 Agent 配置/CA 的所有者、权限或路径不符合要求；未修改文件，请检查原 SSH 账户与私有目录",
+        22 => "远端 Agent CA 与平台登记摘要不同；未修改文件，请核对原 CA，不会跳过 TLS 校验",
+        23 => "远端 Agent 身份与原机器 ID 不一致或无法确认；未修改配置，也未重置 SQLite",
+        24 => "实际服务权限与所选模式不同；已有 Full 必须使用原 root/sudo 配置，不会创建 Basic 替代服务",
+        25 => "原 Agent 配置格式不兼容或有重复项；未修改文件，请检查 agent.env",
+        26 => "写入原 Agent 私有配置失败；请检查剩余磁盘空间、目录写权限及保留的恢复文件",
+        _ => "网络配置通道失败；请检查 Python3、root/sudo 授权和原安装；不会输出远端原始内容或凭据",
+    };
+    return Err(OperationsError::ssh(reason));
 }
 
 pub(super) fn restart_basic_on(session: &Session, target: &Target) -> Result<(), OperationsError> {
@@ -432,14 +650,18 @@ async fn probe(
 
 async fn list(
     State(state): State<OperationsState>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, OperationsError> {
     let targets = load_all_targets(&state.registry)?;
     let platform_admin_available = platform_target(&state).is_ok();
-    let rows = sqlx::query("SELECT id,hostname,display_name,management_note,deleted_at,last_seen FROM nodes ORDER BY hostname")
+    let rows = sqlx::query("SELECT n.id,n.hostname,n.display_name,n.management_note,n.deleted_at,n.last_seen,m.metrics->'privilege'->>'mode' AS mode FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id ORDER BY n.hostname")
         .fetch_all(&state.pool).await.map_err(|_| OperationsError::busy())?;
     let machines: Vec<_> = rows.iter().map(|row| {
         let id: Uuid = row.get("id");
         let target = targets.iter().find(|target| target.node_id == id);
+        let observed: Option<String> = row.get("mode");
+        let last_seen: DateTime<Utc> = row.get("last_seen");
+        let deleted: Option<DateTime<Utc>> = row.get("deleted_at");
         json!({"node_id":id,"hostname":row.get::<String,_>("hostname"),
             "display_name":row.get::<Option<String>,_>("display_name"),
             "note":row.get::<String,_>("management_note"),"deleted_at":row.get::<Option<DateTime<Utc>>,_>("deleted_at"),
@@ -447,6 +669,11 @@ async fn list(
             "host":target.map(|t|t.host),"port":target.map(|t|t.port),
             "username":target.map(|t|t.default_user.clone()),"manageable":target.is_some() || platform_admin_available,
             "connection_mode":target.map(|t|t.connection_mode),
+            "credentials_saved":target.is_some_and(|t|ssh_vault::exists(&state.registry,t)),
+            "deployment_mode":target.map(|t|preserved_mode(t,observed.as_deref()).name()),
+            "redeploy_available":deleted.is_none() && last_seen<=Utc::now()-chrono::Duration::seconds(state.config.online_window_seconds)
+                && target.is_some_and(|t|t.ssh_alias.as_deref()!=Some("local")),
+            "saved_credentials_usable":target.is_some_and(|t|ssh_vault::load(&state.registry,t).is_ok_and(|s|ssh_vault::authorized(&s,t,&headers))),
             "ssh_transport":target.filter(|t|t.connection_mode==ssh_transport::Mode::Ssh).map(ssh_transport::status)})
     }).collect();
     Ok(Json(
@@ -496,7 +723,7 @@ async fn add(
     uri: Uri,
     headers: HeaderMap,
     payload: Result<Json<AddMachine>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<serde_json::Value>, OperationsError> {
+) -> Result<Response, OperationsError> {
     validate_origin(&headers, &uri)?;
     // Do not echo malformed field values (which may contain a secret) in JSON errors.
     let Json(mut request) = payload.map_err(|error| {
@@ -548,40 +775,7 @@ async fn add(
         .try_acquire_owned()
         .map_err(|_| OperationsError::busy())?;
     let id = Uuid::new_v4();
-    let key = Zeroizing::new(format!(
-        "{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    ));
-    {
-        let mut jobs = state
-            .machines
-            .jobs
-            .lock()
-            .map_err(|_| OperationsError::busy())?;
-        jobs.retain(|_, job| job.created.elapsed() < JOB_TTL || job.status == "running");
-        if jobs.len() >= 32
-            || jobs
-                .values()
-                .any(|job| job.host == request.host && job.status == "running")
-        {
-            return Err(OperationsError::busy());
-        }
-        jobs.insert(
-            id,
-            Job {
-                created: Instant::now(),
-                key_hash: crate::api::hash_token(&key),
-                node_id: id,
-                host: request.host,
-                status: "running".to_owned(),
-                progress: 0,
-                events: vec![],
-            },
-        );
-    }
-    let response = json!({"job_id":id,"job_key":key.as_str(),"node_id":id});
-    let actor = request.username.clone();
+    let key=state.machines.begin(id,request.host)?;
     let deployment_mode = request.deployment_mode;
     state.machines.event(
         id,
@@ -590,19 +784,38 @@ async fn add(
         if deployment_mode == DeploymentMode::Basic { "任务已创建；普通用户模式，所有安装文件位于 SSH 用户 home，不执行 sudo" }
         else { "任务已创建；已选择首次安装管理员 Full Agent，将验证 root/sudo 权限" },
     );
+    launch_deployment(state,id,request,permit,&key,DeploymentContext::default())
+}
+
+#[derive(Default)]
+struct DeploymentContext {
+    existing: Option<Target>,
+    lease: Option<Lease>,
+    browser_token: Option<Zeroizing<String>>,
+}
+
+fn launch_deployment(state: OperationsState,id: Uuid,request: AddMachine,
+    permit: tokio::sync::OwnedSemaphorePermit,key: &str,context: DeploymentContext) -> Result<Response,OperationsError> {
+    let response = json!({"job_id":id,"job_key":key,"node_id":id});
+    let browser_token = context.browser_token.unwrap_or_else(||Zeroizing::new(format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())));
+    let cookie = ssh_vault::cookie_for(id,&browser_token);
+    let actor = request.username.clone();
+    let deployment_mode = request.deployment_mode;
+    let redeploy = context.existing.is_some();
     tokio::spawn(async move {
         let _permit = permit;
+        let _lease = context.lease;
         let worker_state = state.clone();
         let handle = tokio::runtime::Handle::current();
         let worker =
-            tokio::task::spawn_blocking(move || deploy(&worker_state, id, request, &handle));
+            tokio::task::spawn_blocking(move || deploy(&worker_state, id, request, &handle, &browser_token,context.existing));
         let result = worker.await;
         let outcome = if matches!(&result, Ok(Ok(()))) {
             "success"
         } else {
             "failed"
         };
-        if audit(&state.pool, id, &actor, "machine.add.result", outcome)
+        if audit(&state.pool, id, &actor, if redeploy {"machine.redeploy.result"}else{"machine.add.result"}, outcome)
             .await
             .is_err()
         {
@@ -612,7 +825,8 @@ async fn add(
             Ok(Ok(())) => {
                 state
                     .machines
-                    .event(id, 100, "success", if deployment_mode == DeploymentMode::Basic { "已收到新 Agent 的 Basic 心跳，部署完成；后续可通过设备总览提权" } else { "已收到新 Agent 的 Full / UID 0 心跳，管理员部署完成" })
+                    .event(id, 100, "success", if redeploy {"已收到重新部署后的真实心跳；原机器 ID、历史和显示信息保留，旧 Agent 凭据已失效"}
+                        else if deployment_mode == DeploymentMode::Basic { "已收到新 Agent 的 Basic 心跳，部署完成；后续可通过设备总览提权" } else { "已收到新 Agent 的 Full / UID 0 心跳，管理员部署完成" })
             }
             Ok(Err(error)) => state.machines.event(id, 100, "failed", error.1),
             Err(_) => state.machines.event(
@@ -623,7 +837,9 @@ async fn add(
             ),
         }
     });
-    Ok(Json(response))
+    let mut response = Json(response).into_response();
+    response.headers_mut().insert(axum::http::header::SET_COOKIE,cookie.parse().map_err(|_|OperationsError::busy())?);
+    Ok(response)
 }
 
 fn controller_address(value: &str) -> Result<String, OperationsError> {
@@ -715,7 +931,7 @@ pub(super) fn command(session: &Session, invocation: &str) -> Result<String, Ope
     String::from_utf8(output).map_err(|_| OperationsError::ssh("远端检查格式异常"))
 }
 
-fn check_parent(registry: &FsPath) -> Result<(), OperationsError> {
+pub(super) fn check_parent(registry: &FsPath) -> Result<(), OperationsError> {
     if !registry.is_absolute() {
         return Err(OperationsError::bad_request("可信清单需使用绝对路径"));
     }
@@ -949,6 +1165,8 @@ fn deploy(
     id: Uuid,
     mut request: AddMachine,
     handle: &tokio::runtime::Handle,
+    browser_token: &str,
+    existing: Option<Target>,
 ) -> Result<(), OperationsError> {
     state.machines.event(
         id,
@@ -956,8 +1174,18 @@ fn deploy(
         "running",
         "连接 SSH 并核验已确认的主机指纹（尚未进行身份鉴权）",
     );
-    let mut session = ssh_transport::onboarding(SocketAddr::new(request.host, request.port))?;
-    if fingerprint(&session)? != request.fingerprint {
+    let ssh_auth = ssh_auth(&request);
+    let pooled = existing.as_ref().is_some_and(|target|ssh_transport::status(target)["status"]=="connected");
+    let mut session = if pooled {
+        ssh_transport::authenticated(existing.as_ref().ok_or(OperationsError::registry())?,&ssh_auth,&Cancellation::default())?
+    } else {
+        if let Some(target) = existing.as_ref() { ssh_transport::stop(target)?; }
+        ssh_transport::onboarding(SocketAddr::new(request.host, request.port))?
+    };
+    if let Some(target) = existing.as_ref() {
+        // Pinned original host key is checked BEFORE any password/key is sent.
+        ssh_transport::verify_lease(&session,target)?;
+    } else if fingerprint(&session)? != request.fingerprint {
         return Err(OperationsError::ssh(
             "SSH 指纹与确认值不同；未进行身份鉴权，已停止部署",
         ));
@@ -967,8 +1195,12 @@ fn deploy(
         && request.auth_method == AuthMethod::Password {
         request.sudo_password = Zeroizing::new(request.password.to_string());
     }
-    let ssh_auth = ssh_auth(&request);
-    authenticate(&session, &mut request)?;
+    if session.authenticated() { request.clear_ssh_credentials(); }
+    else { authenticate(&session, &mut request)?; }
+    if let Some(target) = existing.as_ref() {
+        let enabled=ssh_vault::load(&state.registry,target).is_ok_and(|saved|saved.enabled);
+        ssh_vault::save_with_token(&state.registry,target,&ssh_auth,&request.sudo_password,enabled,browser_token)?;
+    }
     state.machines.event(
         id,
         10,
@@ -1015,6 +1247,12 @@ fn deploy(
         .map_err(|_| OperationsError::bad_request("检测到旧用户目录 Agent 身份，请先迁移到 ~/.easymanage，不允许重复注册"))?;
     command(&session,"/bin/bash --noprofile --norc -c 'set -eu; if command -v systemctl >/dev/null; then state=$(systemctl show easymanage-agent.service -p LoadState --value 2>/dev/null || true); test -z \"$state\" || test \"$state\" = not-found; fi; test ! -e /etc/systemd/system/easymanage-agent.service; test ! -d /var/lib/easymanage-agent; test ! -e /usr/local/sbin/easymanage-agent; test ! -d /etc/easymanage || test -x /etc/easymanage; test ! -e /etc/easymanage/agent.env; test ! -e \"$HOME/.easymanage/state/state.db\"; test ! -e \"$HOME/.easymanage/config/agent.env\"; test ! -e \"$HOME/.config/systemd/user/easymanage-agent.service\"' ")
         .map_err(|_|OperationsError::bad_request("目标已存在 Agent 配置、用户单元或身份库；请恢复/接管原节点，不允许覆盖安装"))?;
+    if existing.is_some() {
+        let script = "# EasyManage redeploy preflight: read-only, no process termination\nfrom pathlib import Path\nfor p in Path('/proc').glob('[0-9]*/comm'):\n try:\n  name=p.read_text().strip()\n  if name in ('easymanage-agent','easymanage-agen') and p.with_name('stat').read_text().rsplit(')',1)[1].split()[0] not in ('Z','X'):\n   raise SystemExit(1)\n except (FileNotFoundError,PermissionError,ProcessLookupError):\n  continue\n";
+        let check=format!("/usr/bin/python3 -c {}",shell_quote(script));
+        let checked=if mode==DeploymentMode::Full {admin_command(&session,&request,&check)} else {command(&session,&check).map(|_|())};
+        checked.map_err(|_|OperationsError::bad_request("目标仍有 Agent 进程或无法确认其已退出；请先完成原卸载，不会强杀进程或覆盖安装"))?;
+    }
     let bootstrap = Zeroizing::new(format!(
         "{}{}",
         Uuid::new_v4().simple(),
@@ -1024,7 +1262,8 @@ fn deploy(
         id,
         15,
         "running",
-        "已为新机器分配待注册 ID；准备 Agent CA 与已核验的 SSH 公钥",
+        if existing.is_some() {"已核验原机器 ID 与 SSH 主机公钥；准备重新部署，不新建节点"}
+        else {"已为新机器分配待注册 ID；准备 Agent CA 与已核验的 SSH 公钥"},
     );
     let home = PathBuf::from(fields[1]).join(".easymanage");
     // Deploy the Agent's trusted CA, not the platform leaf certificate.
@@ -1033,6 +1272,7 @@ fn deploy(
         .registry
         .with_file_name(format!("machine-{id}.known_hosts"));
     check_parent(&state.registry)?;
+    if existing.is_none() {
     let mut known = session
         .known_hosts()
         .map_err(|_| OperationsError::registry())?;
@@ -1060,7 +1300,8 @@ fn deploy(
     known
         .write_file(&key_path, KnownHostFileKind::OpenSSH)
         .map_err(|_| OperationsError::ssh("无法保存已核验 SSH 公钥，未继续安装"))?;
-    let mut target = Target {
+    }
+    let mut target = existing.clone().unwrap_or_else(||Target {
         node_id: id,
         hostname: request.display_name.clone(),
         host: request.host,
@@ -1071,39 +1312,63 @@ fn deploy(
         agent_sha256: None,
         server_url: Some(request.server_url.clone()),
         ca_sha256: Some(hex::encode(Sha256::digest(&ca))),
-        release_sha256: Some(hash),
+        release_sha256: Some(hash.clone()),
         ssh_alias: None,
         disabled: false,
         connection_mode: ssh_transport::Mode::Direct,
         ssh_remote_port: None,
         agent_mode: Some(mode.name().to_owned()),
-    };
+    });
+    target.hostname=request.display_name.clone();
+    target.agent_sha256=None;
+    target.server_url=Some(request.server_url.clone());
+    target.ca_sha256=Some(hex::encode(Sha256::digest(&ca)));
+    target.release_sha256=Some(hash);
+    target.agent_mode=Some(mode.name().to_owned());
     let mut setup = None;
     let use_ssh = request.connection_mode == ssh_transport::Mode::Ssh ||
         (request.connection_mode == ssh_transport::Mode::Auto && !direct_reachable(&session, &request.server_url, &ca)?);
     if use_ssh {
         state.machines.event(id, 23, "running", "目标无法直连或已选择 SSH：建立长期控制与上报连接，每目标最多 3 条 SSH，不新增公网监听");
-        let local = checked_local_https(state, handle, &ca)?;
-        let port = ssh_transport::start(&target, ssh_auth, &mut session, local)?;
-        setup = Some(ssh_transport::SetupGuard::new(&target));
+        let port = if pooled {
+            target.ssh_remote_port.ok_or(OperationsError::registry())?
+        } else {
+            target.ssh_remote_port=None;
+            let local = checked_local_https(state, handle, &ca)?;
+            let port=ssh_transport::start(&target, ssh_auth.clone(), &mut session, local)?;
+            setup = Some(ssh_transport::SetupGuard::new(&target));
+            port
+        };
         target.connection_mode = ssh_transport::Mode::Ssh;
         target.ssh_remote_port = Some(port);
         request.server_url = format!("https://127.0.0.1:{port}");
         target.server_url = Some(request.server_url.clone());
+    } else {
+        if pooled { return Err(OperationsError::bad_request("原 SSH 长连接仍在运行，请先断开后再选择仅 HTTPS 直连重新部署")); }
+        target.connection_mode=ssh_transport::Mode::Direct;
+        target.ssh_remote_port=None;
     }
     // Resolve transport policy before inserting a pending node. A refused SSH
     // forward must not leave a phantom machine that cannot be deployed again.
     handle.block_on(async {
         let mut tx=state.pool.begin().await.map_err(|_|OperationsError::busy())?;
+        if existing.is_some() {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))").bind(id.to_string()).execute(&mut *tx).await.map_err(|_|OperationsError::busy())?;
+            let allowed=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM nodes WHERE id=$1 AND deleted_at IS NULL AND last_seen<=NOW()-make_interval(secs=>$2))")
+                .bind(id).bind(state.config.online_window_seconds as f64).fetch_one(&mut *tx).await.map_err(|_|OperationsError::busy())?;
+            if !allowed { return Err(OperationsError::bad_request("原机器已恢复心跳或被软删除；已停止重新部署，未改注册凭据")); }
+        } else {
         sqlx::query("INSERT INTO nodes(id,hostname,display_name,os_name,os_version,kernel_version,architecture,cpu_model,cpu_logical_cores,agent_version,last_seen) VALUES($1,$2,$2,'等待 Agent','','',$3,'',0,'等待 Agent',NOW()-INTERVAL '1 day')")
             .bind(id).bind(&request.display_name).bind(fields[2]).execute(&mut *tx).await.map_err(|_|OperationsError::busy())?;
-        sqlx::query("INSERT INTO machine_enrollments(node_id,token_hash,expires_at,expected_user) VALUES($1,$2,NOW()+INTERVAL '10 minutes',$3)")
+        }
+        sqlx::query("INSERT INTO machine_enrollments(node_id,token_hash,expires_at,expected_user) VALUES($1,$2,NOW()+INTERVAL '10 minutes',$3) ON CONFLICT(node_id) DO UPDATE SET token_hash=EXCLUDED.token_hash,expires_at=EXCLUDED.expires_at,expected_user=EXCLUDED.expected_user")
             .bind(id).bind(crate::api::hash_token(&bootstrap)).bind(&request.username).execute(&mut *tx).await.map_err(|_|OperationsError::busy())?;
-        sqlx::query("INSERT INTO audit_logs(actor_type,actor_id,action,target_type,target_id,details) VALUES('ssh-user',$1,'machine.add','node',$2,'{\"result\":\"authorized\"}')")
-            .bind(&request.username).bind(id.to_string()).execute(&mut *tx).await.map_err(|_|OperationsError::busy())?;
+        sqlx::query("INSERT INTO audit_logs(actor_type,actor_id,action,target_type,target_id,details) VALUES('ssh-user',$1,$3,'node',$2,'{\"result\":\"authorized\"}')")
+            .bind(&request.username).bind(id.to_string()).bind(if existing.is_some(){"machine.redeploy"}else{"machine.add"}).execute(&mut *tx).await.map_err(|_|OperationsError::busy())?;
         tx.commit().await.map_err(|_|OperationsError::busy())
     })?;
     save_target(state, &target)?;
+    ssh_vault::save_with_token(&state.registry,&target,&ssh_auth,&request.sudo_password,false,browser_token)?;
     state.machines.event(
         id,
         25,
@@ -1178,6 +1443,7 @@ fn deploy(
         "/usr/bin/timeout --signal=TERM --kill-after=3s 90s /bin/bash {}",
         shell_quote(&format!("{stage}/install-user-agent.sh"))
     );
+    let installation_started=Utc::now();
     session.set_timeout(100_000);
     if mode == DeploymentMode::Basic { command(&session, &invocation).map_err(|_| {
         OperationsError::ssh(
@@ -1214,10 +1480,11 @@ fn deploy(
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         let confirmed=handle.block_on(async {
-            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM nodes n JOIN metrics_latest m ON m.node_id=n.id WHERE n.id=$1 AND n.deleted_at IS NULL AND n.last_seen>NOW()-INTERVAL '30 seconds' AND m.metrics->'privilege'->>'mode'=$2 AND m.metrics->'privilege'->>'uid'=$3)")
-                .bind(id).bind(mode.name()).bind(if mode == DeploymentMode::Basic { uid.to_string() } else { "0".to_owned() }).fetch_one(&state.pool).await
+            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM nodes n JOIN metrics_latest m ON m.node_id=n.id JOIN agents a ON a.node_id=n.id WHERE n.id=$1 AND n.deleted_at IS NULL AND n.last_seen>NOW()-INTERVAL '30 seconds' AND m.metrics->'privilege'->>'mode'=$2 AND m.metrics->'privilege'->>'uid'=$3 AND a.enrolled_at>=$4 AND m.updated_at>=$4)")
+                .bind(id).bind(mode.name()).bind(if mode == DeploymentMode::Basic { uid.to_string() } else { "0".to_owned() }).bind(installation_started).fetch_one(&state.pool).await
         }).unwrap_or(false);
         if confirmed {
+            ssh_vault::set_enabled(&state.registry,&target,target.connection_mode==ssh_transport::Mode::Ssh)?;
             if let Some(setup) = setup.as_mut() { setup.commit(); }
             // Remove only the exact uploaded files, never recursive cleanup.
             let cleanup = format!(
@@ -1268,6 +1535,9 @@ async fn change(
         return Err(OperationsError::bad_request("操作或机器确认 ID 不正确"));
     }
     state.machines.rate_limit()?;
+    // Keep registry mutations exclusive with redeployment, while preserving
+    // their existing machine-management rate limit rather than charging twice.
+    let _node_lease=acquire_node_lease(&state.limits,id,true,false)?;
     if state
         .machines
         .jobs
@@ -1388,7 +1658,10 @@ async fn change(
         save_target(&state, target)?;
     }
     tx.commit().await.map_err(|_| OperationsError::busy())?;
-    if request.action == "delete" && let Some(target) = target.as_ref() { ssh_transport::stop(target)?; }
+    if request.action == "delete" && let Some(target) = target.as_ref() {
+        ssh_transport::stop(target)?;
+        if ssh_vault::exists(&state.registry,target) { ssh_vault::set_enabled(&state.registry,target,false)?; }
+    }
     Ok(Json(
         json!({"message":match request.action.as_str(){"delete"=>"已软删除：历史、身份和远端文件保留，上报凭据停用", "restore"=>"已恢复原机器身份与上报凭据，等待 Agent 心跳", _=>"显示名称和备注已更新；SSH 地址、权限和机器身份未改变"}}),
     ))
@@ -1432,6 +1705,40 @@ fn verify_admin(session: &Session, credentials: &Credentials) -> Result<(), Oper
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redeployment_preserves_full_privileges_and_disallows_target_overrides() {
+        let mut target: Target=serde_json::from_value(json!({"node_id":Uuid::new_v4(),"hostname":"fixture",
+            "host":"10.0.0.9","port":22,"default_user":"tester","agent_home":"/home/tester/.easymanage","known_hosts":"/tmp/fixture-known-hosts"})).unwrap();
+        assert!(preserved_mode(&target,None)==DeploymentMode::Basic);
+        assert!(preserved_mode(&target,Some("full"))==DeploymentMode::Full);
+        target.agent_mode=Some("full".into());
+        assert!(preserved_mode(&target,Some("basic"))==DeploymentMode::Full);
+        target.agent_mode=None;target.default_user="root".into();
+        assert!(preserved_mode(&target,None)==DeploymentMode::Full);
+        let request=json!({"confirmation":target.node_id,"username":"tester","server_url":"https://127.0.0.1:8443","use_saved":true});
+        assert!(serde_json::from_value::<RedeployRequest>(request.clone()).is_ok());
+        for field in ["host","port","node_id","deployment_mode","known_hosts","force"] {
+            let mut altered=request.clone();altered[field]=json!("cannot-override");
+            assert!(serde_json::from_value::<RedeployRequest>(altered).is_err());
+        }
+    }
+
+    #[test]
+    fn redeployment_rotates_finished_job_capability_but_never_replaces_a_running_job() {
+        let tasks=Tasks::default();let node=Uuid::new_v4();let host="10.0.0.9".parse().unwrap();
+        let first=tasks.begin(node,host).unwrap();
+        assert!(tasks.begin(node,host).is_err());
+        assert!(tasks.begin(Uuid::new_v4(),host).is_err());
+        tasks.event(node,100,"failed","fixed sanitized fixture failure");
+        let next=tasks.begin(node,host).unwrap();
+        assert_ne!(*first,*next);
+        let jobs=tasks.jobs.lock().unwrap();
+        assert_eq!(jobs.len(),1);
+        assert_eq!(jobs[&node].node_id,node);
+        assert_eq!(jobs[&node].key_hash,crate::api::hash_token(&next));
+        assert_ne!(jobs[&node].key_hash,*next);
+    }
     fn authentication_request(fields: serde_json::Value) -> AddMachine {
         let mut value = json!({"host":"10.0.0.9","port":22,"display_name":"fixture",
             "server_url":"https://controller:8443","fingerprint":"fixture","username":"tester"});

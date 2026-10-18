@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -68,3 +69,39 @@ class NetworkConfigTests(unittest.TestCase):
         self.path.rename(original)
         self.path.symlink_to(original)
         self.assertNotEqual(self.run_switch().returncode, 0)
+
+    def test_quoted_exported_uuid_and_comments_preserve_other_settings(self):
+        original = (f'# private config\nexport EASYMANAGE_NODE_ID = "{self.node}"\n'
+                    'EASYMANAGE_SERVER_URL="https://old.example:8443"\n'
+                    'EXTRA_SETTING="keep spaces and # literal"\n')
+        self.path.write_text(original)
+        self.assertEqual(self.run_switch().returncode,0)
+        updated=self.path.read_text()
+        self.assertIn('EXTRA_SETTING="keep spaces and # literal"',updated)
+        self.assertIn('# private config',updated)
+        self.assertIn('EASYMANAGE_NODE_ID='+self.node,updated)
+
+    def test_legacy_uuid_can_be_confirmed_from_read_only_sqlite(self):
+        self.path.write_text('EASYMANAGE_SERVER_URL=https://old.example:8443\nEXTRA_SETTING=preserved\n')
+        state=self.base/'state/state.db'
+        state.unlink()
+        with sqlite3.connect(state) as db:
+            db.execute('CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            db.execute('INSERT INTO metadata VALUES(?,?)',('node_id',self.node))
+            db.execute('INSERT INTO metadata VALUES(?,?)',('agent_token','synthetic-agent-token'))
+        before=state.read_bytes()
+        self.assertEqual(self.run_switch().returncode,0)
+        self.assertEqual(state.read_bytes(),before)
+        self.assertIn('EASYMANAGE_NODE_ID='+self.node,self.path.read_text())
+
+    def test_specific_sanitized_failure_codes_do_not_create_or_reset_installation(self):
+        self.assertEqual(self.run_switch(ca='0'*64).returncode,22)
+        self.assertEqual(self.run_switch(node=str(uuid.uuid4())).returncode,23)
+        self.path.chmod(0o644)
+        self.assertEqual(self.run_switch().returncode,21)
+        self.path.chmod(0o600)
+        self.path.unlink()
+        result=self.run_switch()
+        self.assertEqual(result.returncode,20)
+        self.assertFalse(self.path.exists())
+        self.assertEqual((self.base/'state/state.db').read_bytes(),b'unchanged fixture identity bytes')

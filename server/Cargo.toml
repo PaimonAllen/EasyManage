@@ -17,6 +17,7 @@ easymanage-protocol = { path = "../protocol" }
 easymanage-runtime = { path = "../runtime" }
 hex.workspace = true
 reqwest.workspace = true
+ring = "0.17.14"
 ssh2 = "0.9.6"
 zeroize = "1.8"
 rustls.workspace = true

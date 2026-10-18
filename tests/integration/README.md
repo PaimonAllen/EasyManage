@@ -2,6 +2,8 @@
 
 SSH 长连接回归复用 `--machine-onboarding`：目标上报地址实际不可达时自动使用真实反向 HTTPS 通道，要求收到真实 Agent 心跳；检查稳定两条连接、指纹/健康查询与重启不新增握手、连接中断后的退避恢复、三连接硬上限、禁用转发时明确失败、显式断开/重连及软删除恢复后身份不变。端口转发由隔离 Paramiko fixture 提供，不修改生产 sshd，也不代表生产管理员已允许转发。`test_ssh_network_config.py` 检查配置切换的原 UUID/额外设置保留、私有备份、CA/身份/URL/注入/符号链接拒绝与秘密不回显。Rust 单测补充握手预算与有界重连退避；前端 SSR 检查自动/直连/SSH 三种选项、最多三连接说明及 TLS 校验提示。
 
+凭据保险库回归包含密码/私钥/口令的认证加密往返、随机 nonce、篡改/跨节点替换/错误主密钥/缺失密钥/权限/符号链接拒绝，以及节点作用域浏览器 Cookie、过期凭证、暂停恢复和删除密文。真实 SSH fixture 检查无 Cookie 不能使用保存的凭据、同浏览器免输入重连、实际平台重启后自动恢复并收到新心跳；随后使用真实时间等待三次 60 秒重试，确认停止并释放所有连接，再通过保存的密文手动恢复。该组测试会比旧版多花数分钟，不缩短生产重试间隔。所有 SSH 密钥和主密钥均为隔离临时生成，不使用生产凭据。
+
 `full_ssh_update_smoke.py` 同样传入宿主 net/mnt ID，在嵌套私有 root namespace 中检查固定 Full 更新器的正常替换、错误摘要/UUID 拒绝、服务重启失败回退，以及从未有 Basic 配置的 Full 节点切换网络。所有情况保留原 SQLite 字节；使用 mock systemd，不接触生产 root 服务。
 
 生产主机不直接运行测试。`isolated_smoke.py` 必须在独立网络和挂载命名空间、私有 `/tmp`、非 root 用户下执行；它会拒绝原主机命名空间。该环境不是完整虚拟机。
@@ -19,6 +21,7 @@ cargo test --workspace --no-run --jobs 2
 bwrap --unshare-all --die-with-parent --new-session \
   --ro-bind / / --dev /dev --proc /proc \
   --tmpfs /tmp --tmpfs /run --tmpfs /home --tmpfs /sys \
+  --tmpfs /var --tmpfs /etc/easymanage --tmpfs /etc/systemd/system --tmpfs /usr/local/sbin \
   --dir /tmp/work --ro-bind "$PWD" /tmp/work --chdir /tmp/work \
   /usr/bin/python3 /tmp/work/tests/integration/isolated_smoke.py \
   --server-binary /tmp/work/target/release/easymanage-server \
@@ -32,6 +35,8 @@ bwrap --unshare-all --die-with-parent --new-session \
 Rust 单元测试同样在上述隔离环境执行编译得到的 `target/debug/deps/` 测试二进制，不在生产环境直接执行 `cargo test`。
 
 可选 `--machine-onboarding` 回归需临时测试 venv 的 Paramiko 3.5.1（不是平台依赖）和 C 编译器。仍须使用上面的私有网络、`/home` 与 `/tmp`，将 venv 只读映射至 `/tmp/ssh-env` 并用其 Python 调用隔离入口。测试会生成临时 SSH 密钥和凭据，SSH/SCP、摘要校验、用户安装脚本与 Agent 上报是真实执行；systemd 用户 manager 为 mock。`fixtures/ssh_loopback_redirect.c` 仅预加载到该临时 Server，将两个合成内网 IP 的 SSH 连接转到隔离 loopback，不改网络配置、不接触生产 SSH。严禁对生产进程使用该测试 shim。
+
+SSH fixture 还强制遮蔽 `/var`、`/etc/easymanage`、`/etc/systemd/system` 和 `/usr/local/sbin`，对私有环境执行真实安装残留检查，不读取生产 Agent 路径。`--machine-redeployment` 自动启用 onboarding，并增加实际卸载归档后原 UUID 的重新部署、在线/残留/覆盖字段/重复任务拒绝、历史/名称/备注保留、原 SSH 通道复用与旧 Agent token 失效验证；该入口跳过单独的三分钟重试耗尽用例，后者仍由 `--machine-onboarding` 覆盖。Full 级别不降权及请求不可覆盖地址/模式另有 Rust 单测，前端 SSR 检查确认窗口、原 ID/权限展示及已保存凭据模式。
 
 新增机器鉴权回归包含旧版密码请求兼容、未加密/加密 PEM RSA 私钥、带口令 OpenSSH Ed25519 私钥完成真实部署、错误口令和指纹阻断；还检查解析错误不回显秘密，任务日志、运行日志、清单和安装后的 Agent 文件不含密码/私钥/口令。所有密钥均在隔离测试运行时生成，不使用个人 SSH 密钥。`web/tests/machineAuthentication.test.ts` 检查请求序列化后及异常时的引用清理，SSR 检查鉴权选项、密码/口令掩码和不回显正文的私钥上传。
 

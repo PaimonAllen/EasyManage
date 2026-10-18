@@ -29,3 +29,9 @@ test("secret fields are cleared on serialization errors too", () => {
   assert.equal(value.sudo_password, "");
   clearMachineAuthentication(value);
 });
+
+test("saved credential reuse serializes only the selector, never plaintext secret fields", () => {
+  const request: {use_saved: boolean} & Partial<MachineAuthentication> = {use_saved:true};
+  assert.deepEqual(JSON.parse(serializeMachineRequest(request)),{use_saved:true});
+  assert.deepEqual(request,{use_saved:true});
+});

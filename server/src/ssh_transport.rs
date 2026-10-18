@@ -1,4 +1,4 @@
-//! Controller-initiated, bounded SSH transports. No SSH subprocesses or credentials on disk.
+//! Controller-initiated, bounded SSH transports. Credentials at rest use ssh_vault.
 //! Two long-lived TCP sessions (control + reverse HTTPS), plus one optional admin
 //! identity. Channels are NOT connections. Control operations serialize because
 //! libssh2 blocking mode belongs to a session, not to an individual channel.
@@ -17,6 +17,8 @@ fn fingerprint(session: &Session) -> Result<String, OperationsError> {
 }
 
 pub(super) const MAX_CONNECTIONS: usize = 3;
+pub(super) const RETRY_LIMIT: u32 = 3;
+pub(super) const RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_PIPES: usize = 8;
 const PROBE_TTL: Duration = Duration::from_secs(60);
 
@@ -57,7 +59,7 @@ impl Auth {
         hex::encode(hash.finalize())
     }
 
-    fn authenticate(&self, session: &Session) -> Result<(), OperationsError> {
+    pub(super) fn authenticate(&self, session: &Session) -> Result<(), OperationsError> {
         let result = if self.key.is_empty() {
             session.userauth_password(&self.username, &self.password)
         } else {
@@ -142,10 +144,13 @@ struct State {
     control: Option<Cached>,
     admin: Option<Cached>,
     stop: Option<Arc<AtomicBool>>,
+    worker_done: Option<Arc<AtomicBool>>,
     tunnel_socket: Option<TcpStream>,
     node_id: Option<Uuid>,
     status: &'static str,
     reconnects: u64,
+    retry_attempt: u32,
+    last_error: Option<&'static str>,
     port: Option<u16>,
 }
 
@@ -412,9 +417,20 @@ pub(super) fn status(target: &Target) -> serde_json::Value {
     let Ok(state) = host.state.lock() else {
         return json!({"status":"busy"});
     };
-    json!({"status":if state.stop.is_none() {"disconnected"} else {state.status},
+    json!({"status":if state.status.is_empty() {"disconnected"} else {state.status},
         "connections":MAX_CONNECTIONS - host.slots.available_permits(), "limit":MAX_CONNECTIONS,
-        "remote_port":state.port.or(target.ssh_remote_port), "reconnects":state.reconnects})
+        "remote_port":state.port.or(target.ssh_remote_port), "reconnects":state.reconnects,
+        "retry_attempt":state.retry_attempt,"retry_limit":RETRY_LIMIT,"retry_interval_seconds":RETRY_INTERVAL.as_secs(),
+        "last_error":state.last_error})
+}
+
+pub(super) fn restore_status(target: &Target, status: &'static str, attempt: u32, error: &'static str) {
+    if let Ok(host) = host(SocketAddr::new(target.host,target.port))
+        && let Ok(mut state) = host.state.lock() {
+        state.status = status;
+        state.retry_attempt = attempt;
+        state.last_error = Some(error);
+    }
 }
 
 pub(super) fn stop(target: &Target) -> Result<(), OperationsError> {
@@ -432,6 +448,22 @@ pub(super) fn stop(target: &Target) -> Result<(), OperationsError> {
     state.control = None;
     state.admin = None;
     state.status = "disconnected";
+    state.last_error = None;
+    state.retry_attempt = 0;
+    let done = state.worker_done.take();
+    drop(state);
+    // The libssh2 listener owns the remote port until its worker drops it.
+    // Wait for acknowledgement before a manual reconnect can dial/rebind.
+    if let Some(done) = done {
+        let deadline = Instant::now()+Duration::from_secs(3);
+        while !done.load(Ordering::Acquire) && Instant::now()<deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !done.load(Ordering::Acquire) {
+            host.state.lock().map_err(|_|OperationsError::busy())?.worker_done = Some(done);
+            return Err(OperationsError::ssh("旧 SSH 会话尚未完全退出；未新建连接，请稍后重试"));
+        }
+    }
     Ok(())
 }
 
@@ -510,6 +542,7 @@ pub(super) fn start(
     }
     verify_listener(session, port)?;
     let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     {
         let mut state = host.state.lock().map_err(|_| OperationsError::busy())?;
         let cached = Cached::new(session.connection.clone(), auth.identity());
@@ -522,6 +555,7 @@ pub(super) fn start(
         );
         state.control = Some(cached);
         state.stop = Some(stop.clone());
+        state.worker_done = Some(done.clone());
         state.tunnel_socket = Some(
             tunnel
                 .socket
@@ -530,19 +564,38 @@ pub(super) fn start(
         );
         state.node_id = Some(target.node_id);
         state.status = "connected";
+        state.retry_attempt = 0;
+        state.last_error = None;
         state.port = Some(port);
     }
     let mut target = target.clone();
     target.ssh_remote_port = Some(port);
     let host_clone = host.clone();
-    std::thread::spawn(move || maintain(host_clone, target, auth, stop, local, tunnel, listener));
+    std::thread::spawn(move || {
+        struct Done(Arc<AtomicBool>);
+        impl Drop for Done { fn drop(&mut self) { self.0.store(true,Ordering::Release); } }
+        let _done = Done(done);
+        maintain(host_clone, target, auth, stop, local, tunnel, listener);
+    });
     Ok(port)
 }
 
-fn backoff(attempt: u32) -> Duration {
-    let seconds = 5_u64.saturating_mul(1_u64 << attempt.min(6)).min(300);
-    // Jitter prevents a fleet reconnecting all at once after an outage.
-    Duration::from_millis(seconds * 1000 + u64::from(Uuid::new_v4().as_bytes()[0]) * seconds)
+fn retry_delay(attempt: u32) -> Option<Duration> {
+    (attempt < RETRY_LIMIT).then_some(RETRY_INTERVAL)
+}
+
+fn finish(host: &Host, stop: &Arc<AtomicBool>, status: &'static str) {
+    if let Ok(mut state) = host.state.lock()
+        && state.stop.as_ref().is_some_and(|current| Arc::ptr_eq(current,stop)) {
+        for cached in [&state.control,&state.admin].into_iter().flatten() {
+            let _ = cached.connection.socket.shutdown(Shutdown::Both);
+        }
+        state.control = None;
+        state.admin = None;
+        state.tunnel_socket = None;
+        state.stop = None;
+        state.status = status;
+    }
 }
 
 fn maintain(
@@ -554,9 +607,8 @@ fn maintain(
     mut tunnel: Arc<Connection>,
     mut listener: ssh2::Listener,
 ) {
-    let mut attempt = 0;
     loop {
-        let started = Instant::now();
+        let mut attempt = 0;
         let result = pump(&host, &tunnel.session, &mut listener, &stop, local);
         // Drop listener and connection before waiting/dialing. No overlapping
         // replacement tunnel can exceed the per-endpoint semaphore budget.
@@ -565,11 +617,9 @@ fn maintain(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        if started.elapsed() > Duration::from_secs(60) {
-            attempt = 0;
-        }
         if let Ok(mut state) = host.state.lock() {
             state.tunnel_socket = None;
+            state.retry_attempt = 0;
             state.status = if result.is_err() {
                 "reconnecting"
             } else {
@@ -577,8 +627,10 @@ fn maintain(
             };
         }
         loop {
-            let delay = backoff(attempt);
-            attempt = attempt.saturating_add(1);
+            let Some(delay) = retry_delay(attempt) else {
+                finish(&host, &stop, "retry_exhausted");
+                return;
+            };
             let until = Instant::now() + delay;
             while Instant::now() < until && !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
@@ -586,6 +638,8 @@ fn maintain(
             if stop.load(Ordering::Relaxed) {
                 return;
             }
+            attempt += 1;
+            if let Ok(mut state) = host.state.lock() { state.retry_attempt = attempt; }
             let result = (|| {
                 let _dial = host.dial.lock().map_err(|_| OperationsError::busy())?;
                 if stop.load(Ordering::Relaxed) {
@@ -611,7 +665,7 @@ fn maintain(
                     .map_err(|_| OperationsError::busy())?
                     .control
                     .is_none();
-                let control = if needs_control {
+                let mut control = if needs_control {
                     let connection = dial(&host, SocketAddr::new(target.host, target.port))?;
                     verify(&connection, &target)?;
                     auth.authenticate(&connection.session)?;
@@ -634,15 +688,20 @@ fn maintain(
                     // An outage may kill BOTH sessions. The forward can recover
                     // before the old control socket notices EOF; do not retain
                     // that dead cached control forever across retries.
-                    if control.is_none() {
-                        host.state
-                            .lock()
-                            .map_err(|_| OperationsError::busy())?
-                            .control = None;
-                    }
-                    return Err(error);
-                }
-                drop(control_lease);
+                    drop(control_lease);
+                    if control.is_some() { return Err(error); }
+                    host.state.lock().map_err(|_| OperationsError::busy())?.control = None;
+                    // Rebuild the stale control within THIS retry, not after
+                    // another minute. Release its lease/cache before dialing.
+                    let connection = dial(&host,SocketAddr::new(target.host,target.port))?;
+                    verify(&connection,&target)?;
+                    auth.authenticate(&connection.session)?;
+                    let replacement = Cached::new(connection,auth.identity());
+                    let check = replacement.lease()?;
+                    verify_listener(&check,port)?;
+                    drop(check);
+                    control = Some(replacement);
+                } else { drop(control_lease); }
                 let mut state = host.state.lock().map_err(|_| OperationsError::busy())?;
                 if stop.load(Ordering::Relaxed) {
                     return Err(OperationsError::busy());
@@ -657,6 +716,7 @@ fn maintain(
                 }
                 state.reconnects += 1;
                 state.status = "connected";
+                state.last_error = None;
                 Ok((new, listener))
             })();
             match result {
@@ -668,13 +728,14 @@ fn maintain(
                 Err(error)
                     if error.0 == StatusCode::UNAUTHORIZED || error.0 == StatusCode::CONFLICT =>
                 {
-                    if let Ok(mut state) = host.state.lock() {
-                        state.status = "authentication_required";
-                    }
+                    if let Ok(mut state) = host.state.lock() { state.last_error = Some(error.1); }
+                    finish(&host, &stop, "authentication_required");
                     // No tight retries against bad credentials or changed host keys.
                     return;
                 }
-                Err(_) => {}
+                Err(error) => {
+                    if let Ok(mut state) = host.state.lock() { state.last_error = Some(error.1); }
+                }
             }
         }
     }
@@ -881,11 +942,23 @@ mod tests {
         assert_eq!(host.slots.available_permits(), MAX_CONNECTIONS);
     }
     #[test]
-    fn backoff_is_bounded_and_never_a_tight_loop() {
-        for attempt in 0..100 {
-            let delay = backoff(attempt);
-            assert!(delay >= Duration::from_secs(5) && delay < Duration::from_secs(377));
-        }
+    fn reconnects_wait_one_minute_and_stop_after_three_attempts() {
+        for attempt in 0..3 { assert_eq!(retry_delay(attempt),Some(Duration::from_secs(60))); }
+        for attempt in 3..100 { assert_eq!(retry_delay(attempt),None); }
+    }
+    #[test]
+    fn exhausted_worker_cleanup_never_stops_a_newer_transport() {
+        let host = Host::default();
+        let old = Arc::new(AtomicBool::new(false));
+        let current = Arc::new(AtomicBool::new(false));
+        host.state.lock().unwrap().stop = Some(current.clone());
+        finish(&host,&old,"retry_exhausted");
+        assert!(host.state.lock().unwrap().stop.is_some());
+        finish(&host,&current,"retry_exhausted");
+        let state = host.state.lock().unwrap();
+        assert!(state.stop.is_none());
+        assert_eq!(state.status,"retry_exhausted");
+        assert_eq!(host.slots.available_permits(),3);
     }
     #[test]
     fn legacy_targets_default_to_direct_but_onboarding_defaults_to_auto() {

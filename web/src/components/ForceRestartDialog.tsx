@@ -42,7 +42,7 @@ export function ForceRestartDialog({ target, onClose, onSubmitted }: {
       {message ? <div className="notice notice--success" role="status">{message}{!target && <p>等待约 5 秒后刷新页面检查平台状态。</p>}</div> : <>
         <p className="form-error">将立即终止该服务的全部进程并重新启动，当前请求及监控连接会中断。</p>
         <p className="hint">{target ? "支持离线或故障 Agent；保留目标机已配置的 Full / Basic 权限。" : "仅重启平台服务；数据库故障仍需管理员恢复 PostgreSQL。"} 每次操作均需目标服务器的管理员 SSH 与 sudo 验证。</p>
-        {!target&&<p className="hint">平台重启会断开 SSH 长连接，之后需到设备总览重新鉴权；不影响 Agent 安装和原有权限。</p>}
+        {!target&&<p className="hint">平台重启会短暂中断 SSH 长连接；已加密保存凭据且启用的连接将自动恢复。不影响 Agent 安装和原有权限。</p>}
         <label>管理员用户名<input required autoFocus value={username} disabled={busy} onChange={(event) => setUsername(event.target.value)} maxLength={64} autoComplete="off" placeholder="例如 cvpr" /></label>
         <label>管理员密码<input required type="password" value={password} disabled={busy} onChange={(event) => setPassword(event.target.value)} maxLength={1024} autoComplete="off" /></label>
       </>}
