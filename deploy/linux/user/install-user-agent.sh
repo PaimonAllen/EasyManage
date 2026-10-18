@@ -23,7 +23,7 @@ assert_plain_path() {
 }
 for item in "$bundle_dir" "$agent_base/bin/easymanage-agent" "$agent_base/config/agent.env" \
   "$agent_base/config/ca.crt" "$agent_base/state/state.db" "$agent_base/state/state.db-wal" \
-  "$agent_base/state/state.db-shm" "$unit_path"; do
+  "$agent_base/state/state.db-shm" "$agent_base/bin/agent-user-control.py" "$agent_base/config/agent-launch.json" "$unit_path"; do
   assert_plain_path "$item"
 done
 cd "$bundle_dir"
@@ -33,13 +33,13 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   [[ "$line" =~ ^[a-fA-F0-9]{64}\ \ ([a-zA-Z0-9_.-]+)$ ]] || exit 64
   file="${BASH_REMATCH[1]}"
   case "$file" in
-    easymanage-agent|install-user-agent.sh|install-full-candidate.sh|migrate-agent-to-user.sh|handover.sh|easymanage-agent.user.service|node.json|agent.env|ca.crt) ;;
+    easymanage-agent|agent-user-control.py|install-user-agent.sh|install-full-candidate.sh|migrate-agent-to-user.sh|handover.sh|easymanage-agent.user.service|node.json|agent.env|ca.crt) ;;
     *) exit 64 ;;
   esac
   [[ -z "${verified_files[$file]:-}" && -f "$file" && ! -L "$file" ]] || exit 64
   verified_files["$file"]=1
 done < SHA256SUMS
-for file in easymanage-agent install-user-agent.sh easymanage-agent.user.service node.json agent.env ca.crt; do
+for file in easymanage-agent agent-user-control.py install-user-agent.sh easymanage-agent.user.service node.json agent.env ca.crt; do
   [[ "${verified_files[$file]:-}" == 1 ]] || { printf 'Incomplete agent installation manifest.\n' >&2; exit 64; }
 done
 sha256sum --check --status SHA256SUMS
@@ -80,11 +80,15 @@ if state.exists():
     if not existing or uuid.UUID(existing[0]) != node_id:
         raise SystemExit("Persisted identity differs; administrator review is required")
 PY
-systemctl --user show-environment >/dev/null
-install -d -m 0700 "$agent_base" "$agent_base/bin" "$agent_base/config" "$agent_base/state" "$operator_home/.config/systemd/user"
+backend=compatibility
+if [[ "$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null || true)" == yes ]] && systemctl --user show-environment >/dev/null 2>&1; then
+  backend=systemd
+fi
+install -d -m 0700 "$agent_base" "$agent_base/bin" "$agent_base/config" "$agent_base/state"
+if [[ "$backend" == systemd ]]; then install -d -m 0700 "$operator_home/.config/systemd/user"; fi
 backup_dir="$(mktemp -d "$agent_base/install-backup.XXXXXX")"
-targets=("$agent_base/bin/easymanage-agent" "$agent_base/config/agent.env" "$agent_base/config/ca.crt" "$unit_path")
-sources=("$bundle_dir/easymanage-agent" "$bundle_dir/agent.env" "$bundle_dir/ca.crt" "$bundle_dir/easymanage-agent.user.service")
+targets=("$agent_base/bin/easymanage-agent" "$agent_base/config/agent.env" "$agent_base/config/ca.crt" "$unit_path" "$agent_base/bin/agent-user-control.py" "$agent_base/config/agent-launch.json")
+sources=("$bundle_dir/easymanage-agent" "$bundle_dir/agent.env" "$bundle_dir/ca.crt" "$bundle_dir/easymanage-agent.user.service" "$bundle_dir/agent-user-control.py")
 for index in "${!targets[@]}"; do
   target="${targets[$index]}"
   [[ ! -e "$target" || -f "$target" ]] || exit 64
@@ -92,6 +96,10 @@ for index in "${!targets[@]}"; do
 done
 was_active=false
 was_enabled=false
+was_compat=false
+was_compat_enabled=false
+if [[ -f "$agent_base/state/compat.enabled" ]]; then was_compat_enabled=true; fi
+if [[ -f "$agent_base/bin/agent-user-control.py" ]] && python3 "$agent_base/bin/agent-user-control.py" status >/dev/null 2>&1; then was_compat=true; fi
 if systemctl --user is-active --quiet easymanage-agent.service; then was_active=true; fi
 if systemctl --user is-enabled --quiet easymanage-agent.service; then was_enabled=true; fi
 mutation_started=false
@@ -100,6 +108,7 @@ restore_on_exit() {
   trap - EXIT
   if (( result != 0 )) && [[ "$mutation_started" == true ]]; then
     set +e
+    if [[ -f "$agent_base/bin/agent-user-control.py" ]]; then python3 "$agent_base/bin/agent-user-control.py" stop; fi
     systemctl --user stop easymanage-agent.service
     for index in "${!targets[@]}"; do
       target="${targets[$index]}"
@@ -113,6 +122,7 @@ restore_on_exit() {
       systemctl --user disable easymanage-agent.service
     fi
     if [[ "$was_active" == true ]]; then systemctl --user start easymanage-agent.service; fi
+    if [[ "$was_compat" == true || "$was_compat_enabled" == true ]]; then python3 "$agent_base/bin/agent-user-control.py" start; fi
     printf 'User-agent update failed; prior files/service restoration attempted. Recovery: %s\n' "$backup_dir" >&2
   fi
   exit "$result"
@@ -121,18 +131,39 @@ trap restore_on_exit EXIT
 mutation_started=true
 # Stop only this agent while replacing its executable, configuration and unit together.
 systemctl --user stop easymanage-agent.service 2>/dev/null || [[ "$was_active" == false ]]
-for index in "${!targets[@]}"; do
+if [[ -f "$agent_base/bin/agent-user-control.py" ]]; then python3 "$agent_base/bin/agent-user-control.py" stop; fi
+for index in "${!sources[@]}"; do
+  if [[ "$backend" != systemd && "$index" == 3 ]]; then continue; fi
   target="${targets[$index]}"
   temporary="$(mktemp "$(dirname -- "$target")/.easymanage-install.XXXXXX")"
   mode=0600
-  if [[ "$index" == 0 ]]; then mode=0700; fi
+  if [[ "$index" == 0 || "$index" == 4 ]]; then mode=0700; fi
   install -m "$mode" "${sources[$index]}" "$temporary"
   mv -f -- "$temporary" "$target"
 done
-systemctl --user daemon-reload
-systemctl --user enable easymanage-agent.service
-systemctl --user restart easymanage-agent.service
-sleep 3
-systemctl --user is-active --quiet easymanage-agent.service
+if [[ "$backend" == systemd ]]; then
+  python3 - "$agent_base/config/agent-launch.json" <<'PY'
+import json,pathlib,sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({'backend':'systemd','autostart':'systemd'}))
+PY
+  chmod 600 "$agent_base/config/agent-launch.json"
+  systemctl --user daemon-reload
+  systemctl --user enable easymanage-agent.service
+  systemctl --user restart easymanage-agent.service
+  sleep 3
+  systemctl --user is-active --quiet easymanage-agent.service
+else
+  if [[ -f "$unit_path" ]]; then
+    systemctl --user disable easymanage-agent.service >/dev/null 2>&1 || true
+    # Retire the previous user unit even when its manager cannot be reached.
+    # Leaving an enabled unit on disk could launch a duplicate at next login.
+    mv -- "$unit_path" "$backup_dir/retired-user-unit"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+  python3 "$agent_base/bin/agent-user-control.py" configure
+  python3 "$agent_base/bin/agent-user-control.py" start
+  sleep 3
+  python3 "$agent_base/bin/agent-user-control.py" status
+fi
 trap - EXIT
-printf 'Basic Agent installed for user %s. Master checks the fresh heartbeat.\n' "$operator_user"
+printf 'Basic Agent installed for user %s using %s. Master checks the fresh heartbeat.\n' "$operator_user" "$backend"

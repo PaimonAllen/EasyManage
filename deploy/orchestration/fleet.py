@@ -107,6 +107,7 @@ def create_bundle(directory, node, enrollment, server_url, ca):
     files = {
         "easymanage-agent": ROOT / "target/release/easymanage-agent",
         "install-user-agent.sh": ROOT / "deploy/linux/user/install-user-agent.sh",
+        "agent-user-control.py": ROOT / "deploy/linux/user/agent-user-control.py",
         "install-full-candidate.sh": ROOT / "deploy/linux/operations/install-full-candidate.sh",
         "migrate-agent-to-user.sh": ROOT / "deploy/linux/migrations/migrate-agent-to-user.sh",
         "handover.sh": ROOT / "deploy/linux/migrations/handover.sh",
@@ -182,6 +183,7 @@ def publish(manifest, inventory):
         raise RuntimeError("Platform user configuration is not initialized")
     release = BASE / "releases/current"
     names = ["target/release/easymanage-agent", "deploy/orchestration/fleet.py",
+             "deploy/linux/user/agent-user-control.py",
              "deploy/linux/user/install-user-agent.sh", "deploy/linux/operations/install-full-candidate.sh",
              "deploy/linux/migrations/migrate-agent-to-user.sh", "deploy/linux/migrations/handover.sh",
              "deploy/linux/user/easymanage-agent.user.service"]
@@ -381,11 +383,15 @@ def verify_heartbeats(manifest, started):
 
 def control_agent(node, action):
     require_linux(node)
+    compat = ('[ -f "$HOME/.easymanage/config/agent-launch.json" ] && '
+              'python3 -c \'import json; from pathlib import Path; d=json.loads((Path.home()/".easymanage/config/agent-launch.json").read_text()); raise SystemExit(0 if d.get("backend")=="compatibility" else 1)\'')
     # A promoted Full agent is intentionally not restarted/downgraded through a user service.
     if action == "restart":
         command = ("state=$(systemctl show easymanage-agent.service -p ActiveState --value); "
                    "if [ \"$state\" = active ] || systemctl is-enabled --quiet easymanage-agent.service; then "
                    "printf 'Full/system Agent requires administrator restart.\\n' >&2; exit 3; fi; "
+                   f"if {compat}; then "
+                   "python3 \"$HOME/.easymanage/bin/agent-user-control.py\" restart; exit $?; fi; "
                    "systemctl --user is-active --quiet easymanage-agent.service || exit 3; "
                    "systemctl --user restart easymanage-agent.service && "
                    "sleep 2 && systemctl --user is-active --quiet easymanage-agent.service")
@@ -400,6 +406,8 @@ def control_agent(node, action):
                "printf 'System agent is transitioning; refusing to start a duplicate.\\n' >&2; exit 3; "
                "elif systemctl is-enabled --quiet easymanage-agent.service; then "
                "printf 'System/Full agent is configured but stopped; administrator action required.\\n' >&2; exit 3; "
+               f"elif {compat}; then "
+               f"python3 \"$HOME/.easymanage/bin/agent-user-control.py\" {action}; "
                f"else systemctl --user {action} easymanage-agent.service; fi")
     print(f"{node['hostname']}:", flush=True)
     if node["ssh_target"] == "local":

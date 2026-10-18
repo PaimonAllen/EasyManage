@@ -2,7 +2,7 @@
 
 这里放普通用户 Server / Basic Agent 和 systemd 用户服务，系统级单元与安装器位于 [system](../system/README.md)。用户模式并未废弃；用户 Server 可以管理 Full Agent，不自动切换生产模式或把已提权 Agent 降回 Basic。
 
-程序、配置、TLS 和 SQLite 状态在 `~/.easymanage/`，单元在 `~/.config/systemd/user/`。用户不可见的指标保持未知；退出 SSH 后持续运行需要 systemd 用户 manager / linger。
+程序、配置、TLS 和 SQLite 状态在 `~/.easymanage/`。用户不可见的指标保持未知。Basic 自动优先选择已有 manager + linger 的 systemd 用户服务（单元在 `~/.config/systemd/user/`），否则使用 `agent-user-control.py` 普通用户后台守护，不要求先启用 linger，也不调用 sudo。兼容模式日志有界，允许用户 cron 时添加独立标记块作开机/每分钟恢复；cron 不可用时仍允许部署，但必须明确提示恢复能力受限。平台服务本身仍使用 systemd 用户服务，不在本次兼容范围内。
 
 `scripts/run-server.sh` 的 `--controller`、`--prepare-fleet`、`--fleet`、`--start-all` 保持兼容。默认读取私有 `deploy/local/fleet.json`；Full 的更新、重启或强制重启走管理员验证路径。
 

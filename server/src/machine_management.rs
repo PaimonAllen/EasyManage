@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 
 const USER_INSTALL: &str = include_str!("../../deploy/linux/user/install-user-agent.sh");
 const USER_UNIT: &str = include_str!("../../deploy/linux/user/easymanage-agent.user.service");
+const USER_CONTROL: &str = include_str!("../../deploy/linux/user/agent-user-control.py");
 const FULL_INSTALL: &str = include_str!("../../deploy/linux/operations/install-new-full-agent.sh");
 const JOB_TTL: Duration = Duration::from_mins(30);
 const MAX_PRIVATE_KEY_BYTES: usize = 12 * 1024;
@@ -596,7 +597,7 @@ fn command(session: &Session, invocation: &str) -> Result<String, OperationsErro
         .map_err(|_| OperationsError::ssh("远端通道中断"))?;
     if channel.exit_status().unwrap_or(1) != 0 {
         return Err(OperationsError::ssh(
-            "远端环境检查失败；请核对 Linux、Python3、systemd 及所选部署权限，Basic 还需用户 manager 与 linger",
+            "远端环境检查失败；请核对 Linux、Python3、目标账户及所选部署权限；Basic 支持无 linger 的兼容模式",
         ));
     }
     String::from_utf8(output).map_err(|_| OperationsError::ssh("远端检查格式异常"))
@@ -770,14 +771,14 @@ fn deploy(
         id,
         10,
         "running",
-        if mode == DeploymentMode::Basic { "SSH 认证成功；检查普通用户身份、Linux 架构、systemd 与 linger" }
+        if mode == DeploymentMode::Basic { "SSH 认证成功；检查普通用户身份、Linux 架构与 Python3；不强制要求 linger" }
         else { "SSH 认证成功；检查 Linux 架构和管理员 root/sudo 权限（Full 不依赖用户 linger）" },
     );
     let info = command(
         &session,
         &format!("/bin/bash --noprofile --norc -c {}", shell_quote(&format!(
             "set -eu; test \"$(uname -s)\" = Linux; command -v python3 >/dev/null; command -v timeout >/dev/null; printf '%s\\n' \"$(id -un)\" \"$(getent passwd \"$(id -un)\" | cut -d: -f6)\" \"$(uname -m)\" \"$(id -u)\"; {}",
-            if mode == DeploymentMode::Basic { "test \"$(id -u)\" != 0; test \"$(loginctl show-user \"$(id -u)\" -p Linger --value)\" = yes; systemctl --user show-environment >/dev/null" }
+            if mode == DeploymentMode::Basic { "test \"$(id -u)\" != 0" }
             else { "systemctl show-environment >/dev/null" }
         ))),
     )?;
@@ -810,7 +811,7 @@ fn deploy(
     // Refuse an existing Agent, even if stopped. Onboarding never reassigns its UUID.
     command(&session, "test ! -e \"$HOME/.local/share/easymanage/config/agent.env\" && test ! -e \"$HOME/.local/share/easymanage/state/state.db\"")
         .map_err(|_| OperationsError::bad_request("检测到旧用户目录 Agent 身份，请先迁移到 ~/.easymanage，不允许重复注册"))?;
-    command(&session,"/bin/bash --noprofile --norc -c 'set -eu; test \"$(systemctl show easymanage-agent.service -p LoadState --value)\" = not-found; test ! -d /var/lib/easymanage-agent; test ! -e /usr/local/sbin/easymanage-agent; test ! -d /etc/easymanage || test -x /etc/easymanage; test ! -e /etc/easymanage/agent.env; test ! -e \"$HOME/.easymanage/state/state.db\"; test ! -e \"$HOME/.easymanage/config/agent.env\"; test ! -e \"$HOME/.config/systemd/user/easymanage-agent.service\"' ")
+    command(&session,"/bin/bash --noprofile --norc -c 'set -eu; if command -v systemctl >/dev/null; then state=$(systemctl show easymanage-agent.service -p LoadState --value 2>/dev/null || true); test -z \"$state\" || test \"$state\" = not-found; fi; test ! -e /etc/systemd/system/easymanage-agent.service; test ! -d /var/lib/easymanage-agent; test ! -e /usr/local/sbin/easymanage-agent; test ! -d /etc/easymanage || test -x /etc/easymanage; test ! -e /etc/easymanage/agent.env; test ! -e \"$HOME/.easymanage/state/state.db\"; test ! -e \"$HOME/.easymanage/config/agent.env\"; test ! -e \"$HOME/.config/systemd/user/easymanage-agent.service\"' ")
         .map_err(|_|OperationsError::bad_request("目标已存在 Agent 配置、用户单元或身份库；请恢复/接管原节点，不允许覆盖安装"))?;
     let bootstrap = Zeroizing::new(format!(
         "{}{}",
@@ -917,6 +918,7 @@ fn deploy(
     let files: Vec<(&str, &[u8], i32)> = vec![
         ("easymanage-agent", &binary, 0o700),
         ("install-user-agent.sh", USER_INSTALL.as_bytes(), 0o700),
+        ("agent-user-control.py", USER_CONTROL.as_bytes(), 0o700),
         ("easymanage-agent.user.service", USER_UNIT.as_bytes(), 0o600),
         ("node.json", &node, 0o600),
         ("agent.env", env.as_bytes(), 0o600),
@@ -949,7 +951,7 @@ fn deploy(
         id,
         60,
         "running",
-        if mode == DeploymentMode::Basic { "安装用户服务并启动 Basic Agent（所有文件位于 SSH 用户 home，不调用 sudo）" }
+        if mode == DeploymentMode::Basic { "安装并启动 Basic Agent：优先 systemd + linger，否则自动使用用户兼容守护；不调用 sudo" }
         else { "以 root/sudo 安装系统服务并直接启动 Full Agent；不创建 Basic 用户服务" },
     );
     let invocation = format!(
@@ -959,9 +961,19 @@ fn deploy(
     session.set_timeout(100_000);
     if mode == DeploymentMode::Basic { command(&session, &invocation).map_err(|_| {
         OperationsError::ssh(
-            "用户服务安装/启动失败；请检查 systemd 用户 manager、linger、目标日志与保留的暂存包",
+            "Basic 安装/启动失败；请检查 ~/.easymanage 下的日志、目标执行策略与保留的暂存包；无需先启用 linger",
         )
-    })?; } else {
+    })?;
+        let launch = command(&session, &format!("python3 {} describe", shell_quote(&home.join("bin/agent-user-control.py").to_string_lossy())))?;
+        let launch: serde_json::Value = serde_json::from_str(&launch).map_err(|_| OperationsError::ssh("启动方式信息格式错误，未确认部署成功"))?;
+        let message = match (launch["backend"].as_str(), launch["autostart"].as_str()) {
+            (Some("systemd"), _) => "已使用 systemd 用户服务（现有 linger 已启用）；未修改系统策略",
+            (Some("compatibility"), Some("cron")) => "已使用无 linger 兼容守护；已添加用户 cron 开机/每分钟恢复任务，依赖目标 cron 服务运行",
+            (Some("compatibility"), _) => "已使用无 linger 兼容守护；用户 cron 不可用，无法保证开机/退出会话后自动恢复；请勿视为系统服务保证",
+            _ => return Err(OperationsError::ssh("未知 Basic 启动方式，未确认部署成功")),
+        };
+        state.machines.event(id, 75, "running", message);
+    } else {
         let invocation = format!("/usr/bin/timeout --signal=TERM --kill-after=3s 90s /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -c {} -- {} {} {} {} {} {}",
             shell_quote(FULL_INSTALL), shell_quote(&stage), shell_quote(&target.release_sha256.clone().unwrap_or_default()),
             shell_quote(target.ca_sha256.as_deref().unwrap_or_default()), shell_quote(&hex::encode(Sha256::digest(env.as_bytes()))),
@@ -976,7 +988,7 @@ fn deploy(
         id,
         80,
         "running",
-        if mode == DeploymentMode::Basic { "用户服务已启动；等待真实 Basic 心跳，未确认前不标记成功" }
+        if mode == DeploymentMode::Basic { "普通用户 Agent 已启动；等待真实 Basic 心跳，未确认前不标记成功" }
         else { "系统服务已启动；等待真实 Full / UID 0 心跳，未确认前不标记成功" },
     );
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -986,9 +998,9 @@ fn deploy(
                 .bind(id).bind(mode.name()).bind(if mode == DeploymentMode::Basic { uid.to_string() } else { "0".to_owned() }).fetch_one(&state.pool).await
         }).unwrap_or(false);
         if confirmed {
-            // Remove only the exact seven files uploaded above, never recursive cleanup.
+            // Remove only the exact uploaded files, never recursive cleanup.
             let cleanup = format!(
-                "cd {} && unlink SHA256SUMS && unlink easymanage-agent && unlink install-user-agent.sh && unlink easymanage-agent.user.service && unlink node.json && unlink agent.env && unlink ca.crt && rmdir {}",
+                "cd {} && unlink SHA256SUMS && unlink easymanage-agent && unlink install-user-agent.sh && unlink agent-user-control.py && unlink easymanage-agent.user.service && unlink node.json && unlink agent.env && unlink ca.crt && rmdir {}",
                 shell_quote(&stage),
                 shell_quote(&stage)
             );

@@ -33,13 +33,13 @@ verify_bundle() {
     [[ "$line" =~ ^[a-fA-F0-9]{64}\ \ ([a-zA-Z0-9_.-]+)$ ]] || return 1
     file="${BASH_REMATCH[1]}"
     case "$file" in
-      easymanage-agent|install-user-agent.sh|install-full-candidate.sh|migrate-agent-to-user.sh|handover.sh|easymanage-agent.user.service|node.json|agent.env|ca.crt) ;;
+      easymanage-agent|agent-user-control.py|install-user-agent.sh|install-full-candidate.sh|migrate-agent-to-user.sh|handover.sh|easymanage-agent.user.service|node.json|agent.env|ca.crt) ;;
       *) return 1 ;;
     esac
     [[ -z "${verified_files[$file]:-}" && -f "$directory/$file" && ! -L "$directory/$file" ]] || return 1
     verified_files["$file"]=1
   done < "$directory/SHA256SUMS"
-  for file in easymanage-agent install-user-agent.sh migrate-agent-to-user.sh handover.sh easymanage-agent.user.service node.json; do
+  for file in easymanage-agent agent-user-control.py install-user-agent.sh migrate-agent-to-user.sh handover.sh easymanage-agent.user.service node.json; do
     [[ "${verified_files[$file]:-}" == 1 ]] || return 1
   done
   (cd "$directory" && sha256sum --check --status SHA256SUMS)
@@ -72,7 +72,7 @@ printf '%s\n' "EASYMANAGE_SERVER_URL=$server_url" \
   'EASYMANAGE_REPORT_INTERVAL_SECONDS=10' > "$root_stage/agent.env"
 unset enrollment_token
 # The manifest must match the populated configuration, including formerly absent env/CA files.
-(cd "$root_stage" && sha256sum easymanage-agent install-user-agent.sh install-full-candidate.sh migrate-agent-to-user.sh \
+(cd "$root_stage" && sha256sum easymanage-agent agent-user-control.py install-user-agent.sh install-full-candidate.sh migrate-agent-to-user.sh \
   handover.sh easymanage-agent.user.service node.json agent.env ca.crt > SHA256SUMS)
 verify_bundle "$root_stage"
 install -d -o "$operator_user" -g "$operator_group" -m 0700 "$agent_base/staging"

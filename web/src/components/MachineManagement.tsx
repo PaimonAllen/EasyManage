@@ -99,7 +99,7 @@ function AddMachineDialog({onClose,onStarted}:{onClose:()=>void;onStarted:(job:{
     <div className="dialog-title"><h2>添加机器并部署 Agent</h2><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭">×</button></div>
     <p className="hint">无需预装 Agent：填写新机器的 SSH 信息并选择运行权限，平台将直接下发最新 Agent、安装并启动，随后自动等待对应权限的心跳。部署进度和日志会显示在机器管理中。</p>
     <AgentDeploymentFields mode={deploymentMode} onChange={mode=>{clearInputs();setDeploymentMode(mode);setConfirmed(false);}} busy={busy} username={username} sudoRef={sudoInput}/>
-    <details><summary>目标机器要求（仅 Linux）</summary><p className="hint">目标需 Python3、匹配的 CPU 架构和 systemd。普通用户模式还需 systemd 用户 manager 与已启用 linger；管理员模式需 root 或 sudo 授权，不依赖用户 linger。不覆盖已有 Agent 身份；环境不满足时会报告原因。</p></details>
+    <details><summary>目标机器要求（仅 Linux）</summary><p className="hint">目标需 Python3 和匹配的 CPU 架构。普通用户自动选择 systemd 用户服务或无 linger 兼容守护，无需 sudo。兼容模式在允许用户 cron 时配置开机及每分钟恢复；否则不保证开机/退出会话后的自动恢复。管理员模式需 systemd 及 root/sudo 授权。不覆盖已有 Agent 身份。</p></details>
     <label>显示名称<input required maxLength={160} value={name} disabled={busy} onChange={event=>setName(event.target.value)}/></label>
     <label>目标内网 IP<input required value={host} disabled={busy} onChange={event=>{setHost(event.target.value);setFingerprint("");setConfirmed(false);}}/></label>
     <label>SSH 端口<input required type="number" min={1} max={65535} value={port} disabled={busy} onChange={event=>{setPort(Number(event.target.value));setFingerprint("");setConfirmed(false);}}/></label>
@@ -121,7 +121,7 @@ export function AgentDeploymentFields({mode,onChange,busy,username,sudoRef}:{mod
     <label>Agent 运行权限<select value={mode} disabled={busy} onChange={event=>onChange(event.target.value as MachineDeploymentMode)}>
       <option value="basic">普通用户 Basic（默认，后续可提权）</option><option value="full">管理员 Full（首次直接以 root 运行）</option>
     </select></label>
-    {mode==="basic"?<p className="hint">使用 SSH 登录的普通用户运行；安装包、程序、配置及状态库均在该用户 ~/.easymanage 内，用户服务在 ~/.config/systemd/user，不执行 sudo。需要时可在设备总览中提权到 Full。</p>:<>
+    {mode==="basic"?<p className="hint">使用 SSH 登录的普通用户运行；安装包、程序、配置及状态库均在该用户 ~/.easymanage 内，不执行 sudo，也不强制要求 linger。优先 systemd 用户服务；不满足时自动使用兼容守护，日志位于 ~/.easymanage/logs。需要时可在设备总览中提权到 Full。</p>:<>
       <p className="notice">将安装 root 系统服务：程序 /usr/local/sbin/easymanage-agent，配置 /etc/easymanage，状态库 /var/lib/easymanage-agent。不修改已有 Agent，也不会重启目标机器。</p>
       {username.trim()!=="root"&&<label>sudo 密码（如需）<input ref={sudoRef} type="password" autoComplete="off" maxLength={1024} disabled={busy}/><small>密码登录时留空默认使用 SSH 密码；密钥登录时填写 sudo 密码，免密 sudo 可留空。</small></label>}
     </>}

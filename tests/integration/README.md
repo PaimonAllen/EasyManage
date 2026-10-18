@@ -31,6 +31,10 @@ Rust 单元测试同样在上述隔离环境执行编译得到的 `target/debug/
 
 新增机器鉴权回归包含旧版密码请求兼容、未加密/加密 PEM RSA 私钥、带口令 OpenSSH Ed25519 私钥完成真实部署、错误口令和指纹阻断；还检查解析错误不回显秘密，任务日志、运行日志、清单和安装后的 Agent 文件不含密码/私钥/口令。所有密钥均在隔离测试运行时生成，不使用个人 SSH 密钥。`web/tests/machineAuthentication.test.ts` 检查请求序列化后及异常时的引用清理，SSR 检查鉴权选项、密码/口令掩码和不回显正文的私钥上传。
 
+普通用户 SSH 回归使用 mock `Linger=no` 和私有 cron 表，运行实际兼容守护与 Agent，验证 SSH 全部断开后仍继续上报、崩溃重启、原身份保持及自动恢复能力提示；不会读取/写入宿主 crontab。`test_agent_user_control.py` 检查 cron 标记块保留、不可读表不覆盖、缺失 cron 的降级、禁用标记和 PID 复用保护。`compatibility_agent_smoke.py` 在相同隔离入口内接收宿主 net/mnt ID，使用合成 Agent 检查双重单例、守护进程被杀后的孤儿防重、停止/重启及有界日志。均不等同真实 logind 清理策略、cron 调度或生产 systemd 的验证。
+
+`compatibility_promotion_smoke.py` 同样接收宿主 net/mnt ID，在嵌套私有 root 文件系统中使用 mock systemd/runuser 检查兼容模式提权顺序与 Full 启动失败恢复：必须以原用户执行停止，停止后才能安装 Full，保留原身份字节，失败时尝试恢复此前启用的兼容实例。没有执行生产 sudo、切换真实用户或操作真实服务。
+
 `first_full_install_smoke.py` 同样必须在上述隔离环境运行并传入宿主 net/mnt namespace ID。它在嵌套 root 用户 namespace 内构造私有系统目录，只使用 mock systemd；覆盖普通 SSH / root 暂存布局的首次 Full、配置路径重写、root 所有权、错误摘要、已有单元/身份拒绝、符号链接/不安全系统目录拒绝、启动失败撤回与恢复数据保留。真实 SSH 回归还核对 Basic 暂存包仅在 SSH 用户 home 内、sudo 拒绝时不上传、不回退为 Basic，并执行实际 Full 安装器与 namespace-root Agent，确认真实 Full / UID 0 心跳。sudo 鉴权及 systemd 均为 mock，不是生产 root/sudo 或真实 systemd 的端到端验证。
 
 部署纯逻辑回归为 `test_fleet.py`；应急重启 mock 回归为 `force_restart_smoke.py`。后者同样在上述隔离环境调用，并传入两个位置参数：宿主 net、mnt 命名空间 ID。它在嵌套私有命名空间内模拟 systemd/runuser，不联系生产服务。真实 Agent 回归同时检查少量线程、实时上报、慢速采样缓存和重启后身份保持。

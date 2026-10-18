@@ -80,6 +80,7 @@ class FleetTests(unittest.TestCase):
             source, bundle = root / "source", root / "bundle"
             bundle.mkdir(mode=0o700)
             for name in ("target/release/easymanage-agent", "deploy/linux/user/install-user-agent.sh",
+                         "deploy/linux/user/agent-user-control.py",
                          "deploy/linux/operations/install-full-candidate.sh",
                          "deploy/linux/migrations/migrate-agent-to-user.sh", "deploy/linux/migrations/handover.sh",
                          "deploy/linux/user/easymanage-agent.user.service"):
@@ -107,7 +108,7 @@ class FleetTests(unittest.TestCase):
             (base / "config").mkdir(parents=True)
             (base / "config/server.env").write_text("fixture=true\n")
             names = ("target/release/easymanage-agent", "deploy/orchestration/fleet.py",
-                     "deploy/linux/user/install-user-agent.sh", "deploy/linux/operations/install-full-candidate.sh",
+                     "deploy/linux/user/install-user-agent.sh", "deploy/linux/user/agent-user-control.py", "deploy/linux/operations/install-full-candidate.sh",
                      "deploy/linux/migrations/migrate-agent-to-user.sh", "deploy/linux/migrations/handover.sh",
                      "deploy/linux/user/easymanage-agent.user.service")
             for name in names:

@@ -10,8 +10,16 @@
 
 设备总览的“机器管理”支持添加、编辑显示名称/备注、软删除与恢复。新机器无需预装 Agent：填写内网 IP、SSH 端口和用户名，选择运行权限及密码或 SSH 私钥鉴权，并独立核验首次 SSH 主机指纹；确认后平台通过 SSH 下发最新已发布 Agent、安装并启动，页面展示部署进度与日志，并等待对应权限的首次心跳。Agent 的平台连接地址默认使用当前页面地址，自动写入配置；只有目标机器无法访问该地址时，才需展开“高级网络设置”修改。私钥支持 OpenSSH / PEM（最大 12 KiB）及解密口令，不接受 `.pub` 或 `.ppk`。目标需 Linux、Python3、systemd 及与 ELF 候选匹配的架构。已有 Agent 配置/状态拒绝覆盖，应接管或恢复原机器，不重新生成身份。
 
-- **普通用户 Basic（默认）**：SSH 账户必须是非 root 且 home 为 `/home/账户`，需用户 manager 与已启用 linger。程序、配置和 SQLite 状态库统一位于 `~/.easymanage/`，临时安装包位于其中的 `staging/agent.XXXXXXXX`；用户服务单元仍位于 systemd 标准的 `~/.config/systemd/user/`。不调用 sudo、不写系统安装目录；后续可从设备总览提权为 Full。
+- **普通用户 Basic（默认）**：SSH 账户必须是非 root 且 home 为 `/home/账户`，只要求 Linux、Python3 和匹配的 CPU 架构，不再要求预先启用 linger。有可用用户 manager 且 linger 已启用时优先安装 systemd 用户服务；否则自动安装普通用户兼容守护进程。程序、配置和 SQLite 状态库统一位于 `~/.easymanage/`，临时安装包位于其中的 `staging/agent.XXXXXXXX`；使用 systemd 时单元仍在标准的 `~/.config/systemd/user/`。不调用 sudo、不写系统安装目录、不主动修改 linger/logind；后续可从设备总览提权为 Full。
 - **管理员 Full（首次直接安装）**：支持 SSH root（home 为 `/root`）或有 sudo 权限的普通 SSH 账户；不要求用户 manager / linger，不先运行 Basic。密码登录时 sudo 密码留空默认复用 SSH 密码；密钥登录可另填 sudo 密码，免密 sudo 可留空。固定安装器经管理员验证后，将程序安装到 `/usr/local/sbin/easymanage-agent`、配置到 `/etc/easymanage/`、状态到 `/var/lib/easymanage-agent/`，创建 root 系统服务并启用开机启动。安装前重新检查已有身份，校验二进制/CA/配置摘要；服务启动失败时尝试撤回本次新增服务和文件并保留恢复数据，不承诺网络中断后的完整回滚，不重启整机。
+
+### 无 linger 的普通用户兼容模式
+
+`~/.easymanage/bin/agent-user-control.py` 以 SSH 用户运行独立后台 Python 守护进程，启动并在崩溃后重启 Agent。后台进程关闭 SSH 的标准输入/输出并建立独立会话；锁由 Agent 一并持有，避免守护进程意外退出后产生重复采集器。日志在 `~/.easymanage/logs/agent.log`，最多保留两个各 1 MiB 的文件。该模式额外常驻一个 Python 进程，不视为系统服务。
+
+若允许用户 crontab，安装器仅新增/替换 `EasyManage Agent compatibility` 标记块，保留其他用户任务；通过 `@reboot` 与每分钟检查恢复守护。不开启或配置系统 cron 服务，是否执行依赖目标机 cron 实际运行及账户策略。无法读取 crontab、禁止使用或没有命令时，不阻断首次安装，任务日志会明确提示无法保证开机/会话退出后的自动恢复。禁止把这种情况显示为完整开机自启保证。[logind 的会话清理策略](https://github.com/systemd/systemd/blob/main/man/logind.conf.xml) 仍可能回收后台进程，普通用户模式不会绕过管理员限制。
+
+手动控制：`python3 ~/.easymanage/bin/agent-user-control.py restart`（或 `status`、`stop`）。`stop` 会禁用恢复标记，cron 不会擅自重新启动；再次显式 `start` 可恢复。提权会先以原用户停止兼容守护并禁用恢复标记，确认退出后才复制 SQLite 身份；Full 启动后不会被 cron 拉回 Basic。提权失败时尝试恢复此前启用的兼容实例。
 
 平台服务用户需有安全可写的可信清单目录，配置 `EASYMANAGE_OPERATIONS_TARGETS`。浏览器管理的增量存 `managed-targets.json`，不会覆盖原 fleet 清单；每机器已确认的 SSH 公钥存同目录独立 `.known_hosts` 文件，均不入 Git。设置 `EASYMANAGE_AGENT_CA_CERTIFICATE` 指向 Agent 信任的 CA（默认平台证书同目录 `ca.crt`），候选默认来自平台用户已发布的 `~/.easymanage/releases/current/target/release/easymanage-agent`。系统模式平台可用 `EASYMANAGE_AGENT_RELEASE_ROOT` 指定经批准的发布目录。 目前页面不改 SSH 地址/用户名；新机器未配置 SSH 免密分发时，现有依赖免密的 Basic 更新/重启功能不会冒充可用，后续仍可用管理员凭据提权。
 

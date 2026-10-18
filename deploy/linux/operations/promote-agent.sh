@@ -54,7 +54,18 @@ bounded() {
   (( budget <= 8 )) || budget=8
   timeout --signal=TERM --kill-after=1s "${budget}s" "$@"
 }
+compat_present=false
+compat_control() {
+  timeout --signal=TERM --kill-after=1s 22s runuser -u "$operator_user" -- env -i HOME="$operator_home" PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    /usr/bin/python3 "$agent_base/bin/agent-user-control.py" "$@"
+}
 user_service() {
+  if [[ "$compat_present" == true && ( "$1" == stop || "$1" == disable ) ]]; then
+    local loaded
+    loaded="$(bounded runuser -u "$operator_user" -- env XDG_RUNTIME_DIR="/run/user/$operator_uid" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$operator_uid/bus" systemctl --user show easymanage-agent.service -p LoadState --value 2>/dev/null || true)"
+    [[ "$loaded" == loaded ]] || return 0
+  fi
   bounded runuser -u "$operator_user" -- env XDG_RUNTIME_DIR="/run/user/$operator_uid" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$operator_uid/bus" systemctl --user "$@"
 }
@@ -66,6 +77,11 @@ done
 regular_file "$agent_base/bin/easymanage-agent" 268435456 || die 'Invalid staged Agent binary.'
 regular_file "$agent_base/config/agent.env" 65536 || die 'Invalid staged Agent configuration.'
 regular_file "$agent_base/config/ca.crt" 1048576 || die 'Invalid staged Agent CA.'
+if regular_file "$agent_base/config/agent-launch.json" 65536 && \
+  /usr/bin/python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("backend")=="compatibility" else 1)' "$agent_base/config/agent-launch.json"; then
+  regular_file "$agent_base/bin/agent-user-control.py" 65536 || die 'Missing compatibility control.'
+  compat_present=true
+fi
 for directory in /var/lib /etc/easymanage /etc/easymanage/tls /var/lib/easymanage-agent /usr/local/sbin /etc/systemd/system /run/easymanage-promotion; do
   root_directory "$directory" || die 'A destination directory is not root-owned or has unsafe permissions.'
 done
@@ -105,6 +121,8 @@ for state_name in state.db state.db-wal state.db-shm; do
 done
 basic_active=false
 basic_enabled=false
+compat_enabled=false
+if [[ "$compat_present" == true && -f "$agent_base/state/compat.enabled" ]]; then compat_enabled=true; fi
 full_active=false
 full_enabled=false
 if user_service is-active --quiet easymanage-agent.service; then basic_active=true; fi
@@ -171,6 +189,7 @@ rollback() {
   if [[ "$basic_changed" == true ]]; then
     if [[ "$basic_enabled" == true ]]; then rollback_user enable easymanage-agent.service || recovery_ok=false; fi
     if [[ "$basic_active" == true ]]; then rollback_user start easymanage-agent.service || recovery_ok=false; fi
+    if [[ "$compat_enabled" == true ]]; then compat_control start || recovery_ok=false; fi
   fi
   if [[ "$recovery_ok" == true ]]; then
     printf 'Promotion did not complete; prior Agent state restored. Recovery files: %s\n' "$root_stage" >&2
@@ -208,6 +227,7 @@ if [[ "$full_active" == true && -f /usr/local/sbin/easymanage-agent && -f /etc/e
 fi
 mutation_started=true
 basic_changed=true
+if [[ "$compat_present" == true ]]; then compat_control stop || die 'Compatibility Agent did not stop; identity was not copied.'; fi
 user_service stop easymanage-agent.service
 if [[ "$already_current" == true ]]; then
   user_service disable easymanage-agent.service

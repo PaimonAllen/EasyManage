@@ -55,6 +55,14 @@ else
         force_restart "$unit" /usr/bin/systemctl
         printf 'Full Agent force restarted; root retained.\n'
     else
+        compat="/home/$owner/.easymanage"
+        if [[ -f "$compat/config/agent-launch.json" && ! -L "$compat/config/agent-launch.json" && "$(stat -c %s "$compat/config/agent-launch.json")" -le 65536 ]] && \
+          /usr/bin/python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("backend")=="compatibility" else 1)' "$compat/config/agent-launch.json"; then
+            /usr/sbin/runuser -u "$owner" -- /usr/bin/env -i HOME="/home/$owner" PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+                /usr/bin/python3 "$compat/bin/agent-user-control.py" restart
+            printf 'Compatibility Basic Agent restarted as its owner.\n'
+            exit 0
+        fi
         [[ "$(user_ctl show "$unit" -p LoadState --value)" == loaded ]] || exit 3
         user_state=$(user_ctl show "$unit" -p ActiveState --value)
         [[ "$user_state" != inactive ]] || user_ctl is-enabled --quiet "$unit" || exit 3

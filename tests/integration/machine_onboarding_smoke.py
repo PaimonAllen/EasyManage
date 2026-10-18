@@ -6,6 +6,7 @@ is real and must report to the temporary HTTPS/PG platform. No host services,
 network configuration, private keys or credentials are read/changed.
 """
 import hashlib
+from isolated_smoke import parse_timestamp
 import io
 import json
 import logging
@@ -67,8 +68,20 @@ if action=="restart":
     process=subprocess.Popen([str(base/"bin/easymanage-agent")],env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
     pidfile.write_text(str(process.pid))
 sys.exit(0)
-''')
+'''.replace('os.environ["MACHINE_FIXTURE_RUNTIME"]', repr(str(runtime))))
     systemctl.chmod(0o700)
+    (commands/"loginctl").write_text("#!/bin/sh\nprintf 'no\\n'\n")
+    (commands/"loginctl").chmod(0o700)
+    (commands/"crontab").write_text('''#!/usr/bin/python3
+import pathlib,sys
+table=pathlib.Path('TABLE_PLACEHOLDER')
+if sys.argv[1:]==['-l']:
+ if table.exists(): print(table.read_text(),end='');sys.exit(0)
+ print('no crontab for fixture',file=sys.stderr);sys.exit(1)
+if sys.argv[1:]==['-']: table.write_text(sys.stdin.read());sys.exit(0)
+sys.exit(2)
+'''.replace('TABLE_PLACEHOLDER',str(runtime/"crontab")))
+    (commands/"crontab").chmod(0o700)
     password = secrets.token_urlsafe(24)
     key = paramiko.RSAKey.generate(2048)
     key_phrase = secrets.token_urlsafe(24)
@@ -121,7 +134,7 @@ sys.exit(0)
                 if channel.recv(1) != b"\0": raise RuntimeError("SCP terminator")
                 channel.sendall(b"\0")
                 result=0
-            elif "loginctl show-user" in command:
+            elif "$(getent passwd" in command and "$(uname -m)" in command:
                 result = 1 if failure.is_set() else 0
                 if not result: channel.sendall(f"{current.pw_name}\n{home}\n{os.uname().machine}\n{os.getuid()}\n".encode())
             elif "systemctl show-environment" in command:
@@ -191,6 +204,9 @@ sys.exit(0)
                 result=subprocess.run(shlex.split(command),env=ssh_env,stdout=log,stderr=subprocess.STDOUT,timeout=100).returncode
                 log.close()
                 channel.sendall(b"fixture installer finished\n")
+            elif "agent-user-control.py" in command and command.endswith(" describe"):
+                completed=subprocess.run(shlex.split(command),env=ssh_env,capture_output=True,timeout=5)
+                channel.sendall(completed.stdout); result=completed.returncode
             elif command.startswith("cd ") and "unlink SHA256SUMS" in command:
                 result=subprocess.run(["/bin/sh","-c",command],env=ssh_env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5).returncode
             else:
@@ -294,6 +310,28 @@ sys.exit(0)
             # Workflow messages are public/sanitized. Never print installer/Agent logs.
             print("DIAGNOSTIC onboarding:", [event["message"] for event in job["events"]], "fixture errors:",errors,flush=True)
         require(job["status"]=="success","real SCP, checksum installer and actual Basic heartbeat complete onboarding")
+        launch=json.loads((home/".easymanage/config/agent-launch.json").read_text())
+        require(launch["backend"]=="compatibility","Linger=no / missing user manager installs a real Basic compatibility supervisor")
+        require(any("兼容守护" in event["message"] for event in job["events"]),"deployment log reports compatibility backend and actual autostart limitations")
+        for transport in transports: transport.close()
+        transports.clear()
+        after_disconnect=time.time()
+        deadline=time.monotonic()+25
+        while time.monotonic()<deadline:
+            _,snapshot=request("/api/v1/nodes")
+            resumed=next((node for node in snapshot["nodes"] if node["id"]==created["node_id"]),None)
+            if resumed and parse_timestamp(resumed["last_seen"]).timestamp()>after_disconnect: break
+            time.sleep(0.25)
+        require(resumed and parse_timestamp(resumed["last_seen"]).timestamp()>after_disconnect,"Basic Agent continues actual reporting after all deployment SSH transports close")
+        require((runtime/"crontab").read_text().count("# BEGIN EasyManage Agent compatibility")==1,"compatibility autostart updates only its managed user-cron block")
+        old_agent=json.loads((home/".easymanage/state/compat-process.json").read_text())["agent_pid"]
+        os.kill(old_agent,signal.SIGKILL)  # Exact disposable Agent, never a host PID.
+        deadline=time.monotonic()+30
+        while time.monotonic()<deadline:
+            current_agent=json.loads((home/".easymanage/state/compat-process.json").read_text()).get("agent_pid")
+            if current_agent and current_agent!=old_agent: break
+            time.sleep(0.25)
+        require(current_agent!=old_agent,"unprivileged supervisor automatically restarts a crashed Agent without systemd/linger")
         require(all(stage.parent==home/".easymanage/staging" for stage in stages),"all Basic deployment staging stays inside the SSH user's ~/.easymanage")
         values=dict(line.split("=",1) for line in (home/".easymanage/config/agent.env").read_text().splitlines() if "=" in line)
         require(values["EASYMANAGE_ENROLLMENT_TOKEN"]!=enrollment,"target receives only a scoped token, never the platform enrollment secret")
@@ -346,7 +384,7 @@ sys.exit(0)
         collision.clear()
         failure.set()
         status,failed=request("/api/v1/machines",payload|{"host":"10.222.0.10"})
-        require(status==200 and wait_job(failed)["status"]=="failed","missing user-service/linger prerequisites fail instead of reporting deployment success")
+        require(status==200 and wait_job(failed)["status"]=="failed","other invalid prerequisites still fail without claiming deployment success")
         failure.clear()
         allow_full.set()
         status,full_created=request("/api/v1/machines",key_payload|{"host":"10.222.0.10","deployment_mode":"full","sudo_password":password})
@@ -360,6 +398,8 @@ sys.exit(0)
                 "Full deployment success requires the selected privilege and UID 0, not a Basic heartbeat")
         require(all(secret not in json.dumps(full_job) for secret in (password,key_phrase,ed_private)),"Full deployment logs exclude SSH keys, sudo passwords and private-key passphrases")
     finally:
+        helper=home/".easymanage/bin/agent-user-control.py"
+        if helper.is_file(): subprocess.run(["/usr/bin/python3",str(helper),"stop"],env=ssh_env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=25)
         alive.clear();listener.close()
         for transport in transports: transport.close()
         pidfile=runtime/"agent.pid"
