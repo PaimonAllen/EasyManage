@@ -3,14 +3,23 @@ import { fetchRecoveryStatus, fetchPlatformUpdateStatus, updateAgent, type Opera
 import { AgentRestartDialog } from "../components/AgentRestartDialog";
 import { ForceRestartDialog } from "../components/ForceRestartDialog";
 import { PlatformUpdateDialog } from "../components/PlatformUpdateDialog";
+import { AdminCredentialFields, useAdminCredentials } from "../components/AdminCredentials";
 import { NodeStatus, PrivilegeBadge } from "../components/NodeStatus";
 import { PageHeading } from "../components/PageHeading";
 import { formatDate } from "../lib/format";
 import type { NodeSummary } from "../types/monitoring";
 
-function updateEligible(node: NodeSummary, target?: OperationTarget): boolean {
+function updateHeartbeatAvailable(node: NodeSummary): boolean {
+  // A pause request hides monitoring, not the real heartbeat of a legacy
+  // collector that still needs this update to implement the requested pause.
+  const age=Date.now()-Date.parse(node.last_seen);
+  return node.online || Boolean(node.monitoring_paused && node.metrics?.agent_control==null
+    && Number.isFinite(age) && age>=-5_000 && age<=45_000);
+}
+
+export function updateEligible(node: NodeSummary, target?: OperationTarget): boolean {
   const privilege = node.metrics?.privilege;
-  return Boolean(target?.update_available && target.update_state === "available" && node.online
+  return Boolean(target?.update_available && target.update_state === "available" && updateHeartbeatAvailable(node)
     && (privilege?.mode === "basic" || (privilege?.mode === "full" && privilege.uid === 0)));
 }
 
@@ -27,7 +36,7 @@ function updateCondition(node: NodeSummary, target?: OperationTarget): string {
   if (target.update_state === "untrusted_target") return "SSH 目标未就绪";
   if (target.update_state === "unknown_installed") return "当前安装摘要未知";
   if (target.update_state === "current") return "已是候选版本";
-  if (!node.online) return "等待心跳恢复";
+  if (!updateHeartbeatAvailable(node)) return "等待心跳恢复";
   return updateEligible(node, target) ? "有更新可分发" : "等待有效权限上报";
 }
 
@@ -39,8 +48,6 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
 }) {
   const updateSection = useRef<HTMLElement>(null);
   const [selection, setSelection] = useState("");
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [results, setResults] = useState<string[]>([]);
   const [restarting, setRestarting] = useState<NodeSummary | null>(null);
@@ -88,12 +95,12 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
   const available = nodes.filter((node) => updateEligible(node, targetByNode.get(node.id)));
   const selectedNodes = selection === "all" ? available : available.filter((node) => node.id === selection);
   const needsAdmin = selectedNodes.some((node) => node.metrics?.privilege?.mode === "full");
+  const auth = useAdminCredentials(selectedNodes.filter(node=>node.metrics?.privilege?.mode === "full").map(node=>node.id));
   const online = nodes.filter((node) => node.online).length;
   const full = nodes.filter((node) => node.online && node.metrics?.privilege?.mode === "full" && node.metrics.privilege.uid === 0).length;
 
   function selectForUpdate(nodeId: string) {
     setSelection(nodeId);
-    setPassword("");
     setResults([]);
     updateSection.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
@@ -104,12 +111,13 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
     const chosen = selectedNodes;
     if (!chosen.length) { setResults(["所选节点当前不满足安全更新条件；请检查心跳、权限和已发布候选包。"]); return; }
     const full = chosen.filter((node) => node.metrics?.privilege?.mode === "full");
-    if (full.length && (!username.trim() || !password)) { setResults(["包含 Full 节点，请填写这些节点可用的管理员 SSH 用户名和密码。"]); return; }
+    if (full.length && !auth.ready) { setResults(["包含 Full 节点，请填写管理员凭据或选择平台已保存的授权。"]); return; }
     if (!window.confirm(`即将通过 SSH 更新并重启 ${chosen.map((node) => node.hostname).join("、")} 的 Agent，监控心跳会短暂中断。确认继续？`)) return;
-    const credentials = { username: username.trim(), password };
-    setPassword("");
     setBusy(true);
     setResults([]);
+    let credentials;
+    try { credentials = full.length ? await auth.prepare() : undefined; }
+    catch (caught) { setResults([caught instanceof Error ? caught.message : "管理员验证失败"]); setBusy(false); return; }
     const progress: string[] = [];
     for (const node of chosen) {
       try {
@@ -121,7 +129,6 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
       setResults([...progress]);
       onRefresh();
     }
-    credentials.password = "";
     setBusy(false);
   }
   return <>
@@ -138,7 +145,7 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
         <p className="hint agent-management-hint">平台重启会短暂中断 SSH 长连接；已加密保存凭据且启用的连接将自动恢复。断线每分钟重试，最多 3 次；之后可到设备总览手动重连。Agent 安装、身份和 Full / Basic 权限保留。</p>
       </article>
       <article className="data-panel">
-        <header className="panel-header"><div><h2>应急重启</h2><p>支持数据库异常或节点离线；每次均需管理员验证。</p></div>
+        <header className="panel-header"><div><h2>应急重启</h2><p>支持数据库异常或节点离线；可复用已保存的管理员授权。</p></div>
           <button className="button button--danger button--small" type="button" disabled={!recovery?.platform_restart_available || busy || Boolean(forceTarget) || Boolean(restarting) || platformUpdating} onClick={() => setForceTarget({ target: null })}>强制重启平台</button></header>
         <p className={`hint agent-management-hint ${recovery && !recovery.database_healthy ? "form-error" : ""}`} role="status">{recoveryError || recovery?.message || "正在检查恢复接口…"}</p>
         <div className="table-scroll"><table><thead><tr><th>可信节点</th><th>SSH 目标</th><th>应急操作</th></tr></thead><tbody>
@@ -180,11 +187,10 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
       </article>
       <article className="data-panel" ref={updateSection}>
         <header className="panel-header"><div><h2>更新并重启</h2><p>仅候选摘要与已登记安装摘要不同的节点可选；确认后逐台更新。</p></div></header>
-        <p className="hint agent-management-hint">先在主节点以普通用户运行 <code>./scripts/run-server.sh --build</code> 发布版本。Basic 节点使用已有普通用户 SSH 密钥；Full 节点每次更新都验证管理员 SSH 与 sudo 密码。更新结果以新版本心跳确认。</p>
+        <p className="hint agent-management-hint">先在主节点以普通用户运行 <code>./scripts/run-server.sh --build</code> 发布版本。Basic 节点使用已有普通用户 SSH 密钥；Full 节点可复用加密保存的管理员密码或私钥。更新结果以新版本心跳确认。</p>
       <div className="admin-form agent-management-form">
-        <label>分发范围<select value={selection} onChange={(event) => { setSelection(event.target.value); setPassword(""); setResults([]); }} disabled={busy}><option value="">请选择节点</option>{available.map((node) => <option key={node.id} value={node.id}>{node.hostname}</option>)}<option value="all" disabled={!available.length}>全部可更新节点（{available.length}）</option></select></label>
-        {needsAdmin && <label>Full 节点管理员用户名<input value={username} onChange={(event) => setUsername(event.target.value)} disabled={busy} autoComplete="off" placeholder="例如 cvpr" /></label>}
-        {needsAdmin && <label>Full 节点管理员密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy} autoComplete="off" /></label>}
+        <label>分发范围<select value={selection} onChange={(event) => { setSelection(event.target.value); setResults([]); }} disabled={busy}><option value="">请选择节点</option>{available.map((node) => <option key={node.id} value={node.id}>{node.hostname}</option>)}<option value="all" disabled={!available.length}>全部可更新节点（{available.length}）</option></select></label>
+        {needsAdmin && <AdminCredentialFields auth={auth} disabled={busy} />}
         <button className="button" type="button" onClick={() => void distribute()} disabled={busy || !selectedNodes.length}>{busy ? "正在逐台更新…" : "确认更新并重启"}</button>
       </div>
       <div className="agent-management-results" role="status" aria-live="polite">{results.map((result, index) => <p key={`${index}-${result}`}>{result}</p>)}</div>

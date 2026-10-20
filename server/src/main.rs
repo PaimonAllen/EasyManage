@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod agent_control;
 mod collection_settings;
 mod config;
 mod database;
@@ -8,6 +9,7 @@ mod guide;
 mod insights;
 mod operations;
 mod performance;
+mod network;
 mod permission_reviews;
 
 use anyhow::{Context, Result};
@@ -46,6 +48,7 @@ fn initialize_crypto_provider() {
 
 async fn run() -> Result<()> {
     ensure_administrator("controller")?;
+    easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::HttpBrowser);
     let config = Arc::new(ServerConfig::load()?);
     let pool = PgPoolOptions::new()
         .max_connections(config.database_max_connections)
@@ -79,10 +82,12 @@ async fn run() -> Result<()> {
         performance_monitor.clone(),
         collection,
     )?)
+    .merge(network::router(pool.clone()))
     .merge(performance::router(pool, performance_monitor))
     .merge(guide::router(&config.web_root)?)
     .layer(axum::middleware::from_fn_with_state(initialized, database::guard))
-    .layer(axum::middleware::from_fn(api::attach_request_id));
+    .layer(axum::middleware::from_fn(api::attach_request_id))
+    .layer(axum::middleware::from_fn(network::account));
 
     info!(
         %bind_address,

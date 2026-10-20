@@ -150,13 +150,13 @@ async fn update(
     Json(request): Json<UpdatePlatformRequest>,
 ) -> Result<Json<serde_json::Value>, OperationsError> {
     validate_origin(&headers, &uri)?;
-    validate_credentials(&request.credentials)?;
     if !configured(&state) || !valid_digest(&request.candidate_sha256) {
         return Err(OperationsError::bad_request(
             "平台部署配置不支持更新，或候选摘要不合法",
         ));
     }
     let target = platform_target(&state)?;
+    let credentials = resolve_credentials(&state, &target, &headers, request.credentials)?;
     let (_, lease) = target_and_lease(&state, target.node_id, true)?;
     let mut current = tokio::task::spawn_blocking(read_status)
         .await
@@ -180,7 +180,7 @@ async fn update(
             "候选已改变或没有更新，请重新刷新并确认",
         ));
     }
-    let actor = request.credentials.username.clone();
+    let actor = credentials.username.clone();
     let sha = request.candidate_sha256;
     let bind = state.config.bind_address;
     let ip = if bind.ip().is_unspecified() {
@@ -206,7 +206,7 @@ async fn update(
             shell_quote(&sha),
             shell_quote(&url)
         );
-        run_privileged_command(&target, request.credentials, &cancellation, &invocation)
+        run_privileged_command(&target, credentials, &cancellation, &invocation)
     });
     let result = tokio::time::timeout(Duration::from_secs(65), worker)
         .await
@@ -227,6 +227,15 @@ fn valid_digest(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn platform_update_accepts_saved_or_key_authentication_without_dropping_the_candidate() {
+        use super::*;
+        let request: UpdatePlatformRequest = serde_json::from_value(json!({"use_saved":true,"candidate_sha256":"a".repeat(64)})).unwrap();
+        assert!(request.credentials.use_saved);
+        assert!(valid_digest(&request.candidate_sha256));
+        let request: UpdatePlatformRequest = serde_json::from_value(json!({"username":"fixture","private_key":"-----BEGIN key","sudo_password":"fixture","candidate_sha256":"b".repeat(64)})).unwrap();
+        assert!(validate_credentials(&request.credentials).is_ok());
+    }
     #[test]
     fn copied_but_not_restarted_platform_still_needs_update() {
         let mut status =

@@ -20,6 +20,7 @@ export function Dashboard({
   onRefresh: () => void;
 }) {
   const online = data?.nodes.filter((node) => node.online).length ?? 0;
+  const paused = data?.nodes.filter((node) => node.monitoring_paused).length ?? 0;
   const { history, errors } = useMetricHistory(data?.nodes.map((node) => node.id) ?? []);
   const live = useLiveMetrics();
   const [temperatureSnapshots, setTemperatureSnapshots] = useState<Record<string, MetricsSnapshot[]>>({});
@@ -43,9 +44,10 @@ export function Dashboard({
             <span>当前在线</span>
           </div>
           <div>
-            <strong>{data ? data.nodes.length - online : "—"}</strong>
+            <strong>{data ? data.nodes.length - online - paused : "—"}</strong>
             <span>当前离线</span>
           </div>
+          {paused>0&&<div><strong>{paused}</strong><span>监控暂停</span></div>}
         </div>
       </PageHeading>
       <MachineManagement onRefresh={onRefresh}/>

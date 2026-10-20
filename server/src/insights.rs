@@ -154,11 +154,13 @@ async fn platform_health_uncached(state: InsightState) -> Json<Value> {
     for target in configured {
         checks.spawn(async move {
             if let Some(connected) = target.ssh_persistent_connected { return (target, connected); }
+            let mut attempt=easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::TcpProbe).begin();
             let connected = tokio::time::timeout(
                 Duration::from_secs(2),
                 TcpStream::connect(SocketAddr::new(target.host, target.port)),
             )
             .await;
+            attempt.finish(matches!(connected,Ok(Ok(_))));
             (target, matches!(connected, Ok(Ok(_))))
         });
     }
@@ -206,14 +208,13 @@ async fn platform_health_uncached(state: InsightState) -> Json<Value> {
 
 async fn gitea_uncached(state: InsightState) -> Json<Value> {
     let started = Instant::now();
-    let health = state
+    let health = crate::network::service_request(state
         .http
         .get(format!("{}/api/healthz", state.gitea))
-        .send()
-        .await;
+        ,easymanage_protocol::NetworkGroup::HttpService).await;
     let (reachable, checks, message) = match health {
-        Ok(response) if response.status().is_success() => {
-            let body: Value = response.json().await.unwrap_or(Value::Null);
+        Ok(response) if response.status.is_success() => {
+            let body: Value = response.json().unwrap_or(Value::Null);
             let passed = body["status"] == "pass";
             (
                 passed,
@@ -229,15 +230,13 @@ async fn gitea_uncached(state: InsightState) -> Json<Value> {
         Err(_) => (false, Value::Null, "无法连接本机 Gitea"),
     };
     let version: Option<String> = if reachable {
-        match state
+        match crate::network::service_request(state
             .http
             .get(format!("{}/api/v1/version", state.gitea))
-            .send()
-            .await
+            ,easymanage_protocol::NetworkGroup::HttpService).await
         {
-            Ok(response) if response.status().is_success() => response
-                .json::<Value>()
-                .await
+            Ok(response) if response.status.is_success() => response
+                .json()
                 .ok()
                 .and_then(|body| body["version"].as_str().map(str::to_owned)),
             _ => None,
@@ -314,11 +313,11 @@ async fn gitea_users_uncached(state: InsightState) -> Json<Value> {
                 .query(&[("sort", "id"), ("order", "asc")])
                 .header(reqwest::header::AUTHORIZATION, format!("token {token}"));
         }
-        let response = match request.send().await {
-            Ok(response) if response.status().is_success() => response,
+        let response = match crate::network::service_request(request,easymanage_protocol::NetworkGroup::HttpService).await {
+            Ok(response) if response.status.is_success() => response,
             Ok(response) => {
                 let message = if verified
-                    && (response.status().as_u16() == 401 || response.status().as_u16() == 403)
+                    && (response.status.as_u16() == 401 || response.status.as_u16() == 403)
                 {
                     "Gitea 令牌无权读取管理员用户清单；请检查账户管理员身份及 read:admin 权限"
                 } else {
@@ -333,14 +332,14 @@ async fn gitea_users_uncached(state: InsightState) -> Json<Value> {
             }
         };
         if let Some(count) = response
-            .headers()
+            .headers
             .get("x-total-count")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<usize>().ok())
         {
             total_count = Some(count);
         }
-        let body = match response.json::<Value>().await {
+        let body = match response.json() {
             Ok(body) => body,
             Err(_) => {
                 return Json(json!({ "generated_at": Utc::now(), "scope": "unavailable",

@@ -171,6 +171,9 @@ export interface GpuMetric {
 }
 
 export interface CollectionPolicy {
+  users_enabled?: boolean;
+  permissions_enabled?: boolean;
+  proxy_enabled?: boolean;
   revision: number;
   live_seconds: number;
   report_seconds: number;
@@ -198,6 +201,8 @@ export interface HardwareDetails {
 }
 
 export interface MetricsSnapshot {
+  agent_control?: {revision:number;paused:boolean} | null;
+  network_activity?: NetworkActivity | null;
   hardware_details?: HardwareDetails | null;
   temperatures?: HostTemperatures | null;
   collection_policy?: CollectionPolicy | null;
@@ -235,7 +240,19 @@ export interface MetricsSnapshot {
   programming_tools?: ProgrammingToolStatus[];
 }
 
+export type NetworkGroup = "http_browser"|"http_agent"|"http_service"|"http_probe"|"agent_enroll"|"agent_report"|"agent_live"|"agent_control"|"ssh_connect"|"ssh_exec"|"ssh_scp"|"ssh_tunnel"|"tcp_probe"|"web_socket";
+export interface NetworkGroupMetric {
+  group:NetworkGroup; started:number; completed:number; failed:number; in_flight:number;
+  open_connections:number|null; received_bytes:number; submitted_bytes:number;
+}
+export interface NetworkActivity {
+  process_id:number; started_at:string; collected_at:string; groups:NetworkGroupMetric[];
+}
+
 export interface NodeSummary {
+  monitoring_paused?: boolean;
+  monitoring_revision?: number;
+  monitoring_applied_revision?: number | null;
   id: string;
   hostname: string;
   os_name: string;

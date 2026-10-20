@@ -1,6 +1,6 @@
 //! Browser operations are separate from unauthenticated, read-only monitoring.
 //! Targets come only from the operator-owned registry. SSH reconnect credentials
-//! use the owner-only encrypted vault; other request credentials are transient.
+//! and verified administrator credentials use distinct, owner-only encrypted records.
 //! SSH host keys are verified before authentication, and terminal contents are
 //! never written to the application log or audit table.
 
@@ -37,6 +37,10 @@ mod ssh_transport;
 #[path = "ssh_vault.rs"]
 #[cfg(target_os = "linux")]
 mod ssh_vault;
+
+#[path = "admin_credentials.rs"]
+#[cfg(target_os = "linux")]
+mod admin_credentials;
 
 #[path = "platform_update.rs"]
 #[cfg(target_os = "linux")]
@@ -185,30 +189,53 @@ struct PublicTarget {
     restart_available: bool,
 }
 
+type UpdateRequest = Credentials;
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct UpdateRequest {
-    #[serde(default)]
-    username: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_secret")]
-    password: Option<Zeroizing<String>>,
-}
-
-fn deserialize_optional_secret<'de, D>(
-    deserializer: D,
-) -> Result<Option<Zeroizing<String>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(|value| value.map(Zeroizing::new))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Credentials {
+    #[serde(default)]
     username: String,
-    #[serde(deserialize_with = "deserialize_secret")]
+    #[serde(default, deserialize_with = "deserialize_secret")]
     password: Zeroizing<String>,
+    #[serde(default, deserialize_with = "deserialize_secret")]
+    private_key: Zeroizing<String>,
+    #[serde(default, deserialize_with = "deserialize_secret")]
+    passphrase: Zeroizing<String>,
+    #[serde(default, deserialize_with = "deserialize_secret")]
+    sudo_password: Zeroizing<String>,
+    #[serde(default)]
+    use_saved: bool,
+}
+
+impl Credentials {
+    fn sudo_secret(&self) -> &str {
+        if self.sudo_password.is_empty() { &self.password } else { &self.sudo_password }
+    }
+    fn is_empty(&self) -> bool {
+        self.username.is_empty() && self.password.is_empty() && self.private_key.is_empty()
+            && self.passphrase.is_empty() && self.sudo_password.is_empty() && !self.use_saved
+    }
+}
+
+fn resolve_credentials(state: &OperationsState, target: &Target, headers: &HeaderMap, request: Credentials) -> Result<Credentials, OperationsError> {
+    #[cfg(target_os = "linux")]
+    if request.use_saved {
+        if !request.username.is_empty() || !request.password.is_empty() || !request.private_key.is_empty()
+            || !request.passphrase.is_empty() || !request.sudo_password.is_empty() {
+            return Err(OperationsError::bad_request("不能同时提交保存的凭据和新凭据"));
+        }
+        let saved = ssh_vault::load_admin(&state.registry, target, headers)?;
+        let credentials = Credentials { username: saved.username, password: saved.password,
+            private_key: saved.key, passphrase: saved.passphrase, sudo_password: saved.sudo_password,
+            use_saved: false };
+        validate_credentials(&credentials)?;
+        return Ok(credentials);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (state, target, headers);
+    validate_credentials(&request)?;
+    Ok(request)
 }
 
 #[derive(Deserialize)]
@@ -329,10 +356,23 @@ pub fn router(
         .route("/api/v1/nodes/{node_id}/users/manage", post(manage_user))
         .route("/api/v1/nodes/{node_id}/agent/update", post(update_agent))
         .route("/api/v1/nodes/{node_id}/agent/restart", post(restart_agent))
+        .route("/api/v1/machines/{node_id}/monitoring", post(change_monitoring))
         .merge(machine_routes())
         .merge(platform_update_routes())
         .layer(DefaultBodyLimit::max(MAX_FRAME_BYTES))
         .with_state(state)
+}
+
+async fn change_monitoring(
+    State(state): State<OperationsState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    uri: Uri,
+    change: Json<crate::agent_control::Change>,
+) -> Result<Json<serde_json::Value>, Response> {
+    // Share the existing per-node mutation lease without opening SSH or charging its login budget.
+    let _lease = acquire_node_lease(&state.limits, id, true, false).map_err(IntoResponse::into_response)?;
+    crate::agent_control::change(State(state.pool), Path(id), headers, uri, change).await
 }
 
 fn platform_update_routes() -> Router<OperationsState> {
@@ -349,7 +389,7 @@ fn platform_update_routes() -> Router<OperationsState> {
 fn machine_routes() -> Router<OperationsState> {
     #[cfg(target_os = "linux")]
     {
-        machines::router()
+        machines::router().merge(admin_credentials::router())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -402,6 +442,7 @@ async fn force_restart_platform(
 ) -> Result<Json<serde_json::Value>, OperationsError> {
     validate_origin(&headers, &uri)?;
     let target = platform_target(&state)?;
+    let credentials = resolve_credentials(&state, &target, &headers, credentials)?;
     force_restart(state, target.node_id, credentials, true).await
 }
 
@@ -413,6 +454,8 @@ async fn force_restart_agent(
     Json(credentials): Json<Credentials>,
 ) -> Result<Json<serde_json::Value>, OperationsError> {
     validate_origin(&headers, &uri)?;
+    let target = load_targets(&state.registry)?.into_iter().find(|target| target.node_id == node_id).ok_or(OperationsError::registry())?;
+    let credentials = resolve_credentials(&state, &target, &headers, credentials)?;
     force_restart(state, node_id, credentials, false).await
 }
 
@@ -477,8 +520,7 @@ fn run_privileged_command(
     } else {
         format!("/usr/bin/sudo -k -S -p '' {invocation}")
     };
-    let mut channel = session
-        .channel_session()
+    let mut channel = crate::network::ssh_channel(&session)
         .map_err(|_| OperationsError::ssh("无法打开管理员运维通道"))?;
     channel
         .handle_extended_data(ExtendedData::Ignore)
@@ -488,11 +530,12 @@ fn run_privileged_command(
         .map_err(|_| OperationsError::ssh("无法启动固定运维操作"))?;
     if credentials.username != "root" {
         channel
-            .write_all(credentials.password.as_bytes())
+            .write_all(credentials.sudo_secret().as_bytes())
             .and_then(|()| channel.write_all(b"\n"))
             .map_err(|_| OperationsError::ssh("无法验证管理员密码"))?;
     }
     credentials.password.zeroize();
+    credentials.sudo_password.zeroize();
     channel
         .send_eof()
         .map_err(|_| OperationsError::ssh("管理员认证通道中断"))?;
@@ -719,15 +762,7 @@ async fn update_agent(
     }
     let full = reported_agent_mode(&state.pool, node_id).await?;
     let credentials = if full {
-        let username = request.username.ok_or(OperationsError::bad_request(
-            "Full 更新需要目标机管理员用户名",
-        ))?;
-        let password = request.password.ok_or(OperationsError::bad_request(
-            "Full 更新需要目标机管理员密码",
-        ))?;
-        let credentials = Credentials { username, password };
-        validate_credentials(&credentials)?;
-        Some(credentials)
+        Some(resolve_credentials(&state, &target, &headers, request)?)
     } else {
         None
     };
@@ -807,17 +842,9 @@ async fn restart_agent(
     }
     let full = reported_agent_mode(&state.pool, node_id).await?;
     let credentials = if full {
-        let username = request.username.ok_or(OperationsError::bad_request(
-            "Full Agent 重启需要管理员用户名",
-        ))?;
-        let password = request.password.ok_or(OperationsError::bad_request(
-            "Full Agent 重启需要管理员密码",
-        ))?;
-        let credentials = Credentials { username, password };
-        validate_credentials(&credentials)?;
-        Some(credentials)
+        Some(resolve_credentials(&state, &target, &headers, request)?)
     } else {
-        if request.username.is_some() || request.password.is_some() {
+        if !request.is_empty() {
             return Err(OperationsError::bad_request(
                 "Basic Agent 重启不需要管理员凭据",
             ));
@@ -1035,14 +1062,14 @@ fn valid_agent_home(path: &FsPath, username: &str) -> bool {
 
 fn validate_credentials(credentials: &Credentials) -> Result<(), OperationsError> {
     if !valid_username(&credentials.username)
-        || credentials.password.is_empty()
-        || credentials.password.len() > 1024
-        || credentials
-            .password
-            .bytes()
-            .any(|byte| b"\r\n\0".contains(&byte))
+        || credentials.use_saved
+        || (credentials.password.is_empty() && credentials.private_key.is_empty())
+        || (!credentials.password.is_empty() && !credentials.private_key.is_empty())
+        || credentials.private_key.len() > 12 * 1024
+        || (!credentials.private_key.is_empty() && (!credentials.private_key.starts_with("-----BEGIN ") || credentials.private_key.contains('\0')))
+        || [&*credentials.password, &*credentials.sudo_password, &*credentials.passphrase].iter().any(|value| value.len() > 1024 || value.bytes().any(|byte| b"\r\n\0".contains(&byte)))
     {
-        return Err(OperationsError::bad_request("用户名或密码格式不正确"));
+        return Err(OperationsError::bad_request("管理员用户名、密码或 SSH 私钥格式不正确"));
     }
     Ok(())
 }
@@ -1191,8 +1218,8 @@ async fn elevate(
     Json(credentials): Json<Credentials>,
 ) -> Result<Json<serde_json::Value>, OperationsError> {
     validate_origin(&headers, &uri)?;
-    validate_credentials(&credentials)?;
     let (target, lease) = target_and_lease(&state, node_id, true)?;
+    let credentials = resolve_credentials(&state, &target, &headers, credentials)?;
     if !target.elevation_available() {
         return Err(OperationsError::bad_request(
             "此节点缺少可信 Agent、CA 或控制端配置，请先通过主节点重新下发",
@@ -1289,7 +1316,7 @@ async fn manage_user(
         groups,
         confirmation,
     };
-    let credentials = Credentials { username, password };
+    let credentials = Credentials { username, password, ..Default::default() };
     validate_credentials(&credentials)?;
     if !valid_managed_username(&credentials.username) {
         return Err(OperationsError::bad_request(
@@ -1392,8 +1419,7 @@ fn manage_user_worker(
     } else {
         format!("/usr/bin/sudo -k -S -p '' {invocation}")
     };
-    let mut channel = session
-        .channel_session()
+    let mut channel = crate::network::ssh_channel(&session)
         .map_err(|_| OperationsError::ssh("无法打开账户管理通道"))?;
     channel
         .handle_extended_data(ExtendedData::Ignore)
@@ -1403,13 +1429,14 @@ fn manage_user_worker(
         .map_err(|_| OperationsError::ssh("无法启动账户管理操作"))?;
     if credentials.username != "root" {
         channel
-            .write_all(credentials.password.as_bytes())
+            .write_all(credentials.sudo_secret().as_bytes())
             .map_err(|_| OperationsError::ssh("无法验证管理员密码"))?;
         channel
             .write_all(b"\n")
             .map_err(|_| OperationsError::ssh("无法验证管理员密码"))?;
     }
     credentials.password.zeroize();
+    credentials.sudo_password.zeroize();
     channel
         .send_eof()
         .map_err(|_| OperationsError::ssh("管理员认证通道中断"))?;
@@ -1476,8 +1503,7 @@ fn promote_agent(
     } else {
         format!("/usr/bin/sudo -k -S -p '' {invocation}")
     };
-    let mut channel = session
-        .channel_session()
+    let mut channel = crate::network::ssh_channel(&session)
         .map_err(|_| OperationsError::ssh("无法打开 SSH 提权通道"))?;
     channel
         .handle_extended_data(ExtendedData::Merge)
@@ -1487,13 +1513,14 @@ fn promote_agent(
         .map_err(|_| OperationsError::ssh("无法启动固定 Agent 提权安装操作"))?;
     if credentials.username != "root" {
         channel
-            .write_all(credentials.password.as_bytes())
+            .write_all(credentials.sudo_secret().as_bytes())
             .map_err(|_| OperationsError::ssh("无法提交 sudo 认证"))?;
         channel
             .write_all(b"\n")
             .map_err(|_| OperationsError::ssh("无法提交 sudo 认证"))?;
     }
     credentials.password.zeroize();
+    credentials.sudo_password.zeroize();
     channel
         .send_eof()
         .map_err(|_| OperationsError::ssh("提权通道已中断"))?;
@@ -1551,8 +1578,7 @@ fn restart_full_agent(
     } else {
         format!("/usr/bin/sudo -k -S -p '' {invocation}")
     };
-    let mut channel = session
-        .channel_session()
+    let mut channel = crate::network::ssh_channel(&session)
         .map_err(|_| OperationsError::ssh("无法打开 Agent 重启通道"))?;
     channel
         .handle_extended_data(ExtendedData::Ignore)
@@ -1562,13 +1588,14 @@ fn restart_full_agent(
         .map_err(|_| OperationsError::ssh("无法启动固定 Agent 重启操作"))?;
     if credentials.username != "root" {
         channel
-            .write_all(credentials.password.as_bytes())
+            .write_all(credentials.sudo_secret().as_bytes())
             .map_err(|_| OperationsError::ssh("无法验证管理员密码"))?;
         channel
             .write_all(b"\n")
             .map_err(|_| OperationsError::ssh("无法验证管理员密码"))?;
     }
     credentials.password.zeroize();
+    credentials.sudo_password.zeroize();
     channel
         .send_eof()
         .map_err(|_| OperationsError::ssh("管理员认证通道中断"))?;
@@ -1613,10 +1640,12 @@ async fn send_event(socket: &mut WebSocket, event: TerminalEvent) -> bool {
         TerminalEvent::Error(message) => json!({ "type": "error", "message": message }),
         TerminalEvent::Closed => json!({ "type": "closed" }),
     };
+    let message=message.to_string();
+    easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::WebSocket).submit(message.len());
     matches!(
         tokio::time::timeout(
             Duration::from_secs(5),
-            socket.send(Message::Text(message.to_string().into()))
+            socket.send(Message::Text(message.into()))
         )
         .await,
         Ok(Ok(()))
@@ -1629,7 +1658,10 @@ async fn receive_terminal_credentials(
     node_id: Uuid,
 ) -> Result<(Credentials, (u32, u32)), OperationsError> {
     let authentication = match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Text(frame)))) => serde_json::from_str::<BrowserMessage>(&frame).ok(),
+        Ok(Some(Ok(Message::Text(frame)))) => {
+            easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::WebSocket).receive(frame.len());
+            serde_json::from_str::<BrowserMessage>(&frame).ok()
+        },
         _ => None,
     };
     let Some(BrowserMessage::Auth {
@@ -1643,7 +1675,7 @@ async fn receive_terminal_credentials(
             "请在连接后 15 秒内提交 SSH 用户名和密码",
         ));
     };
-    let credentials = Credentials { username, password };
+    let credentials = Credentials { username, password, ..Default::default() };
     validate_credentials(&credentials)?;
     audit(
         &state.pool,
@@ -1662,6 +1694,8 @@ async fn terminal_socket(
     target: Target,
     lease: Lease,
 ) {
+    let counters=easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::WebSocket);
+    let mut network_attempt=counters.begin();let _network_connection=counters.connection();
     let node_id = target.node_id;
     let (credentials, dimensions) =
         match receive_terminal_credentials(&mut socket, &state, node_id).await {
@@ -1700,6 +1734,7 @@ async fn terminal_socket(
             frame = socket.recv() => {
                 match frame {
                     Some(Ok(Message::Text(frame))) => {
+                        counters.receive(frame.len());
                         let message = serde_json::from_str::<BrowserMessage>(&frame);
                         let input = match message {
                             Ok(BrowserMessage::Input { data }) if data.len() <= 8192 => TerminalInput::Data(Zeroizing::new(data.into_bytes())),
@@ -1754,6 +1789,7 @@ async fn terminal_socket(
         tracing::error!(%node_id, "unable to record terminal close");
     }
     let _ = tokio::time::timeout(Duration::from_secs(2), socket.send(Message::Close(None))).await;
+    network_attempt.finish(true);
 }
 
 fn terminal_worker(
@@ -1766,8 +1802,7 @@ fn terminal_worker(
 ) -> Result<(), OperationsError> {
     let session = ssh_connect(target, &credentials, cancellation)?;
     credentials.password.zeroize();
-    let mut channel = session
-        .channel_session()
+    let mut channel = crate::network::ssh_channel(&session)
         .map_err(|_| OperationsError::ssh("无法打开 SSH 终端"))?;
     channel
         .request_pty(
@@ -1931,6 +1966,27 @@ impl IntoResponse for OperationsError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn administrator_authentication_accepts_keys_without_weakening_password_validation() {
+        use super::*;
+        for value in [json!({"username":"admin","password":"fixture-password"}),
+            json!({"username":"admin","private_key":"-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n-----END OPENSSH PRIVATE KEY-----","passphrase":"fixture","sudo_password":"other-fixture"}),
+            json!({"username":"root","private_key":"-----BEGIN RSA PRIVATE KEY-----\nfixture"})] {
+            let credentials: Credentials = serde_json::from_value(value).unwrap();
+            assert!(validate_credentials(&credentials).is_ok());
+        }
+        for value in [json!({}), json!({"username":"admin","use_saved":true}),
+            json!({"username":"admin","password":"fixture","private_key":"-----BEGIN key"}),
+            json!({"username":"admin","private_key":"ssh-ed25519 not-a-private-key"}),
+            json!({"username":"admin","private_key":"-----BEGIN key","sudo_password":"injection\n"}),
+            json!({"username":"admin","password":"x".repeat(1025)}),
+            json!({"username":"admin","private_key":format!("-----BEGIN {}", "x".repeat(12*1024))})] {
+            let credentials: Credentials = serde_json::from_value(value).unwrap();
+            assert!(validate_credentials(&credentials).is_err());
+        }
+        let request: UpdateRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(request.is_empty());
+    }
     use super::*;
 
     #[test]

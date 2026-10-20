@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CollectionPolicy {
+    /// None means a legacy peer/global policy; Some advertises per-node control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_enabled: Option<bool>,
     pub revision: u64,
     pub live_seconds: u64,
     pub report_seconds: u64,
@@ -104,6 +111,9 @@ pub const COLLECTION_ITEMS: &[(&str, &str, &str, u64, u64, u64)] = &[
 impl Default for CollectionPolicy {
     fn default() -> Self {
         Self {
+            users_enabled: None,
+            permissions_enabled: None,
+            proxy_enabled: None,
             revision: 0,
             live_seconds: 1,
             report_seconds: 10,

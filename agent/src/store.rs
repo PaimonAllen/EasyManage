@@ -13,6 +13,63 @@ pub struct Store {
 }
 
 impl Store {
+    pub async fn proxy_enabled(&self) -> Result<bool> {
+        match self.metadata("proxy_enabled").await?.as_deref() {
+            None | Some("true") => Ok(true),
+            Some("false") => Ok(false),
+            _ => anyhow::bail!("stored proxy collection setting is invalid"),
+        }
+    }
+
+    pub async fn save_proxy_enabled(&self, enabled: bool) -> Result<()> {
+        self.set_metadata("proxy_enabled", if enabled { "true" } else { "false" })
+            .await
+    }
+
+    pub async fn agent_control(&self) -> Result<easymanage_protocol::AgentControl> {
+        match self.metadata("agent_control").await? {
+            Some(value) => {
+                serde_json::from_str(&value).context("stored monitoring control is invalid")
+            }
+            None => Ok(Default::default()),
+        }
+    }
+    pub async fn save_agent_control(
+        &self,
+        control: &easymanage_protocol::AgentControl,
+    ) -> Result<()> {
+        self.set_metadata("agent_control", &serde_json::to_string(control)?)
+            .await
+    }
+    pub async fn permissions_enabled(&self) -> Result<bool> {
+        match self.metadata("permissions_enabled").await?.as_deref() {
+            None | Some("true") => Ok(true),
+            Some("false") => Ok(false),
+            _ => anyhow::bail!("stored permission collection setting is invalid"),
+        }
+    }
+
+    pub async fn save_permissions_enabled(&self, enabled: bool) -> Result<()> {
+        self.set_metadata(
+            "permissions_enabled",
+            if enabled { "true" } else { "false" },
+        )
+        .await
+    }
+
+    pub async fn users_enabled(&self) -> Result<bool> {
+        match self.metadata("users_enabled").await?.as_deref() {
+            None | Some("true") => Ok(true),
+            Some("false") => Ok(false),
+            _ => anyhow::bail!("stored user collection setting is invalid"),
+        }
+    }
+
+    pub async fn save_users_enabled(&self, enabled: bool) -> Result<()> {
+        self.set_metadata("users_enabled", if enabled { "true" } else { "false" })
+            .await
+    }
+
     pub async fn hardware_details(&self, uid: u32) -> Result<Option<HardwareDetails>> {
         let Some(value) = self.metadata("hardware_details_v1").await? else {
             return Ok(None);
@@ -239,6 +296,43 @@ mod tests {
             }
         }))
         .expect("valid test report")
+    }
+
+    #[tokio::test]
+    async fn user_collection_switch_survives_reopen() {
+        let state = TemporaryState::new();
+        let store = Store::open(&state.database()).await.unwrap();
+        assert!(store.users_enabled().await.unwrap());
+        assert!(store.permissions_enabled().await.unwrap());
+        assert!(store.proxy_enabled().await.unwrap());
+        assert_eq!(
+            store.agent_control().await.unwrap(),
+            easymanage_protocol::AgentControl::default()
+        );
+        let paused = easymanage_protocol::AgentControl {
+            revision: 7,
+            paused: true,
+        };
+        store.save_agent_control(&paused).await.unwrap();
+        store.save_users_enabled(false).await.unwrap();
+        store.save_permissions_enabled(false).await.unwrap();
+        store.save_proxy_enabled(false).await.unwrap();
+        store.pool.close().await;
+        let reopened = Store::open(&state.database()).await.unwrap();
+        assert!(!reopened.users_enabled().await.unwrap());
+        assert!(!reopened.permissions_enabled().await.unwrap());
+        assert!(!reopened.proxy_enabled().await.unwrap());
+        assert_eq!(reopened.agent_control().await.unwrap(), paused);
+        reopened.save_users_enabled(true).await.unwrap();
+        assert!(reopened.users_enabled().await.unwrap());
+        assert!(
+            !reopened.permissions_enabled().await.unwrap(),
+            "user switch does not change permission collection"
+        );
+        reopened.save_permissions_enabled(true).await.unwrap();
+        reopened.save_proxy_enabled(true).await.unwrap();
+        assert!(reopened.proxy_enabled().await.unwrap());
+        assert!(reopened.permissions_enabled().await.unwrap());
     }
 
     #[tokio::test]

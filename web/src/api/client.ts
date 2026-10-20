@@ -1,11 +1,43 @@
 import type { LiveNodeListResponse, NodeListResponse, NodeMetricHistory, PermissionCheck, PlatformProcessMetric, PlatformStorageMetric } from "../types/monitoring";
 import type { CollectionPolicy } from "../types/monitoring";
 import { serializeMachineRequest, type MachineAuthentication, type MachineDeploymentMode } from "../lib/machineAuthentication";
+import type { NetworkActivity } from "../types/monitoring";
+
+export interface PlatformNetworkStatus {
+  generated_at:string; server:NetworkActivity; agents_available:boolean;
+  agents:{node_id:string;hostname:string;last_seen:string;monitoring_paused?:boolean;activity:NetworkActivity|null}[];
+}
+export async function fetchPlatformNetwork(signal?:AbortSignal):Promise<PlatformNetworkStatus|null>{
+  const response=await fetch("/api/v1/platform-network",{cache:"no-store",signal});
+  if(response.status===404)return null;
+  return readResponse(response);
+}
 
 export interface CollectionSettingsStatus {
   policy: CollectionPolicy;
-  items: { key: Exclude<keyof CollectionPolicy, "revision">; title: string; description: string; minimum: number; maximum: number; default_seconds: number }[];
-  agents: { node_id: string; hostname: string; last_seen: string; applied_policy: CollectionPolicy | null }[];
+  items: { key: Exclude<keyof CollectionPolicy, "revision" | "users_enabled" | "permissions_enabled" | "proxy_enabled">; title: string; description: string; minimum: number; maximum: number; default_seconds: number }[];
+  agents: { node_id: string; hostname: string; last_seen: string; applied_policy: CollectionPolicy | null; users_enabled: boolean; permissions_enabled: boolean; proxy_enabled?: boolean }[];
+}
+
+export async function saveProxyCollection(nodeId:string,enabled:boolean,expectedEnabled:boolean):Promise<{enabled:boolean;message:string}> {
+  return readResponse(await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/proxy-collection`, {
+    method:"POST",headers:{"Content-Type":"application/json"},cache:"no-store",
+    body:JSON.stringify({enabled,expected_enabled:expectedEnabled}),signal:AbortSignal.timeout(15_000),
+  }));
+}
+
+export async function savePermissionCollection(nodeId: string, enabled: boolean, expectedEnabled: boolean): Promise<{enabled:boolean;message:string}> {
+  return readResponse(await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/permission-collection`, {
+    method:"POST",headers:{"Content-Type":"application/json"},cache:"no-store",
+    body:JSON.stringify({enabled,expected_enabled:expectedEnabled}),signal:AbortSignal.timeout(15_000),
+  }));
+}
+
+export async function saveUserCollection(nodeId: string, enabled: boolean, expectedEnabled: boolean): Promise<{enabled:boolean;message:string}> {
+  return readResponse(await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/user-collection`, {
+    method:"POST",headers:{"Content-Type":"application/json"},cache:"no-store",
+    body:JSON.stringify({enabled,expected_enabled:expectedEnabled}),signal:AbortSignal.timeout(15_000),
+  }));
 }
 
 export async function fetchCollectionSettings(signal?: AbortSignal): Promise<CollectionSettingsStatus> {
@@ -61,6 +93,12 @@ export interface ManagedMachine {
   saved_credentials_usable?: boolean;
   deployment_mode?: MachineDeploymentMode | null;
   redeploy_available?: boolean;
+  monitoring_paused?: boolean;
+  monitoring_revision?: number;
+  monitoring_applied_revision?: number | null;
+  monitoring_supported?: boolean;
+  monitoring_reported_revision?: number | null;
+  control_seen_at?: string | null;
   ssh_transport?: {status: string; connections: number; limit: number; remote_port: number | null; reconnects: number; retry_attempt?: number; retry_limit?: number; retry_interval_seconds?: number; last_error?: string | null} | null;
 }
 export interface MachineStatus {
@@ -72,6 +110,12 @@ export interface MachineDeployment {
 }
 export async function fetchMachines(signal?: AbortSignal): Promise<MachineStatus> {
   return readResponse(await fetch("/api/v1/machines", { cache: "no-store", signal }));
+}
+export async function setMachineMonitoring(machine: ManagedMachine, paused: boolean): Promise<{message:string}> {
+  return readResponse(await fetch(`/api/v1/machines/${encodeURIComponent(machine.node_id)}/monitoring`, {
+    method:"POST", headers:{"Content-Type":"application/json"}, cache:"no-store", signal:AbortSignal.timeout(10_000),
+    body:JSON.stringify({confirmation:machine.node_id, paused, expected_revision:machine.monitoring_revision}),
+  }));
 }
 export async function probeMachine(host: string, port: number): Promise<{fingerprint: string; message: string}> {
   return readResponse(await fetch("/api/v1/machines/probe", { method: "POST", headers: {"Content-Type":"application/json"},
@@ -110,7 +154,21 @@ export async function fetchRecoveryStatus(signal?: AbortSignal): Promise<Recover
   return readResponse(await fetch("/api/v1/operations/recovery", { cache: "no-store", signal }));
 }
 
-export async function forceRestartService(nodeId: string | null, credentials: { username: string; password: string }, signal?: AbortSignal): Promise<{ status: string; message: string }> {
+export type AdminAuthentication = {use_saved: true} | {username: string; password?: string; private_key?: string; passphrase?: string; sudo_password?: string};
+function adminCredentialsPath(nodeId: string | null): string {
+  return nodeId === null ? "/api/v1/platform/admin-credentials" : `/api/v1/nodes/${encodeURIComponent(nodeId)}/admin-credentials`;
+}
+export async function fetchAdminCredentials(nodeId: string | null, signal?: AbortSignal): Promise<{available: boolean}> {
+  return readResponse(await fetch(adminCredentialsPath(nodeId), {cache:"no-store", signal}));
+}
+export async function saveAdminCredentials(nodeId: string | null, credentials: AdminAuthentication): Promise<{available:boolean}> {
+  return readResponse(await fetch(adminCredentialsPath(nodeId), {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(credentials), cache:"no-store", signal:AbortSignal.timeout(70_000)}));
+}
+export async function forgetAdminCredentials(nodeId: string | null): Promise<void> {
+  await readResponse(await fetch(adminCredentialsPath(nodeId), {method:"DELETE", cache:"no-store", signal:AbortSignal.timeout(15_000)}));
+}
+
+export async function forceRestartService(nodeId: string | null, credentials: AdminAuthentication, signal?: AbortSignal): Promise<{ status: string; message: string }> {
   const path = nodeId === null ? "/api/v1/platform/force-restart" : `/api/v1/nodes/${encodeURIComponent(nodeId)}/agent/force-restart`;
   return readResponse(await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(credentials), cache: "no-store", signal }));
 }
@@ -128,7 +186,7 @@ export async function fetchPlatformUpdateStatus(signal?: AbortSignal): Promise<P
   return readResponse(await fetch("/api/v1/platform/update", {cache: "no-store", signal}));
 }
 
-export async function updatePlatform(credentials: {username: string; password: string}, candidateSha256: string, signal?: AbortSignal): Promise<{message: string}> {
+export async function updatePlatform(credentials: AdminAuthentication, candidateSha256: string, signal?: AbortSignal): Promise<{message: string}> {
   return readResponse(await fetch("/api/v1/platform/update", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({...credentials, candidate_sha256: candidateSha256}), cache: "no-store", signal}));
 }
@@ -312,14 +370,14 @@ export async function manageUser(nodeId: string, operation: UserOperation, signa
   }));
 }
 
-export async function updateAgent(nodeId: string, credentials?: { username: string; password: string }, signal?: AbortSignal): Promise<{ status: string; message: string }> {
+export async function updateAgent(nodeId: string, credentials?: AdminAuthentication, signal?: AbortSignal): Promise<{ status: string; message: string }> {
   return readResponse(await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/agent/update`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(credentials ?? {}), cache: "no-store", signal,
   }));
 }
 
-export async function restartAgent(nodeId: string, credentials?: { username: string; password: string }, signal?: AbortSignal): Promise<{ status: string; message: string }> {
+export async function restartAgent(nodeId: string, credentials?: AdminAuthentication, signal?: AbortSignal): Promise<{ status: string; message: string }> {
   return readResponse(await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/agent/restart`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(credentials ?? {}), cache: "no-store", signal,
@@ -328,15 +386,14 @@ export async function restartAgent(nodeId: string, credentials?: { username: str
 
 export async function elevateNode(
   nodeId: string,
-  username: string,
-  password: string,
+  credentials: AdminAuthentication,
   signal?: AbortSignal,
 ): Promise<{ message?: string }> {
   return readResponse(
     await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/elevate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify(credentials),
       cache: "no-store",
       signal,
     }),

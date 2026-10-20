@@ -18,6 +18,74 @@ const server = await createServer({
   server: { middlewareMode: true, watch: null },
 });
 try {
+  const { AdminCredentialFields }=await server.ssrLoadModule("/src/components/AdminCredentials.tsx");
+  const auth={ready:true,loading:false,available:true,mode:"saved",username:"fixture-admin",password:"fixture-password-not-for-render",
+    key:"fixture-private-key-not-for-render",passphrase:"fixture-phrase-not-for-render",sudoPassword:"fixture-sudo-not-for-render",error:"",setMode:()=>{}};
+  const savedAdmin=renderToStaticMarkup(React.createElement(AdminCredentialFields,{auth,disabled:false}));
+  assert.ok(savedAdmin.includes("使用平台已加密保存的凭据")&&savedAdmin.includes("清除已保存的管理员凭据"));
+  assert.ok(!savedAdmin.includes("fixture-")&&!savedAdmin.includes("localStorage"));
+  const keyAdmin=renderToStaticMarkup(React.createElement(AdminCredentialFields,{auth:{...auth,mode:"key",password:"",passphrase:"",sudoPassword:""},disabled:true}));
+  assert.ok(keyAdmin.includes('type="file"')&&keyAdmin.includes("12 KiB")&&keyAdmin.includes('disabled=""'));
+  assert.ok(!keyAdmin.includes(auth.key));
+  const loadingAdmin=renderToStaticMarkup(React.createElement(AdminCredentialFields,{auth:{...auth,loading:true},disabled:false}));
+  assert.ok(loadingAdmin.includes("正在检查已保存的授权")&&!loadingAdmin.includes("fixture-"));
+  console.log("PASS administrator credential forms support saved/password/key modes without revealing saved secrets");
+  const { UserCollectionToggle } = await server.ssrLoadModule("/src/pages/Users.tsx");
+  const userToggle=(extra)=>renderToStaticMarkup(React.createElement(UserCollectionToggle,{
+    hostname:"Fixture node",enabled:true,applied:true,online:true,busy:false,onChange:()=>{},...extra,
+  }));
+  assert.match(userToggle({}),/role="switch"[^>]*aria-label="Fixture node 用户状态采集"[^>]*checked/);
+  assert.ok(userToggle({enabled:false,applied:false}).includes("Agent 已停止采集"));
+  assert.ok(userToggle({enabled:false,applied:true}).includes("等待 Agent 确认"));
+  assert.ok(userToggle({enabled:false,applied:undefined}).includes("需更新 Agent"));
+  assert.ok(userToggle({enabled:false,online:false}).includes("上线后应用"));
+  assert.ok(userToggle({busy:true}).includes('disabled=""'));
+  assert.ok(userToggle({enabled:undefined}).includes('disabled=""'));
+  console.log("PASS per-node user collection switch shows confirmed, pending, offline and legacy states");
+  const { NodeCollectionToggle } = await server.ssrLoadModule("/src/components/NodeCollectionControl.tsx");
+  const permissionToggle=renderToStaticMarkup(React.createElement(NodeCollectionToggle,{
+    hostname:"Permission fixture",label:"权限检查采集",enabled:false,applied:false,online:true,busy:false,onChange:()=>{},
+  }));
+  assert.ok(permissionToggle.includes('role="switch"')&&permissionToggle.includes('aria-label="Permission fixture 权限检查采集"'));
+  assert.ok(permissionToggle.includes("Agent 已停止采集"));
+  const { PermissionChecks } = await server.ssrLoadModule("/src/pages/PermissionChecks.tsx");
+  const permissionPage=renderToStaticMarkup(React.createElement(PermissionChecks,{nodes:[
+    {id:"permission-one",hostname:"First machine",online:true,metrics:null},
+    {id:"permission-two",hostname:"Second machine",online:false,metrics:null},
+  ]}));
+  assert.equal((permissionPage.match(/role="switch"/g)??[]).length,2);
+  assert.ok(permissionPage.includes("First machine 权限检查采集")&&permissionPage.includes("Second machine 权限检查采集"));
+  console.log("PASS permission page has independent accessible per-machine collection switches");
+  const { GlobalNetwork,proxyMonitoringVisible }=await server.ssrLoadModule("/src/pages/GlobalNetwork.tsx");
+  const proxyFixture={id:"proxy-one",hostname:"Proxy machine",online:true,metrics:{
+    collection_policy:{proxy_enabled:false},proxy_services:[{name:"mihomo",username:"fixture",uid:1000,pid:54321,listen_addresses:["tcp://127.0.0.1:23456"]}],
+  }};
+  assert.equal(proxyMonitoringVisible(proxyFixture,true),false);
+  assert.equal(proxyMonitoringVisible({...proxyFixture,metrics:{collection_policy:{proxy_enabled:true}}},false),false);
+  assert.equal(proxyMonitoringVisible({...proxyFixture,metrics:{collection_policy:{proxy_enabled:true}}},true),true);
+  assert.equal(proxyMonitoringVisible({...proxyFixture,metrics:{}},undefined),true);
+  const proxyPage=renderToStaticMarkup(React.createElement(GlobalNetwork,{nodes:[proxyFixture,{id:"proxy-two",hostname:"Other proxy machine",online:false,metrics:null}]}));
+  assert.equal((proxyPage.match(/role="switch"/g)??[]).length,2);
+  assert.ok(proxyPage.includes("Proxy machine 代理监控采集")&&proxyPage.includes("代理监控采集已关闭"));
+  assert.ok(!proxyPage.includes("54321")&&!proxyPage.includes("23456")&&!proxyPage.includes("mihomo"));
+  assert.ok(proxyPage.includes("不会停止实际代理"));
+  const oldProxyPlatform=renderToStaticMarkup(React.createElement(NodeCollectionToggle,{
+    hostname:"Legacy platform",label:"代理监控采集",enabled:undefined,applied:true,online:true,busy:false,unavailable:true,onChange:()=>{},
+  }));
+  assert.ok(oldProxyPlatform.includes("平台需更新")&&oldProxyPlatform.includes('disabled=""'));
+  console.log("PASS per-machine proxy switches exclude disabled snapshots and listeners without stopping actual proxy services");
+  const { NetworkResourceRows,NetworkResources }=await server.ssrLoadModule("/src/components/NetworkResources.tsx");
+  const netRow={group:"agent_live",started:5,completed:4,failed:1,in_flight:1,open_connections:0,received_bytes:12,submitted_bytes:24};
+  const netActivity={process_id:42,started_at:"2026-01-01T00:00:00Z",collected_at:"2026-01-01T00:01:00Z",groups:[netRow]};
+  const netHtml=renderToStaticMarkup(React.createElement(NetworkResourceRows,{name:"Network fixture",activity:netActivity}));
+  assert.ok(netHtml.includes("12 B")&&netHtml.includes("24 B")&&netHtml.includes("实时指标"));
+  const unknownNet=renderToStaticMarkup(React.createElement(NetworkResourceRows,{name:"Legacy fixture",activity:null}));
+  assert.ok(unknownNet.includes("不按 0 处理"));
+  const offlineNet=renderToStaticMarkup(React.createElement(NetworkResourceRows,{name:"Offline fixture",activity:netActivity,online:false}));
+  assert.ok(offlineNet.includes("离线历史")&&!/\d[\d. ]*(?:[KMG]i?B|B)\/s/.test(offlineNet));
+  const netPanel=renderToStaticMarkup(React.createElement(NetworkResources));
+  assert.ok(netPanel.includes("重启清零")&&netPanel.includes("不可相加")&&netPanel.includes("不记录 URL"));
+  console.log("PASS network resource rows use component counters, preserve unknown/offline states and disclose non-additive layers");
   const { NodeCharts } = await server.ssrLoadModule("/src/components/NodeCharts.tsx");
   const end = Date.now();
   const at = new Date(end - 1000).toISOString();
@@ -160,7 +228,12 @@ try {
   assert.ok(css.includes('.storage-device-details > summary:focus-visible'));
   assert.ok(css.includes('.storage-device-details[open] > summary::before'));
   console.log("PASS storage recording badges: two SMR, one CMR, unknown model, SSD exclusion and accessible detail toggles");
-  const { AgentManagement } = await server.ssrLoadModule("/src/pages/AgentManagement.tsx");
+  const { AgentManagement,updateEligible } = await server.ssrLoadModule("/src/pages/AgentManagement.tsx");
+  const pendingPauseUpgrade={online:false,monitoring_paused:true,last_seen:new Date().toISOString(),metrics:{privilege:{mode:"full",uid:0},agent_control:null}};
+  const availableFull={update_available:true,update_state:"available"};
+  assert.equal(updateEligible(pendingPauseUpgrade,availableFull),true);
+  assert.equal(updateEligible({...pendingPauseUpgrade,last_seen:"2020-01-01T00:00:00Z"},availableFull),false);
+  assert.equal(updateEligible({...pendingPauseUpgrade,metrics:{...pendingPauseUpgrade.metrics,agent_control:{revision:1,paused:true}}},availableFull),false);
   const emergency = renderToStaticMarkup(React.createElement(AgentManagement, {
     nodes: [], targets: [{node_id:"offline-fixture",hostname:"offline-node",host:"192.0.2.1",port:22,restart_available:true}],
     onRefresh:()=>{},onElevate:()=>{},
@@ -268,7 +341,25 @@ try {
   const oldAi = renderToStaticMarkup(React.createElement(AiTools, { nodes: [{ id: "old-ai", hostname: "old", online: false, metrics: {} }] }));
   assert.ok(oldAi.includes("尚未收到新版 Agent 的 AI 工具清单"));
   console.log("PASS expanded multi-user AI inventory paths and incomplete-scan reasons, with legacy Agent fallback");
-  const { MachineManagement, MachineSshDialog, RedeployMachineDialog, SshAuthenticationFields, AgentConnectionSettings, AgentDeploymentFields } = await server.ssrLoadModule("/src/components/MachineManagement.tsx");
+  const { MachineManagement, MachineMonitoringButton, machineMonitoringLabel, MachineSshDialog, RedeployMachineDialog, SshAuthenticationFields, AgentConnectionSettings, AgentDeploymentFields } = await server.ssrLoadModule("/src/components/MachineManagement.tsx");
+  const pausedMachine={monitoring_paused:true,monitoring_revision:1,monitoring_applied_revision:1,monitoring_supported:true,control_seen_at:new Date().toISOString()};
+  assert.equal(machineMonitoringLabel(pausedMachine),"已暂停 · 轻量控制在线");
+  assert.equal(machineMonitoringLabel({...pausedMachine,monitoring_supported:false}),"暂停待确认 · 需更新 Agent");
+  assert.equal(machineMonitoringLabel({...pausedMachine,monitoring_applied_revision:0}),"暂停待确认");
+  assert.equal(machineMonitoringLabel({...pausedMachine,control_seen_at:"2020-01-01T00:00:00Z"}),"已暂停 · 控制连接离线");
+  assert.match(machineMonitoringLabel({...pausedMachine,monitoring_paused:false,monitoring_revision:2}),/恢复待确认/);
+  assert.equal(machineMonitoringLabel({...pausedMachine,monitoring_paused:false}),"已恢复 · 等待新指标");
+  const monitoringButton=(machine,busy=false)=>renderToStaticMarkup(React.createElement(MachineMonitoringButton,{machine:{hostname:"Paused fixture",...machine},busy,onToggle:()=>{}}));
+  assert.ok(monitoringButton(pausedMachine).includes('aria-label="Paused fixture 恢复监控"'));
+  assert.ok(monitoringButton({...pausedMachine,monitoring_paused:false}).includes('aria-label="Paused fixture 暂停监控"'));
+  assert.ok(monitoringButton({}).includes("需先更新平台后端")&&monitoringButton({}).includes('disabled=""'));
+  assert.ok(monitoringButton(pausedMachine,true).includes('disabled=""'));
+  console.log("PASS monitoring pause distinguishes confirmed, pending, unsupported, disconnected and resume states");
+  const { NodeStatus }=await server.ssrLoadModule("/src/components/NodeStatus.tsx");
+  const pausedStatus=(node)=>renderToStaticMarkup(React.createElement(NodeStatus,{node}));
+  assert.ok(pausedStatus({monitoring_paused:true,monitoring_revision:1,monitoring_applied_revision:0,online:true}).includes("暂停待确认"));
+  const confirmedStatus=pausedStatus({monitoring_paused:true,monitoring_revision:1,monitoring_applied_revision:1,online:false});
+  assert.ok(confirmedStatus.includes("监控已暂停")&&confirmedStatus.includes("status--paused")&&!confirmedStatus.includes("status--offline"));
   const management=renderToStaticMarkup(React.createElement(MachineManagement,{onRefresh:()=>{}}));
   assert.ok(management.includes("机器管理") && management.includes("添加机器") && management.includes("软删除保留历史和身份"));
   assert.ok(management.includes("查看受管机器与已删除机器") && management.includes("disabled"));

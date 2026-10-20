@@ -92,6 +92,7 @@ struct Connection {
     session: Session,
     socket: TcpStream,
     _slot: OwnedSemaphorePermit,
+    _network: easymanage_runtime::network::Connection<'static>,
 }
 
 struct Cached {
@@ -216,8 +217,11 @@ fn dial(host: &Host, address: SocketAddr) -> Result<Arc<Connection>, OperationsE
         .clone()
         .try_acquire_owned()
         .map_err(|_| OperationsError::busy())?;
+    let counters=easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshConnect);
+    let mut attempt=counters.begin();
     let socket = TcpStream::connect_timeout(&address, Duration::from_secs(8))
         .map_err(|_| OperationsError::ssh("SSH 连接失败"))?;
+    let connection=counters.connection();
     socket
         .set_nodelay(true)
         .map_err(|_| OperationsError::ssh("SSH socket 初始化失败"))?;
@@ -231,10 +235,12 @@ fn dial(host: &Host, address: SocketAddr) -> Result<Arc<Connection>, OperationsE
     session
         .handshake()
         .map_err(|_| OperationsError::ssh("SSH 握手失败"))?;
+    attempt.finish(true);
     Ok(Arc::new(Connection {
         session,
         socket,
         _slot: slot,
+        _network: connection,
     }))
 }
 
@@ -324,8 +330,8 @@ pub(super) fn operation(
     let auth = Auth {
         username: credentials.username.clone(),
         password: credentials.password.clone(),
-        key: Zeroizing::new(String::new()),
-        passphrase: Zeroizing::new(String::new()),
+        key: credentials.private_key.clone(),
+        passphrase: credentials.passphrase.clone(),
     };
     authenticated(target, &auth, cancellation)
 }
@@ -488,8 +494,7 @@ fn verify_listener(session: &Session, port: u16) -> Result<(), OperationsError> 
     // GatewayPorts=yes can override the client's requested bind address. Verify
     // the actual Linux listener before installing any loopback Agent URL.
     let script = "import sys\np=int(sys.argv[1]);found=[]\nfor f in ('/proc/net/tcp','/proc/net/tcp6'):\n for line in open(f).read().splitlines()[1:]:\n  row=line.split();a,port=row[1].split(':')\n  if int(port,16)==p and row[3]=='0A': found.append(a)\nassert found and all(a=='0100007F' for a in found)\nprint('loopback')";
-    let mut check = session
-        .channel_session()
+    let mut check = crate::network::ssh_channel(session)
         .map_err(|_| OperationsError::ssh("SSH 回环监听核验失败"))?;
     check
         .handle_extended_data(ExtendedData::Ignore)
@@ -752,6 +757,8 @@ struct Pipe {
     local_eof: bool,
     eof_sent: bool,
     last_io: Instant,
+    network_attempt: easymanage_runtime::network::Attempt<'static>,
+    _network_connection: easymanage_runtime::network::Connection<'static>,
 }
 
 fn would_block(error: &ssh2::Error) -> bool {
@@ -833,6 +840,8 @@ fn pump(
                             local_eof: false,
                             eof_sent: false,
                             last_io: Instant::now(),
+                            network_attempt:easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshTunnel).begin(),
+                            _network_connection:easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshTunnel).connection(),
                         });
                     }
                 }
@@ -862,6 +871,7 @@ impl Pipe {
                 Ok(0) => self.remote_eof = self.channel.eof(),
                 Ok(size) => {
                     self.to_local.extend_from_slice(&buffer[..size]);
+                    easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshTunnel).receive(size);
                     self.last_io = Instant::now();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -904,6 +914,7 @@ impl Pipe {
                 Ok(0) => return Ok(false),
                 Ok(size) => {
                     self.remote_offset += size;
+                    easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshTunnel).submit(size);
                     self.last_io = Instant::now();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -921,10 +932,12 @@ impl Pipe {
                 Err(_) => return Ok(false),
             }
         }
-        Ok(!(self.remote_eof
+        let finished=self.remote_eof
             && self.local_eof
             && self.to_local.is_empty()
-            && self.to_remote.is_empty()))
+            && self.to_remote.is_empty();
+        if finished { self.network_attempt.finish(true); }
+        Ok(!finished)
     }
 }
 

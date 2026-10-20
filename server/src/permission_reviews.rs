@@ -112,6 +112,22 @@ async fn mark(
         .await
         .map_err(database_error)?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "节点不存在"))?;
+    // Serialize with a switch change on the node row, not a pre-lock cache read.
+    if request.accepted
+        && !sqlx::query_scalar::<_, bool>(
+            "SELECT enabled FROM node_permission_collection WHERE node_id=$1",
+        )
+        .bind(node_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(database_error)?
+        .unwrap_or(true)
+    {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "权限检查采集已关闭，不能将旧快照标记为当前人工 OK",
+        ));
+    }
     let evidence = if request.accepted {
         if !matches!(
             check.status.as_str(),
@@ -187,6 +203,12 @@ pub async fn invalidate_changed(
     sqlx::query(r"
         WITH invalidated AS (
             DELETE FROM permission_reviews r WHERE r.node_id=$1 AND NOT EXISTS (
+                -- Explicitly paused/warming-up new collectors have no new evidence.
+                -- Keep annotations dormant; a fresh audit still invalidates changes.
+                SELECT 1 FROM metrics_latest m WHERE m.node_id=r.node_id
+                AND m.metrics->'collection_policy'->>'permissions_enabled' IN ('true','false')
+                AND (m.metrics->'permission_audit' IS NULL OR m.metrics->'permission_audit'='null'::jsonb)
+            ) AND NOT EXISTS (
                 SELECT 1 FROM metrics_latest m,
                     jsonb_array_elements(COALESCE(NULLIF(m.metrics->'permission_audit'->'checks','null'::jsonb),'[]'::jsonb)) AS checks(evidence)
                 WHERE m.node_id=r.node_id AND checks.evidence=r.evidence

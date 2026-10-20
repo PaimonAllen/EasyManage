@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod network;
 mod platform;
 pub mod privilege;
 pub mod process;

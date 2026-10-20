@@ -5,7 +5,7 @@ use crate::platform::{self, PlatformCollector};
 use crate::store::Store;
 use anyhow::{Context, Result};
 use easymanage_protocol::{
-    AGENT_VERSION, AgentLiveReport, AgentReport, CollectionPolicy, EnrollmentRequest,
+    AGENT_VERSION, AgentControl, AgentLiveReport, AgentReport, CollectionPolicy, EnrollmentRequest,
     NodeInventory, PROTOCOL_VERSION,
 };
 use easymanage_runtime::shutdown::shutdown_signal;
@@ -17,71 +17,144 @@ pub(crate) async fn run() -> Result<()> {
     let config = AgentConfig::load()?;
     let store = Store::open(&config.state_database).await?;
     let client = ServerClient::new(&config)?;
-    let mut collector = platform::initialize(&config.state_database, &store).await?;
+    let node_id = store.node_id().await?;
+    let mut token = store.agent_token().await?;
+    let mut control = store.agent_control().await?;
+    // Read persisted intent before any inventory, GPU or filesystem scanning.
+    if let Some(token) = token.as_deref() {
+        if let Err(error) = client.poll_control(token, node_id, &control).await {
+            warn!(%error, "control unavailable; retaining persisted monitoring state");
+        }
+    }
+    let mut collector: Option<platform::NativeCollector> = None;
     let mut policy = CollectionPolicy {
+        users_enabled: Some(store.users_enabled().await?),
+        permissions_enabled: Some(store.permissions_enabled().await?),
+        proxy_enabled: Some(store.proxy_enabled().await?),
         report_seconds: config.report_interval.as_secs(),
         gpu_seconds: config.report_interval.as_secs(),
         ..Default::default()
     };
     policy.validate().map_err(anyhow::Error::msg)?;
-    collector.apply_policy(policy.clone());
-    let inventory = collector.inventory()?;
-    let node_id = store.node_id().await?;
-    let mut token = store.agent_token().await?;
-
-    info!(%node_id, hostname = %inventory.hostname, effective_uid = ?platform::effective_uid(), "EasyManage agent started; privileges reflect its actual execution user");
+    info!(%node_id, paused = control.paused, "EasyManage agent started; saved identity and privileges retained");
     let mut interval = tokio::time::interval(config.report_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut live_interval = tokio::time::interval(Duration::from_secs(1));
     live_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut control_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    control_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut next_live_warning_at = Instant::now();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
-        if let Some(next) = client.collection_policy().filter(|next| next != &policy) {
-            let report_changed = next.report_seconds != policy.report_seconds;
-            let live_changed = next.live_seconds != policy.live_seconds;
-            policy = next;
-            collector.apply_policy(policy.clone());
-            let now = tokio::time::Instant::now();
-            // No immediate extra probes or catch-up bursts when settings change.
-            if report_changed {
-                interval = tokio::time::interval_at(
-                    now + Duration::from_secs(policy.report_seconds),
-                    Duration::from_secs(policy.report_seconds),
+        if let Some(next) = client.agent_control() {
+            if next.revision > control.revision && next != control {
+                store.save_agent_control(&next).await?;
+                control = next;
+                // Drop cancels collector tasks; no scan is scheduled while paused.
+                if control.paused {
+                    collector.take();
+                }
+                if let Some(token) = token.as_deref() {
+                    if let Err(error) = client.poll_control(token, node_id, &control).await {
+                        warn!(%error, "monitoring state saved; acknowledgement will retry");
+                    }
+                }
+                control_interval.reset_after(Duration::from_secs(60));
+                info!(
+                    paused = control.paused,
+                    revision = control.revision,
+                    "monitoring state applied"
                 );
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             }
-            if live_changed {
-                live_interval = tokio::time::interval_at(
-                    now + Duration::from_secs(policy.live_seconds),
-                    Duration::from_secs(policy.live_seconds),
+        }
+        if let Some(mut next) = client.collection_policy() {
+            // A legacy server cannot silently re-enable a locally disabled scan.
+            next.users_enabled = next.users_enabled.or(policy.users_enabled);
+            next.permissions_enabled = next.permissions_enabled.or(policy.permissions_enabled);
+            next.proxy_enabled = next.proxy_enabled.or(policy.proxy_enabled);
+            if next != policy {
+                if next.users_enabled != policy.users_enabled {
+                    store
+                        .save_users_enabled(next.users_enabled.unwrap_or(true))
+                        .await?;
+                }
+                if next.permissions_enabled != policy.permissions_enabled {
+                    store
+                        .save_permissions_enabled(next.permissions_enabled.unwrap_or(true))
+                        .await?;
+                }
+                let report_changed = next.report_seconds != policy.report_seconds;
+                if next.proxy_enabled != policy.proxy_enabled {
+                    store
+                        .save_proxy_enabled(next.proxy_enabled.unwrap_or(true))
+                        .await?;
+                }
+                let live_changed = next.live_seconds != policy.live_seconds;
+                policy = next;
+                if let Some(collector) = collector.as_mut() {
+                    PlatformCollector::apply_policy(collector, policy.clone());
+                }
+                let now = tokio::time::Instant::now();
+                // No immediate extra probes or catch-up bursts when settings change.
+                if report_changed {
+                    interval = tokio::time::interval_at(
+                        now + Duration::from_secs(policy.report_seconds),
+                        Duration::from_secs(policy.report_seconds),
+                    );
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                }
+                if live_changed {
+                    live_interval = tokio::time::interval_at(
+                        now + Duration::from_secs(policy.live_seconds),
+                        Duration::from_secs(policy.live_seconds),
+                    );
+                    live_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                }
+                info!(
+                    revision = policy.revision,
+                    "collection policy applied without changing Agent privileges"
                 );
-                live_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             }
-            info!(
-                revision = policy.revision,
-                "collection policy applied without changing Agent privileges"
-            );
+        }
+        if !control.paused && collector.is_none() {
+            let mut active = platform::initialize(&config.state_database, &store).await?;
+            PlatformCollector::apply_policy(&mut active, policy.clone());
+            collector = Some(active);
+            interval.reset_immediately();
+            live_interval.reset_after(Duration::from_secs(policy.live_seconds));
         }
         tokio::select! {
-            _ = interval.tick() => {
+            _ = control_interval.tick(), if token.is_some() => {
+                if let Some(token) = token.as_deref() {
+                    tokio::select! {
+                        () = &mut shutdown => break,
+                        result = client.poll_control(token, node_id, &control) => {
+                            if let Err(error) = result { warn!(%error, "monitoring control unavailable; retaining current state"); }
+                        }
+                    }
+                }
+            }
+            _ = interval.tick(), if !control.paused => {
                 // Cancelling this future leaves the outbox intact and closes in-flight HTTP requests.
                 tokio::select! {
                     () = &mut shutdown => break,
-                    result = collect_and_send(&mut collector, &client, &store, &mut token, node_id) => {
+                    result = collect_and_send(collector.as_mut().expect("active collector"), &client, &store, &mut token, node_id, &control) => {
                         if let Err(error) = result {
                             warn!(%error, "metrics remain buffered for a later retry");
                         }
                     }
                 }
             }
-            _ = live_interval.tick(), if token.is_some() => {
+            _ = live_interval.tick(), if token.is_some() && !control.paused => {
                 let report = AgentLiveReport {
                     protocol_version: PROTOCOL_VERSION,
                     node_id,
-                    metrics: collector.collect_fast(),
+                    metrics: PlatformCollector::collect_fast(collector.as_mut().expect("active collector")),
                 };
                 if let Some(agent_token) = token.as_deref() {
                     let result = client.report_live(agent_token, &report).await;
@@ -112,6 +185,9 @@ pub(crate) async fn run() -> Result<()> {
 async fn flush_outbox(client: &ServerClient, store: &Store, token: &str) -> Result<()> {
     // Bound catch-up work so an old backlog cannot starve fresh sampling or shutdown.
     for _ in 0..8 {
+        if client.agent_control().is_some_and(|control| control.paused) {
+            break;
+        }
         let Some((id, report)) = store.oldest().await? else {
             break;
         };
@@ -126,14 +202,18 @@ async fn collect_and_send(
     store: &Store,
     token: &mut Option<String>,
     node_id: Uuid,
+    control: &AgentControl,
 ) -> Result<()> {
     let inventory = collector.inventory()?;
+    let mut metrics = collector.collect().await;
+    metrics.network_activity = Some(easymanage_runtime::network::snapshot(true));
+    metrics.agent_control = Some(control.clone());
     let report = AgentReport {
         protocol_version: PROTOCOL_VERSION,
         node_id,
         agent_version: AGENT_VERSION.to_owned(),
         inventory: inventory.clone(),
-        metrics: collector.collect().await,
+        metrics,
     };
     let latest_id = store.enqueue(&report).await?;
     if token.is_none() {

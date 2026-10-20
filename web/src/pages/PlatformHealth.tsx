@@ -4,6 +4,7 @@ import { PageHeading } from "../components/PageHeading";
 import { formatBytes, formatDate, formatRate } from "../lib/format";
 import type { PlatformProcessMetric } from "../types/monitoring";
 import { CollectionSettings } from "../components/CollectionSettings";
+import { NetworkResources } from "../components/NetworkResources";
 
 function ProcessCells({ usage }: { usage?: PlatformProcessMetric | null }) {
   return <>
@@ -84,7 +85,8 @@ export function PlatformHealth() {
     return () => { controller.abort(); window.clearInterval(timer); };
   }, []);
   return <>
-    <PageHeading eyebrow="Control plane" title="平台" description="平台状态、节点链路、自身性能与采集设置；主机安全状态请见 Security">
+    <PageHeading eyebrow="Control plane" title="平台" description="平台状态、节点链路、自身性能、网络资源与采集设置；主机安全状态请见 Security">
+      <button type="button" className="button button--secondary button--small" onClick={() => document.getElementById("platform-network-resources")?.scrollIntoView({ block: "start" })}>网络资源</button>
       <button type="button" className="button button--secondary button--small" onClick={() => document.getElementById("platform-collection-settings")?.scrollIntoView({ block: "start" })}>采集设置</button>
     </PageHeading>
     <section className="page-content">
@@ -129,6 +131,7 @@ export function PlatformHealth() {
           </tbody></table></div>
         </details>
       </article>
+      <NetworkResources />
       <CollectionSettings />
     </section>
   </>;

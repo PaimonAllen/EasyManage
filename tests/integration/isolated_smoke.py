@@ -173,6 +173,20 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     require(status == 200 and "isolated-smoke-dashboard" in dashboard, "dashboard static content without login token")
     status, nodes = request("/api/v1/nodes")
     require(status == 200 and nodes["nodes"] == [], "node listing without dashboard authentication")
+    network_before=request('/api/v1/platform-network')[1]
+    assert network_before['agents']==[] and network_before['agents_available']
+    browser_before=next(g for g in network_before['server']['groups'] if g['group']=='http_browser')
+    sentinel={'host':'invalid-address','port':22,'fixture':'NETWORK_CONTENT_MUST_NOT_BE_RETAINED'}
+    require(request('/api/v1/machines/probe',sentinel,{'Origin':base_url})[0]==422,'network fixture request rejected without acting on a target')
+    network_after=request('/api/v1/platform-network')[1]
+    browser_after=next(g for g in network_after['server']['groups'] if g['group']=='http_browser')
+    require(browser_after['received_bytes']-browser_before['received_bytes']==len(json.dumps(sentinel).encode())
+            and browser_after['started']>=browser_before['started']+2 and browser_after['failed']>browser_before['failed']
+            and browser_after['submitted_bytes']>browser_before['submitted_bytes'],
+            'HTTP middleware streams and counts exact consumed request bytes, response bytes and failures')
+    require('NETWORK_CONTENT_MUST_NOT_BE_RETAINED' not in json.dumps(network_after)
+            and all(set(g)=={'group','started','completed','failed','in_flight','open_connections','received_bytes','submitted_bytes'} for g in network_after['server']['groups']),
+            'network endpoint contains only fixed categories and counters, never payloads or credentials')
     inventory = {
         "hostname": "isolated-smoke-node", "os_name": "Smoke Linux", "os_version": "1",
         "kernel_version": "synthetic", "architecture": "x86_64", "cpu_model": "Synthetic CPU",
@@ -376,6 +390,11 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     require(request(f"/api/v1/nodes/{node_id}/agent/restart", {},
                     {"Origin": "https://cross-origin.invalid"})[0] == 403,
             "cross-origin Agent restart is rejected before SSH")
+    require(request(f"/api/v1/nodes/{node_id}/admin-credentials", {"username":"smoke","password":"fixture-secret-not-for-response"},
+                    {"Origin":"https://cross-origin.invalid"})[0] == 403,
+            "cross-origin administrator credential storage is rejected before SSH or vault writes")
+    require(request(f"/api/v1/nodes/{node_id}/admin-credentials")[1] == {"available":False},
+            "administrator credential status exposes only authorization availability, never passwords or keys")
     require(request("/api/v1/platform/update", {"username":"smoke","password":"fixture-only","candidate_sha256":"a"*64},
                     {"Origin":"https://cross-origin.invalid"})[0] == 403,
             "cross-origin platform update is rejected before SSH or installation")
@@ -494,11 +513,165 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     require(request("/api/v1/collection-settings")[1]["policy"] == saved["policy"], "saved settings are shared across browsers")
     require(request("/api/v1/collection-settings", original | {"revision": saved["policy"]["revision"]}, origin)[0] == 200,
             "original collection intervals can be safely restored")
+    path=f"/api/v1/nodes/{node_id}/user-collection"
+    change={"enabled":False,"expected_enabled":True}
+    require(request(path,change,{"Origin":"https://other.invalid"})[0]==403,
+            "cross-origin user collection changes are rejected")
+    require(request(f"/api/v1/nodes/{uuid.uuid4()}/user-collection",change,origin)[0]==404,
+            "user collection settings cannot create phantom machines")
+    require(request(path,change|{"enabled":"false"},origin)[0]==422,
+            "user collection switches require real boolean values")
+    require(request(path,change,origin)[0]==200 and request(path,change,origin)[0]==409,
+            "per-node user collection changes persist and reject stale pages")
+    current=request('/api/v1/collection-settings')[1]
+    require(next(a for a in current['agents'] if a['node_id']==node_id)['users_enabled'] is False,
+            "per-node switches are shared across browsers independently of global intervals")
+    require(request('/api/v1/collection-settings',current['policy']|{'users_enabled':False},origin)[0]==400,
+            "global interval settings cannot override per-node user switches")
+    token_header={"x-easymanage-agent-token":rotated['agent_token']}
+    require('users_enabled' not in request('/api/v1/agent/report',report,token_header)[1]['collection_policy'],
+            "legacy Agents receive their original policy shape even when user collection is disabled")
+    capable=report|{'metrics':report['metrics']|{'collection_policy':current['policy']|{'users_enabled':True}}}
+    require(request('/api/v1/agent/report',capable,token_header)[1]['collection_policy']['users_enabled'] is False,
+            "capable Agents receive the node-specific disabled switch in authenticated report responses")
+    permission_path=f'/api/v1/nodes/{node_id}/permission-collection'
+    require(request(permission_path,change,{'Origin':'https://other.invalid'})[0]==403
+            and request(permission_path,change|{'enabled':'false'},origin)[0]==422,
+            'permission collection requires same origin and a real boolean')
+    require(request(f'/api/v1/nodes/{uuid.uuid4()}/permission-collection',change,origin)[0]==404,
+            'permission collection cannot create phantom nodes')
+    fresh=json.loads(json.dumps(review_report))
+    fresh_at=datetime.now(timezone.utc)+timedelta(seconds=1)
+    fresh['metrics']['collected_at']=fresh_at.isoformat()
+    fresh['metrics']['permission_audit']['collected_at']=datetime.now(timezone.utc).isoformat()
+    fresh['metrics']['collection_policy']=current['policy']|{'users_enabled':True,'permissions_enabled':True}
+    require(request('/api/v1/agent/report',fresh,token_header)[0]==200
+            and request(review_path,mark,origin)[0]==200,'fresh permission evidence can be reviewed before pausing')
+    require(request(permission_path,change,origin)[0]==200 and request(permission_path,change,origin)[0]==409,
+            'permission switches persist and reject stale pages')
+    settings=request('/api/v1/collection-settings')[1]
+    own=next(a for a in settings['agents'] if a['node_id']==node_id)
+    require(own['permissions_enabled'] is False and own['users_enabled'] is False,
+            'permission and user switches remain independent')
+    require(request('/api/v1/collection-settings',settings['policy']|{'permissions_enabled':False},origin)[0]==400,
+            'global intervals cannot overwrite per-node permission switches')
+    require('permissions_enabled' not in request('/api/v1/agent/report',capable,token_header)[1]['collection_policy'],
+            'user-switch-only Agents do not receive unsupported permission policy fields')
+    paused=json.loads(json.dumps(fresh))
+    paused['metrics']['collected_at']=(fresh_at+timedelta(seconds=1)).isoformat()
+    paused['metrics']['permission_audit']=None
+    paused['metrics']['collection_policy']['permissions_enabled']=False
+    response=request('/api/v1/agent/report',paused,token_header)
+    require(response[0]==200 and response[1]['collection_policy']['permissions_enabled'] is False
+            and len(request('/api/v1/permission-reviews')[1]['reviews'])==1,
+            'paused permission reports preserve dormant manual reviews without inventing new evidence')
+    require(request(review_path,mark,origin)[0]==409,'paused snapshots cannot receive new manual OK marks')
+    require(request(permission_path,{'enabled':True,'expected_enabled':False},origin)[0]==200,
+            'permission collection can be re-enabled independently')
+    fresh['metrics']['collected_at']=(fresh_at+timedelta(seconds=2)).isoformat()
+    fresh['metrics']['permission_audit']['checks'][0]['observed']='changed after pause'
+    require(request('/api/v1/agent/report',fresh,token_header)[0]==200
+            and request('/api/v1/permission-reviews')[1]['reviews']==[],
+            'fresh changed evidence after resume invalidates the previous manual OK')
+    require(request(permission_path,change,origin)[0]==200,'permission switch restored to disabled for persistence tests')
+    proxy_path=f'/api/v1/nodes/{node_id}/proxy-collection'
+    require(request(proxy_path,change,{'Origin':'https://other.invalid'})[0]==403
+            and request(proxy_path,change|{'enabled':'false'},origin)[0]==422,
+            'proxy collection switches require same origin and a real boolean')
+    require(request(f'/api/v1/nodes/{uuid.uuid4()}/proxy-collection',change,origin)[0]==404,
+            'proxy collection switch cannot create phantom nodes')
+    require(request(proxy_path,change,origin)[0]==200 and request(proxy_path,change,origin)[0]==409,
+            'per-node proxy switch persists and rejects stale browser writes')
+    settings=request('/api/v1/collection-settings')[1]
+    own=next(a for a in settings['agents'] if a['node_id']==node_id)
+    require(own['proxy_enabled'] is False and own['users_enabled'] is False and own['permissions_enabled'] is False,
+            'proxy control does not overwrite independent user or permission switches')
+    require(request('/api/v1/collection-settings',settings['policy']|{'proxy_enabled':False},origin)[0]==400,
+            'global policy cannot override per-machine proxy switches')
+    require('proxy_enabled' not in request('/api/v1/agent/report',fresh,token_header)[1]['collection_policy'],
+            'previous Agents never receive unsupported proxy fields in strict collection policies')
+    proxy_capable=report|{'metrics':report['metrics']|{'collection_policy':settings['policy']|{'proxy_enabled':True}}}
+    require(request('/api/v1/agent/report',proxy_capable,token_header)[1]['collection_policy']['proxy_enabled'] is False,
+            'new Agent reports advertise proxy capability and receive their node-specific setting')
+    pause_path=f'/api/v1/machines/{node_id}/monitoring'
+    pause={'confirmation':node_id,'paused':True,'expected_revision':0}
+    require(request(pause_path,pause,{'Origin':'https://other.invalid'})[0]==403
+            and request(pause_path,pause|{'confirmation':str(uuid.uuid4())},origin)[0]==400,
+            'monitoring pause requires same origin and the exact existing node ID')
+    require(request(f'/api/v1/machines/{uuid.uuid4()}/monitoring',pause,origin)[0]==400
+            and request(pause_path,pause|{'paused':'true'},origin)[0]==422,
+            'monitoring controls reject mismatched identities and non-boolean intent')
+    require(request(pause_path,pause,origin)[0]==200 and request(pause_path,pause,origin)[0]==409,
+            'monitoring pause is revisioned and rejects stale browser writes')
+    managed=next(m for m in request('/api/v1/machines')[1]['machines'] if m['node_id']==node_id)
+    require(managed['monitoring_paused'] and not managed['monitoring_supported']
+            and managed['monitoring_applied_revision'] is None and not managed['redeploy_available'],
+            'legacy Agent pause stays pending, never falsely confirmed or offered redeployment')
+    control={'node_id':node_id,'applied':{'revision':0,'paused':False}}
+    require(request('/api/v1/agent/control',control)[0]==401
+            and request('/api/v1/agent/control',control,{'x-easymanage-agent-token':'invalid'})[0]==401,
+            'lightweight control requires the original authenticated Agent identity')
+    require(request('/api/v1/agent/control',control,token_header)[1]['control']=={'revision':1,'paused':True},
+            'authenticated lightweight control receives saved pause intent without a metrics sample')
+    acknowledged=control|{'applied':{'revision':1,'paused':True}}
+    require(request('/api/v1/agent/control',acknowledged,token_header)[0]==200,
+            'Agent can acknowledge pause without sending fabricated metrics')
+    require('proxy_enabled' not in request('/api/v1/agent/control',acknowledged,token_header)[1]['collection_policy']
+            and request('/api/v1/agent/control',acknowledged|{'supports_proxy_collection':True},token_header)[1]['collection_policy']['proxy_enabled'] is False,
+            'paused control polls negotiate proxy support without breaking previous Agent versions')
+    unknown=str(uuid.uuid4())
+    require(request(f'/api/v1/machines/{unknown}/monitoring',pause|{'confirmation':unknown},origin)[0]==404,
+            'monitoring pause cannot create nonexistent machines')
+    require('agent_control' not in request('/api/v1/agent/report',report,token_header)[1],
+            'legacy report responses do not acquire unsupported monitoring control fields')
+    legacy_id=str(uuid.uuid4())
+    _,legacy_identity=request('/api/v1/agent/enroll',enrollment|{'requested_node_id':legacy_id},
+        {'x-easymanage-enrollment-token':enrollment_token})
+    legacy_header={'x-easymanage-agent-token':legacy_identity['agent_token']}
+    legacy_report=report|{'node_id':legacy_id,'metrics':report['metrics']|{'collected_at':datetime.now(timezone.utc).isoformat()}}
+    require(request('/api/v1/agent/report',legacy_report,legacy_header)[0]==200,
+            'legacy resume fixture has a real authenticated report without control capability')
+    legacy_path=f'/api/v1/machines/{legacy_id}/monitoring'
+    request(legacy_path,{'confirmation':legacy_id,'paused':True,'expected_revision':0},origin)
+    require(not next(n for n in request('/api/v1/nodes')[1]['nodes'] if n['id']==legacy_id)['online'],
+            'legacy Agent remains hidden while monitoring pause is requested')
+    request(legacy_path,{'confirmation':legacy_id,'paused':False,'expected_revision':1},origin)
+    legacy_report['metrics']['collected_at']=datetime.now(timezone.utc).isoformat()
+    request('/api/v1/agent/report',legacy_report,legacy_header)
+    legacy_node=next(n for n in request('/api/v1/nodes')[1]['nodes'] if n['id']==legacy_id)
+    require(legacy_node['online'] and legacy_node['monitoring_applied_revision'] is None,
+            'resumed legacy Agent uses real fresh heartbeats without fabricating a control acknowledgement')
+    legacy_live=live|{'node_id':legacy_id}
+    legacy_live['metrics']=live['metrics']|{'collected_at':datetime.now(timezone.utc).isoformat()}
+    require(request('/api/v1/agent/live',legacy_live,legacy_header)[0]==204
+            and any(n['node_id']==legacy_id for n in request('/api/v1/nodes/live')[1]['nodes']),
+            'resumed legacy Agent live metrics are visible without unsupported control fields')
+    resume_id=str(uuid.uuid4())
+    _,resume_identity=request('/api/v1/agent/enroll',enrollment|{'requested_node_id':resume_id},
+        {'x-easymanage-enrollment-token':enrollment_token})
+    resume_header={'x-easymanage-agent-token':resume_identity['agent_token']}
+    current_report=report|{'node_id':resume_id,'metrics':report['metrics']|{
+        'collected_at':datetime.now(timezone.utc).isoformat(),'agent_control':{'revision':0,'paused':False}}}
+    require(request('/api/v1/agent/report',current_report,resume_header)[0]==200,
+            'capable monitoring Agent initially reports under its own identity')
+    resume_path=f'/api/v1/machines/{resume_id}/monitoring'
+    request(resume_path,{'confirmation':resume_id,'paused':True,'expected_revision':0},origin)
+    request('/api/v1/agent/control',{'node_id':resume_id,'applied':{'revision':1,'paused':True}},resume_header)
+    request(resume_path,{'confirmation':resume_id,'paused':False,'expected_revision':1},origin)
+    request('/api/v1/agent/control',{'node_id':resume_id,'applied':{'revision':2,'paused':False}},resume_header)
+    resume_node=next(n for n in request('/api/v1/nodes')[1]['nodes'] if n['id']==resume_id)
+    require(not resume_node['online'] and resume_node['monitoring_applied_revision']==2,
+            'resume acknowledgement alone does not turn old metrics into a new online heartbeat')
+    current_report['metrics']['agent_control']={'revision':2,'paused':False}
+    current_report['metrics']['collected_at']=datetime.now(timezone.utc).isoformat()
+    require(request('/api/v1/agent/report',current_report,resume_header)[0]==200
+            and next(n for n in request('/api/v1/nodes')[1]['nodes'] if n['id']==resume_id)['online'],
+            'resumed monitoring is online only after a fresh report with the applied revision')
 
 
 def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollment_token):
     """Exercise the real collector only inside the guarded private namespaces."""
-    agent = None
+    agent = proxy = None
     agent_root = root / "real-agent"
     agent_root.mkdir(mode=0o700)
     agent_log = (agent_root / "agent.log").open("w+")
@@ -549,10 +722,20 @@ def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollme
 
     before = {node["id"] for node in listing()}
     try:
+        # Named synthetic proxy: private loopback only, never real proxy traffic.
+        marker=agent_root/'proxy-ready'
+        proxy_script="import ctypes,socket,time,sys;from pathlib import Path;ctypes.CDLL(None).prctl(15,b'mihomo',0,0,0);s=socket.socket();s.bind(('127.0.0.1',0));s.listen();Path(sys.argv[1]).write_text('ready');time.sleep(600)"
+        proxy=subprocess.Popen(['/usr/bin/python3','-c',proxy_script,str(marker)],env=environment,
+            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        deadline=time.monotonic()+5
+        while not marker.exists() and time.monotonic()<deadline:time.sleep(.05)
+        require(marker.exists() and proxy.poll() is None,'synthetic proxy listens only inside the isolated loopback namespace')
         started = datetime.now(timezone.utc)
         agent = subprocess.Popen([str(binary.resolve())], cwd=agent_root, env=env, stdout=agent_log, stderr=subprocess.STDOUT)
         node = wait_for_heartbeat(started)
         metrics = node["metrics"]
+        require(any(p['pid']==proxy.pid and p['name']=='mihomo' and p['listen_addresses'] for p in metrics['proxy_services']),
+                'enabled proxy monitoring sees a real synthetic proxy process and its private listening socket')
         status_fields = dict(line.split(":", 1) for line in Path(f"/proc/{agent.pid}/status").read_text().splitlines() if ":" in line)
         threads = int(status_fields["Threads"].strip())
         require(threads <= 12, f"real Agent keeps a small runtime thread count ({threads}), independent of host CPU cores")
@@ -626,7 +809,7 @@ def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollme
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             applied = next((node for node in listing() if node["id"] == node_id), None)
-            if applied and applied["metrics"].get("collection_policy") == expected_policy:
+            if applied and applied["metrics"].get("collection_policy") == expected_policy | {"users_enabled": True,"permissions_enabled":True,"proxy_enabled":True}:
                 break
             time.sleep(0.2)
         else:
@@ -648,6 +831,74 @@ def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollme
                 and newer["metrics"]["inventory_collected_at"] == applied["metrics"]["inventory_collected_at"]
                 and newer["metrics"]["platform_storage"]["collected_at"] == applied["metrics"]["platform_storage"]["collected_at"],
                 "slow probes retain real sampling timestamps instead of inventing fresh samples")
+        activity=newer['metrics'].get('network_activity')
+        groups={g['group']:g for g in (activity or {}).get('groups',[])}
+        require(activity and activity['process_id']==agent.pid and set(groups)=={'agent_enroll','agent_report','agent_live','agent_control'}
+                and groups['agent_report']['started']>0 and groups['agent_live']['started']>0
+                and groups['agent_report']['submitted_bytes']>0 and groups['agent_report']['received_bytes']>0,
+                'real Agent reports only its own counted HTTP attempts and payload budget, not host NIC traffic')
+        with opener.open(base_url+'/api/v1/platform-network',timeout=3) as response:
+            network=json.load(response)
+        require(next(a for a in network['agents'] if a['node_id']==node_id)['activity']==activity,
+                'platform network view exposes the latest authenticated Agent counters')
+        def switch_users(enabled, expected):
+            query=urllib.request.Request(base_url+f'/api/v1/nodes/{node_id}/user-collection',
+                data=json.dumps({'enabled':enabled,'expected_enabled':expected}).encode(),
+                headers={'Content-Type':'application/json','Origin':base_url})
+            with opener.open(query,timeout=3) as response:
+                require(json.load(response)['enabled'] is enabled,'per-node switch saved through real HTTPS')
+        def wait_for_user_switch(enabled):
+            deadline=time.monotonic()+35
+            while time.monotonic()<deadline:
+                observed=next((n for n in listing() if n['id']==node_id),None)
+                if observed and observed['metrics'].get('collection_policy',{}).get('users_enabled') is enabled:
+                    if not enabled or observed['metrics']['users']:
+                        return observed
+                time.sleep(.2)
+            raise AssertionError('Agent did not acknowledge the user collection switch')
+        switch_users(False,True)
+        disabled=wait_for_user_switch(False)
+        require(disabled['metrics']['users']==[] and disabled['metrics']['permission_audit']
+                and disabled['metrics']['privilege']['mode']=='basic' and agent.pid==pid_before,
+                'running Agent stops user reports without stopping permissions, metrics or changing privileges')
+        def switch_permissions(enabled,expected):
+            query=urllib.request.Request(base_url+f'/api/v1/nodes/{node_id}/permission-collection',
+                data=json.dumps({'enabled':enabled,'expected_enabled':expected}).encode(),
+                headers={'Content-Type':'application/json','Origin':base_url})
+            with opener.open(query,timeout=3) as response:
+                require(json.load(response)['enabled'] is enabled,'permission collection switch saved through real HTTPS')
+        def wait_for_permission_switch(enabled):
+            deadline=time.monotonic()+35
+            while time.monotonic()<deadline:
+                observed=next((n for n in listing() if n['id']==node_id),None)
+                if observed and observed['metrics'].get('collection_policy',{}).get('permissions_enabled') is enabled:
+                    if not enabled or observed['metrics'].get('permission_audit'):
+                        return observed
+                time.sleep(.2)
+            raise AssertionError('Agent did not acknowledge the permission collection switch')
+        switch_permissions(False,True)
+        paused=wait_for_permission_switch(False)
+        require(paused['metrics']['permission_audit'] is None and agent.pid==pid_before and agent.poll() is None,
+                'real Agent stops permission collection without restart or stopping ordinary metrics')
+        def switch_proxy(enabled,expected):
+            query=urllib.request.Request(base_url+f'/api/v1/nodes/{node_id}/proxy-collection',
+                data=json.dumps({'enabled':enabled,'expected_enabled':expected}).encode(),
+                headers={'Content-Type':'application/json','Origin':base_url})
+            with opener.open(query,timeout=3) as response:require(json.load(response)['enabled'] is enabled,'proxy switch saved over HTTPS')
+        def wait_for_proxy_switch(enabled):
+            deadline=time.monotonic()+35
+            while time.monotonic()<deadline:
+                observed=next(n for n in listing() if n['id']==node_id)
+                if observed['metrics'].get('collection_policy',{}).get('proxy_enabled') is enabled:
+                    if not enabled or any(p['pid']==proxy.pid for p in observed['metrics']['proxy_services']):return observed
+                time.sleep(.2)
+            raise AssertionError('Agent did not apply proxy collection switch')
+        switch_proxy(False,True)
+        proxy_disabled=wait_for_proxy_switch(False)
+        require(proxy_disabled['metrics']['proxy_services']==[] and proxy.poll() is None and agent.pid==pid_before
+                and proxy_disabled['metrics']['ai_tools'] and proxy_disabled['metrics']['collection_policy']['users_enabled'] is False
+                and proxy_disabled['metrics']['collection_policy']['permissions_enabled'] is False,
+                'proxy switch stops observations but not the actual proxy, other tools, metrics or Agent process')
         graceful_shutdown()
         first_identity = persisted_identity()
         require(first_identity.get("node_id") == node_id and bool(first_identity.get("agent_token"))
@@ -655,9 +906,89 @@ def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollme
         started = datetime.now(timezone.utc)
         agent = subprocess.Popen([str(binary.resolve())], cwd=agent_root, env=env, stdout=agent_log, stderr=subprocess.STDOUT)
         restarted = wait_for_heartbeat(started)
+        require(restarted['metrics']['network_activity']['process_id']==agent.pid
+                and restarted['metrics']['network_activity']['started_at']>activity['started_at'],
+                'Agent process restart begins a new network counter scope instead of inventing continuous totals')
+        require(restarted['metrics']['collection_policy']['users_enabled'] is False and restarted['metrics']['users']==[],
+                'disabled user collection persists before the first sample after an Agent restart')
+        require(restarted['metrics']['collection_policy']['permissions_enabled'] is False and restarted['metrics']['permission_audit'] is None,
+                'disabled permission collection persists before the first check after an Agent restart')
+        require(restarted['metrics']['collection_policy']['proxy_enabled'] is False and restarted['metrics']['proxy_services']==[] and proxy.poll() is None,
+                'disabled proxy collection persists before startup scanning while the actual proxy continues running')
         require(restarted["metrics"]["hardware_details"] == hardware,
                 "daily hardware cache survives Agent restart without changing the sample timestamp")
         require({node["id"] for node in listing()} == before | {node_id}, "restarting the Agent never creates a duplicate node")
+        switch_proxy(True,False)
+        proxy_enabled=wait_for_proxy_switch(True)
+        require(proxy_enabled['metrics']['inventory_collected_at']>proxy_disabled['metrics']['inventory_collected_at']
+                and proxy_enabled['metrics']['collection_policy']['users_enabled'] is False
+                and proxy_enabled['metrics']['collection_policy']['permissions_enabled'] is False,
+                'proxy re-enable collects a fresh listener snapshot without enabling user or permission scans')
+        switch_users(True,False)
+        enabled=wait_for_user_switch(True)
+        require(bool(enabled['metrics']['users']) and enabled['metrics']['inventory_collected_at']>disabled['metrics']['inventory_collected_at'],
+                're-enabling user collection obtains a new inventory instead of replaying old status')
+        require(enabled['metrics']['permission_audit'] is None,'re-enabling users does not restart permission checks')
+        switch_permissions(True,False)
+        resumed=wait_for_permission_switch(True)
+        require(resumed['metrics']['permission_audit']['collected_at']>disabled['metrics']['permission_audit']['collected_at']
+                and resumed['metrics']['users'],
+                're-enabling permission collection makes a fresh audit without disabling users')
+        def monitoring_request(path, payload=None):
+            query=urllib.request.Request(base_url+path, data=None if payload is None else json.dumps(payload).encode(),
+                headers={'Content-Type':'application/json','Origin':base_url})
+            with opener.open(query,timeout=4) as response:return json.load(response)
+        def managed():
+            return next(m for m in monitoring_request('/api/v1/machines')['machines'] if m['node_id']==node_id)
+        monitoring_path=f'/api/v1/machines/{node_id}/monitoring'
+        monitoring_request(monitoring_path,{'confirmation':node_id,'paused':True,'expected_revision':0})
+        deadline=time.monotonic()+20
+        while time.monotonic()<deadline:
+            paused_machine=managed()
+            if paused_machine['monitoring_applied_revision']==1:break
+            time.sleep(.2)
+        else:raise AssertionError('Real Agent did not acknowledge monitoring pause')
+        frozen=next(n for n in listing() if n['id']==node_id)
+        require(frozen['monitoring_paused'] and not frozen['online'] and agent.poll() is None
+                and not any(n['node_id']==node_id for n in live_listing()),
+                'paused Agent remains alive with unchanged identity but is not shown as online/live monitoring')
+        with sqlite3.connect('file:'+str(state)+'?mode=ro',uri=True) as db:
+            queued_before=db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0]
+        time.sleep(12)
+        require(next(n for n in listing() if n['id']==node_id)['metrics']==frozen['metrics'],
+                'pause stops all full metrics, slow scans and reported samples instead of inventing zeros')
+        graceful_shutdown()
+        identity_before_pause_restart=persisted_identity()
+        agent=subprocess.Popen([str(binary.resolve())],cwd=agent_root,env=env,stdout=agent_log,stderr=subprocess.STDOUT)
+        time.sleep(8)
+        with sqlite3.connect('file:'+str(state)+'?mode=ro',uri=True) as db:
+            queued_after=db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0]
+        require(agent.poll() is None and next(n for n in listing() if n['id']==node_id)['metrics']==frozen['metrics']
+                and queued_after==queued_before and persisted_identity()==identity_before_pause_restart,
+                'persisted pause survives Agent restart before collector initialization, without new samples or outbox growth')
+        control_before=managed()['control_seen_at']
+        before_control_requests=next(g for g in monitoring_request('/api/v1/platform-network')['server']['groups'] if g['group']=='http_agent')['started']
+        deadline=time.monotonic()+65
+        while time.monotonic()<deadline:
+            if managed()['control_seen_at']!=control_before:break
+            time.sleep(.5)
+        else:raise AssertionError('Paused Agent did not make its minute control poll')
+        after_control_requests=next(g for g in monitoring_request('/api/v1/platform-network')['server']['groups'] if g['group']=='http_agent')['started']
+        still_paused=next(n for n in listing() if n['id']==node_id)
+        require(still_paused['metrics']==frozen['metrics'] and still_paused['last_seen']==frozen['last_seen']
+                and after_control_requests-before_control_requests==1,
+                'minute lightweight control does not refresh last_seen, metrics or history')
+        started=datetime.now(timezone.utc)
+        monitoring_request(monitoring_path,{'confirmation':node_id,'paused':False,'expected_revision':1})
+        deadline=time.monotonic()+70
+        while time.monotonic()<deadline:
+            observed=next(n for n in listing() if n['id']==node_id)
+            if observed['online'] and observed['metrics'].get('agent_control')=={'revision':2,'paused':False}:break
+            time.sleep(.5)
+        else:raise AssertionError('Agent did not resume at the next minute control poll')
+        require(parse_timestamp(observed['metrics']['collected_at'])>=started and persisted_identity()==identity_before_pause_restart
+                and observed['metrics']['privilege']==frozen['metrics']['privilege'] and agent.poll() is None,
+                'GUI resume obtains fresh real metrics using the same running Agent, identity, credential and privileges')
         graceful_shutdown()
         require(persisted_identity() == first_identity, "restarted Agent reuses the same node identity and credential")
     except Exception:
@@ -665,6 +996,7 @@ def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollme
         raise
     finally:
         stop_process(agent)
+        stop_process(proxy)
         agent_log.close()
 
 
@@ -760,7 +1092,7 @@ def smoke(args):
                                     if response.status==200:return
                             except OSError:time.sleep(0.1)
                         raise RuntimeError('Isolated controller restart failed')
-                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment)
+                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment, args.machine_admin_credentials)
                 with opener.open(base_url + "/api/v1/operations/targets", timeout=2) as response:
                     expected_target_count = len(json.load(response)["targets"])
                 # Reproduce PostgreSQL outage and restart the Server with DB down.
@@ -779,6 +1111,10 @@ def smoke(args):
                     raise RuntimeError("Recovery API was unavailable during database outage")
                 with opener.open(base_url + "/", timeout=2) as response:
                     require("isolated-smoke-dashboard" in response.read().decode(), "dashboard remains reachable during DB outage")
+                with opener.open(base_url+'/api/v1/platform-network',timeout=5) as response:
+                    offline_network=json.load(response)
+                    require(not offline_network['agents_available'] and offline_network['server']['process_id']==server.pid,
+                            'local platform network counters remain available during database outage without fake Agent zeros')
                 with opener.open(base_url + "/api/v1/operations/targets", timeout=2) as response:
                     require(len(json.load(response)["targets"]) == expected_target_count, "trusted targets remain available without PostgreSQL")
                 try:
@@ -815,13 +1151,25 @@ def smoke(args):
                 while time.monotonic() < deadline:
                     try:
                         with opener.open(base_url + "/api/v1/collection-settings", timeout=1) as response:
-                            after_restart = json.load(response)["policy"]
+                            restored_settings = json.load(response)
+                            after_restart = restored_settings["policy"]
                         break
                     except (OSError, urllib.error.URLError):
                         time.sleep(0.1)
                 else:
                     raise AssertionError("Restarted isolated platform did not become ready")
                 require(after_restart == before_restart, "collection settings survive a real isolated platform restart")
+                require(next(a for a in restored_settings['agents'] if a['node_id']==node_id)['users_enabled'] is False,
+                        'per-node user collection switches survive database recovery and a platform restart')
+                require(next(a for a in restored_settings['agents'] if a['node_id']==node_id)['permissions_enabled'] is False,
+                        'per-node permission switches survive database recovery and a platform restart')
+                require(next(a for a in restored_settings['agents'] if a['node_id']==node_id)['proxy_enabled'] is False,
+                        'per-node proxy switches survive database recovery and platform restart')
+                with opener.open(base_url+'/api/v1/machines',timeout=3) as response:
+                    persisted_pause=next(m for m in json.load(response)['machines'] if m['node_id']==node_id)
+                require(persisted_pause['monitoring_paused'] and persisted_pause['monitoring_revision']==1
+                        and persisted_pause['monitoring_applied_revision']==1,
+                        'monitoring pause and its acknowledgement survive database recovery and platform restart')
                 print("PASS isolated integration smoke completed; synthetic fixtures and optional private-namespace collection only", flush=True)
             except Exception:
                 log.flush()
@@ -841,8 +1189,9 @@ if __name__ == "__main__":
     parser.add_argument("--agent-binary", type=Path)
     parser.add_argument("--machine-onboarding", action="store_true", help="Opt-in SSH/SCP fixture with mocked systemd and a real installed Agent; temporary Paramiko venv required")
     parser.add_argument("--machine-redeployment",action="store_true",help="Add real same-UUID uninstalled Agent redeployment coverage; skips the separate three-minute retry-exhaustion scenario")
+    parser.add_argument("--machine-admin-credentials",action="store_true",help="Focused real SSH administrator password/key vault and saved-credential operations regression")
     parser.add_argument("--host-netns", required=True)
     parser.add_argument("--host-mntns", required=True)
     args=parser.parse_args()
-    if args.machine_redeployment:args.machine_onboarding=True
+    if args.machine_redeployment or args.machine_admin_credentials:args.machine_onboarding=True
     smoke(args)

@@ -40,7 +40,7 @@ pub fn initialize(pool: PgPool, settings: crate::collection_settings::Collection
 pub async fn guard(State(ready): State<Initialized>, request: Request, next: Next) -> Response {
     let path = request.uri().path();
     let recovery = !path.starts_with("/api/") || matches!(path,
-        "/api/v1/health/live" | "/api/v1/platform" | "/api/v1/operations/targets" |
+        "/api/v1/health/live" | "/api/v1/platform" | "/api/v1/platform-network" | "/api/v1/operations/targets" |
         "/api/v1/operations/recovery" | "/api/v1/platform/force-restart")
         || (path.starts_with("/api/v1/nodes/") && path.ends_with("/agent/force-restart"));
     if !ready.load(Ordering::Acquire) && !recovery {

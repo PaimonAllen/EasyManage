@@ -40,7 +40,7 @@ pub struct ExtendedInventory {
 }
 
 impl ExtendedInventory {
-    pub async fn collect() -> Self {
+    pub async fn collect(users_enabled: bool, proxy_enabled: bool) -> Self {
         let (
             accounts,
             sessions,
@@ -54,12 +54,25 @@ impl ExtendedInventory {
             overlay_networks,
         ) = tokio::join!(
             read_command("getent", &["passwd"], INVENTORY_LIMIT),
-            read_command("who", &[], 256 * 1024),
-            read_command(
-                "loginctl",
-                &["list-sessions", "--no-legend", "--no-pager"],
-                256 * 1024
-            ),
+            async {
+                if users_enabled {
+                    read_command("who", &[], 256 * 1024).await
+                } else {
+                    Ok(String::new())
+                }
+            },
+            async {
+                if users_enabled {
+                    read_command(
+                        "loginctl",
+                        &["list-sessions", "--no-legend", "--no-pager"],
+                        256 * 1024,
+                    )
+                    .await
+                } else {
+                    Ok(String::new())
+                }
+            },
             read_command("ip", &["-j", "-d", "address", "show"], INVENTORY_LIMIT),
             read_command(
                 "ip",
@@ -112,6 +125,8 @@ impl ExtendedInventory {
                 packages,
                 services,
                 block_devices,
+                users_enabled,
+                proxy_enabled,
             )
         })
         .await
@@ -151,6 +166,8 @@ impl ExtendedInventory {
         packages: io::Result<String>,
         services: io::Result<String>,
         block_devices: io::Result<String>,
+        users_enabled: bool,
+        proxy_enabled: bool,
     ) -> Self {
         let mut issues = Vec::new();
         let passwd = accounts.unwrap_or_else(|_| {
@@ -195,7 +212,7 @@ impl ExtendedInventory {
                 session_evidence: None,
                 process_count: None,
                 locked: None,
-                account_status: account_status(fields[6]),
+                account_status: users_enabled.then(|| account_status(fields[6])).flatten(),
             });
         }
         if passwd.lines().count() > 4096 {
@@ -205,7 +222,9 @@ impl ExtendedInventory {
                 "账户清单超过 4096 条上限，AI 安装目录扫描可能不完整",
             ));
         }
-        fill_groups(&mut users);
+        if users_enabled {
+            fill_groups(&mut users);
+        }
         let block_devices = match block_devices.and_then(|output| block_devices::parse(&output)) {
             Ok(devices) => devices,
             Err(_) => {
@@ -213,69 +232,85 @@ impl ExtendedInventory {
                 Vec::new()
             }
         };
-        let terminal_sessions = match sessions {
-            Ok(output) => Some(parse_terminal_sessions(&output)),
-            Err(_) => {
-                issues.push(issue("sessions", "utmp 会话不可读取"));
-                None
+        let terminal_sessions = if !users_enabled {
+            None
+        } else {
+            match sessions {
+                Ok(output) => Some(parse_terminal_sessions(&output)),
+                Err(_) => {
+                    issues.push(issue("sessions", "utmp 会话不可读取"));
+                    None
+                }
             }
         };
-        let system_sessions = match logind_sessions {
-            Ok(output) => parse_logind_sessions(&output).or_else(|| {
-                issues.push(issue("sessions", "logind 会话输出不可解析"));
-                None
-            }),
-            Err(_) => {
-                issues.push(issue("sessions", "logind 会话不可读取"));
-                None
+        let system_sessions = if !users_enabled {
+            None
+        } else {
+            match logind_sessions {
+                Ok(output) => parse_logind_sessions(&output).or_else(|| {
+                    issues.push(issue("sessions", "logind 会话输出不可解析"));
+                    None
+                }),
+                Err(_) => {
+                    issues.push(issue("sessions", "logind 会话不可读取"));
+                    None
+                }
             }
         };
         let privilege = current_privilege(&owners);
         let mut ai_processes = HashMap::new();
-        let (proxy_services, ssh_sessions, processes_complete) =
-            process_inventory(&mut users, &owners, &mut ai_processes, &mut issues);
-        for user in &mut users {
-            let terminal = terminal_sessions
-                .as_ref()
-                .and_then(|counts| counts.get(user.username.as_str()))
-                .copied()
-                .unwrap_or(0);
-            let system = system_sessions
-                .as_ref()
-                .and_then(|counts| counts.get(&user.uid))
-                .copied()
-                .unwrap_or(0);
-            let ssh = ssh_sessions.get(&user.uid).copied().unwrap_or(0);
-            user.session_evidence = Some(UserSessionEvidence {
-                terminal_records: terminal_sessions.as_ref().map(|_| terminal),
-                logind_sessions: system_sessions.as_ref().map(|_| system),
-                ssh_processes: processes_complete.then_some(ssh),
-            });
-            if terminal > 0 {
-                user.session_sources.push("terminal".to_owned());
+        let (proxy_services, ssh_sessions, processes_complete) = process_inventory(
+            &mut users,
+            &owners,
+            &mut ai_processes,
+            &mut issues,
+            users_enabled,
+            proxy_enabled,
+        );
+        if users_enabled {
+            for user in &mut users {
+                let terminal = terminal_sessions
+                    .as_ref()
+                    .and_then(|counts| counts.get(user.username.as_str()))
+                    .copied()
+                    .unwrap_or(0);
+                let system = system_sessions
+                    .as_ref()
+                    .and_then(|counts| counts.get(&user.uid))
+                    .copied()
+                    .unwrap_or(0);
+                let ssh = ssh_sessions.get(&user.uid).copied().unwrap_or(0);
+                user.session_evidence = Some(UserSessionEvidence {
+                    terminal_records: terminal_sessions.as_ref().map(|_| terminal),
+                    logind_sessions: system_sessions.as_ref().map(|_| system),
+                    ssh_processes: processes_complete.then_some(ssh),
+                });
+                if terminal > 0 {
+                    user.session_sources.push("terminal".to_owned());
+                }
+                if system > 0 {
+                    user.session_sources.push("logind".to_owned());
+                }
+                if ssh > 0 {
+                    user.session_sources.push("ssh".to_owned());
+                }
+                user.sessions = if terminal_sessions.is_some()
+                    || system_sessions.is_some()
+                    || processes_complete
+                    || ssh > 0
+                {
+                    // Sources overlap. An SSH process proves presence but is not a distinct
+                    // session count, so it contributes at most one here.
+                    Some(terminal.max(system).max(u32::from(ssh > 0)))
+                } else {
+                    None
+                };
             }
-            if system > 0 {
-                user.session_sources.push("logind".to_owned());
-            }
-            if ssh > 0 {
-                user.session_sources.push("ssh".to_owned());
-            }
-            user.sessions = if terminal_sessions.is_some()
-                || system_sessions.is_some()
-                || processes_complete
-                || ssh > 0
-            {
-                // Sources overlap. An SSH process proves presence but is not a distinct
-                // session count, so it contributes at most one here.
-                Some(terminal.max(system).max(u32::from(ssh > 0)))
-            } else {
-                None
-            };
-        }
-        issues.push(issue(
+            issues.push(issue(
             "users",
             "账户基础状态只核验登录 Shell；会话综合 utmp、logind 和 SSH 进程，不读取口令或 shadow",
         ));
+        }
         if privilege.mode == "basic" {
             issues.push(issue(
                 "privilege",
@@ -369,6 +404,21 @@ impl ExtendedInventory {
             programming_tools,
             issues,
         }
+    }
+
+    pub fn clear_user_status(&mut self) {
+        // Base account IDs/home paths remain inputs to the separate permission and
+        // tool checks. No groups, sessions, process counts or shell status are retained.
+        for user in &mut self.users {
+            user.groups.clear();
+            user.sessions = None;
+            user.session_sources.clear();
+            user.session_evidence = None;
+            user.process_count = None;
+            user.account_status = None;
+        }
+        self.issues
+            .retain(|item| !matches!(item.component.as_str(), "users" | "sessions"));
     }
 }
 
@@ -512,12 +562,20 @@ fn process_inventory(
     owners: &HashMap<u32, String>,
     ai_processes: &mut HashMap<&'static str, Vec<AiToolProcess>>,
     issues: &mut Vec<CollectionIssue>,
+    users_enabled: bool,
+    proxy_enabled: bool,
 ) -> (Vec<ProxyService>, HashMap<u32, u32>, bool) {
     let Ok(entries) = fs::read_dir("/proc") else {
         issues.push(issue("processes", "/proc 不可读取；进程和代理服务列表未知"));
         return (Vec::new(), HashMap::new(), false);
     };
-    let sockets = listening_sockets();
+    // Process enumeration is shared with users/Agent tools, but socket tables
+    // and per-proxy fd traversal are exclusively for proxy monitoring.
+    let sockets = if proxy_enabled {
+        listening_sockets()
+    } else {
+        HashMap::new()
+    };
     let mut counts = HashMap::<u32, u32>::new();
     let mut services = Vec::new();
     let mut partial = proc_hides_processes();
@@ -551,7 +609,9 @@ fn process_inventory(
         }) else {
             continue;
         };
-        *counts.entry(uid).or_default() += 1;
+        if users_enabled {
+            *counts.entry(uid).or_default() += 1;
+        }
         let name = match read_small(entry.path().join("comm"), 256) {
             Ok(name) => name.trim().to_owned(),
             Err(error) => {
@@ -559,11 +619,11 @@ fn process_inventory(
                 String::new()
             }
         };
-        if uid != 0 && matches!(name.as_str(), "sshd" | "sshd-session") {
+        if users_enabled && uid != 0 && matches!(name.as_str(), "sshd" | "sshd-session") {
             *ssh_sessions.entry(uid).or_default() += 1;
         }
         ai_partial |= record_ai_process(ai_processes, owners, &name, pid, uid);
-        if !is_proxy(&name) {
+        if !proxy_enabled || !is_proxy(&name) {
             continue;
         }
         if services.len() >= PROXY_LIMIT {
@@ -581,7 +641,7 @@ fn process_inventory(
         });
     }
     for user in users {
-        user.process_count = if partial {
+        user.process_count = if partial || !users_enabled {
             None
         } else {
             Some(*counts.get(&user.uid).unwrap_or(&0))
@@ -605,10 +665,12 @@ fn process_inventory(
             "部分代理服务的监听端口不可读取或达到 512 个文件描述符上限",
         ));
     }
-    issues.push(issue(
-        "proxy",
-        "仅识别可见进程名对应的代理服务及当前网络命名空间；不读取命令行、环境变量、代理配置或订阅",
-    ));
+    if proxy_enabled {
+        issues.push(issue(
+            "proxy",
+            "仅识别可见进程名对应的代理服务及当前网络命名空间；不读取命令行、环境变量、代理配置或订阅",
+        ));
+    }
     services.sort_by(|left, right| {
         (left.uid, &left.name, left.pid).cmp(&(right.uid, &right.name, right.pid))
     });
@@ -942,6 +1004,8 @@ mod tests {
             Ok(String::new()),
             Ok(String::new()),
             Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            true,
+            true,
         );
         fs::remove_file(&binary).unwrap();
         fs::remove_dir(&directory).unwrap();
@@ -961,6 +1025,71 @@ mod tests {
             inventory.privilege.uid, other_uid,
             "fixture must represent another account"
         );
+    }
+
+    #[test]
+    fn disabled_user_status_keeps_only_shared_account_inputs() {
+        let inventory = super::ExtendedInventory::from_sources(
+            Ok("root:x:0:0::/root:/bin/sh\nfixture:x:1000:1000::/home/fixture:/bin/sh".into()),
+            Ok("fixture pts/0 2026-01-01".into()),
+            Ok("3 1000 fixture - -".into()),
+            Ok("[]".into()),
+            Ok("[]".into()),
+            Ok("[]".into()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Err(std::io::ErrorKind::NotFound.into()),
+            false,
+            true,
+        );
+        assert!(
+            inventory
+                .users
+                .iter()
+                .any(|user| user.uid == 1000 && user.home == "/home/fixture")
+        );
+        for user in &inventory.users {
+            assert!(user.groups.is_empty() && user.session_sources.is_empty());
+            assert!(user.sessions.is_none() && user.session_evidence.is_none());
+            assert!(user.process_count.is_none() && user.account_status.is_none());
+        }
+        assert!(
+            !inventory
+                .issues
+                .iter()
+                .any(|item| matches!(item.component.as_str(), "users" | "sessions"))
+        );
+    }
+
+    #[test]
+    fn disabled_proxy_inventory_retains_other_inventory_without_proxy_notes() {
+        let inventory = super::ExtendedInventory::from_sources(
+            Ok("root:x:0:0::/root:/bin/sh\nfixture:x:1000:1000::/home/fixture:/bin/sh".into()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok("[]".into()),
+            Ok("[]".into()),
+            Ok("[]".into()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Err(std::io::ErrorKind::NotFound.into()),
+            true,
+            false,
+        );
+        assert!(inventory.proxy_services.is_empty());
+        assert!(
+            !inventory
+                .issues
+                .iter()
+                .any(|issue| issue.component == "proxy")
+        );
+        assert!(
+            inventory
+                .users
+                .iter()
+                .any(|user| user.username == "fixture")
+        );
+        assert!(!inventory.ai_tools.is_empty());
     }
 
     #[test]

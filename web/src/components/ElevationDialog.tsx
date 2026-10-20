@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { elevateNode } from "../api/client";
 import type { NodeSummary } from "../types/monitoring";
+import { AdminCredentialFields, useAdminCredentials } from "./AdminCredentials";
 
 export function ElevationDialog({
   node,
-  defaultUser,
   onClose,
   onSubmitted,
 }: {
@@ -14,8 +14,7 @@ export function ElevationDialog({
   onSubmitted: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
-  const [username, setUsername] = useState(defaultUser ?? "");
-  const [password, setPassword] = useState("");
+  const auth = useAdminCredentials([node.id]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [showOriginDetails, setShowOriginDetails] = useState(false);
@@ -46,13 +45,7 @@ export function ElevationDialog({
           setBusy(true);
           setError("");
           setShowOriginDetails(false);
-          const request = elevateNode(
-            node.id,
-            username.trim(),
-            password,
-            AbortSignal.timeout(90_000),
-          );
-          setPassword("");
+          const request = (async()=>elevateNode(node.id, await auth.prepare(), AbortSignal.timeout(90_000)))();
           void request
             .then((result) => {
               if (!active.current) return;
@@ -98,34 +91,9 @@ export function ElevationDialog({
           </div>
         ) : (
           <>
-            <label>
-              管理员用户名
-              <input
-                required
-                autoFocus
-                name="username"
-                autoComplete="off"
-                maxLength={128}
-                value={username}
-                onChange={(event) => setUsername(event.target.value)}
-                disabled={busy}
-              />
-            </label>
-            <label>
-              密码
-              <input
-                required
-                type="password"
-                maxLength={4096}
-                name="password"
-                autoComplete="off"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                disabled={busy}
-              />
-            </label>
+            <AdminCredentialFields auth={auth} disabled={busy} />
             <p className="hint">
-              密码仅用于本次操作，不保存在浏览器。LAN、Tailscale、ZeroTier
+              凭据加密保存在平台，不保存在浏览器。LAN、Tailscale、ZeroTier
               地址在 HTTPS 证书覆盖后均可作为平台入口；操作请求必须与当前页面使用相同的地址和端口。
             </p>
           </>
@@ -188,7 +156,7 @@ export function ElevationDialog({
             <button
               type="submit"
               className="button"
-              disabled={busy || !username.trim() || !password}
+              disabled={busy || !auth.ready}
             >
               {busy ? "正在提权…" : "确认提升到 Full"}
             </button>

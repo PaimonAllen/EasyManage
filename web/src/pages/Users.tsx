@@ -9,6 +9,7 @@ import { PageHeading } from "../components/PageHeading";
 import { UserManagement } from "../components/UserManagement";
 import { accountState } from "../lib/accountStatus";
 import type { OperationTarget } from "../api/client";
+import { NodeCollectionToggle, useNodeCollection } from "../components/NodeCollectionControl";
 import type { NodeSummary, UserStatus } from "../types/monitoring";
 
 const ADMIN_GROUPS = new Set(["sudo", "wheel", "lab-admins"]);
@@ -31,9 +32,17 @@ function loginDetails(user: UserStatus) {
   return sources.map(([label, count]) => `${label} ${count == null ? "未知" : count}`).join(" · ");
 }
 
+export function UserCollectionToggle({hostname,enabled,applied,online,busy,onChange}: {
+  hostname:string; enabled:boolean|undefined; applied:boolean|undefined; online:boolean;
+  busy:boolean; onChange:()=>void;
+}) {
+  return <NodeCollectionToggle hostname={hostname} label="用户状态采集" enabled={enabled} applied={applied} online={online} busy={busy} onChange={onChange}/>;
+}
+
 export function Users({ nodes, targets }: { nodes: NodeSummary[]; targets: OperationTarget[] }) {
   const [query, setQuery] = useState("");
   const [selectedNode, setSelectedNode] = useState("");
+  const {settings,settingsError,busy,errors,toggle}=useNodeCollection("users");
   const filteredNodes = nodes.filter(
     (node) => !selectedNode || node.id === selectedNode,
   );
@@ -75,7 +84,10 @@ export function Users({ nodes, targets }: { nodes: NodeSummary[]; targets: Opera
         <p className="hint">
           账户来源按系统普通用户 UID 范围识别，并始终包含 root；无法仅凭账户文件确认是否手工创建。登录线索分别列出终端记录、logind 会话和 SSH 进程，可覆盖部分 VS Code Remote-SSH 等非交互连接；来源可能重复，“至少”数量不可与来源计数相加，未检测到也不等于确定已退出。「状态」只核验登录 Shell 是否可执行，不代表密码、密钥或 SSH 策略一定可用。
         </p>
+        <p className="hint">每台机器可独立关闭用户状态采集；不影响其他监控，重启后保留设置。关闭不删除历史；权限检查和工具发现仍可能读取必要的基础账户信息。</p>
+        {settingsError&&<p className="form-error" role="alert">{settingsError}</p>}
         {filteredNodes.map((node) => {
+          const enabled=settings?.agents.find(agent=>agent.node_id===node.id)?.users_enabled;
           const users = (node.metrics?.users ?? []).filter((user) =>
             `${user.username} ${user.groups.join(" ")}`
               .toLowerCase()
@@ -92,8 +104,14 @@ export function Users({ nodes, targets }: { nodes: NodeSummary[]; targets: Opera
                     <SnapshotAge node={node} inventory />
                   </p>
                 </div>
-                <PrivilegeBadge node={node} />
+                <div className="user-collection-actions"><PrivilegeBadge node={node} />
+                  <UserCollectionToggle hostname={node.hostname} enabled={enabled}
+                    applied={node.metrics?.collection_policy?.users_enabled} online={node.online}
+                    busy={!!busy[node.id]} onChange={()=>{if(enabled!==undefined)void toggle(node.id,enabled);}}/>
+                </div>
               </header>
+              {errors[node.id]&&<p className="form-error" role="alert">{errors[node.id]}</p>}
+              {enabled===false?<p className="table-empty">用户状态采集已关闭，不展示旧快照。{node.metrics?.collection_policy?.users_enabled===false?"Agent 已确认停止采集。":"等待 Agent 应用；离线或旧版节点暂不能确认。"}</p>:<>
               <div className="table-scroll">
                 <table>
                   <thead>
@@ -168,6 +186,7 @@ export function Users({ nodes, targets }: { nodes: NodeSummary[]; targets: Opera
                 node={node}
                 components={["user", "session", "process"]}
               />
+              </>}
             </article>
           );
         })}

@@ -49,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/agent/enroll", post(enroll_agent))
         .route("/api/v1/agent/report", post(report_metrics))
         .route("/api/v1/agent/live", post(report_live_metrics))
+        .route("/api/v1/agent/control", post(agent_control))
         .fallback_service(static_files)
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(CompressionLayer::new())
@@ -89,7 +90,7 @@ async fn list_live_nodes(
         - Duration::seconds(
             i64::try_from(state.collection.current().live_seconds + 3).unwrap_or(63),
         );
-    let active: HashSet<Uuid> = sqlx::query_scalar("SELECT id FROM nodes WHERE deleted_at IS NULL")
+    let active: HashSet<Uuid> = sqlx::query_scalar("SELECT n.id FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.deleted_at IS NULL AND NOT n.monitoring_paused AND (n.monitoring_revision=0 OR (n.monitoring_applied_revision IS NULL AND m.metrics IS NOT NULL AND COALESCE(m.metrics->'agent_control','null'::jsonb)='null'::jsonb) OR m.metrics->'agent_control'=jsonb_build_object('revision',n.monitoring_revision,'paused',false))")
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::database)?
@@ -283,6 +284,15 @@ async fn report_metrics(
     let provided_token = header_value(&headers, AGENT_TOKEN_HEADER)?;
     authenticate_agent(&state.pool, report.node_id, provided_token).await?;
 
+    if let Some(activity)=&report.metrics.network_activity {
+        let mut seen=std::collections::HashSet::new();
+        if activity.process_id==0 || !(3..=4).contains(&activity.groups.len()) || activity.started_at>activity.collected_at
+            || activity.collected_at>report.metrics.collected_at+chrono::Duration::seconds(5)
+            || activity.groups.iter().any(|item|!item.group.is_agent() || !seen.insert(item.group as usize)) {
+            return Err(ApiError::bad_request("invalid Agent network accounting"));
+        }
+    }
+
     if report
         .metrics
         .hardware_details
@@ -330,6 +340,9 @@ async fn report_metrics(
 
     if let Some(policy) = &report.metrics.collection_policy {
         policy.validate().map_err(ApiError::bad_request)?;
+    }
+    if report.metrics.agent_control.as_ref().is_some_and(|control|control.revision>i64::MAX as u64) {
+        return Err(ApiError::bad_request("invalid monitoring control revision"));
     }
     if let Some(temperatures) = &report.metrics.temperatures {
         let valid = |value: f32| value.is_finite() && (0.0..=150.0).contains(&value);
@@ -518,17 +531,36 @@ async fn report_metrics(
         .await
         .map_err(ApiError::database)?;
 
+    let agent_control=if report.metrics.agent_control.is_some() {
+        Some(crate::agent_control::desired(&mut transaction,report.node_id,report.metrics.agent_control.as_ref()).await.map_err(ApiError::database)?)
+    }else{None};
     transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(AgentReportResponse {
+        agent_control,
         accepted_at: now,
-        collection_policy: Some(state.collection.current()),
+        collection_policy: Some(
+            state.collection.for_node_with_proxy(
+                report.node_id,
+                report
+                    .metrics
+                    .collection_policy
+                    .as_ref()
+                    .is_some_and(|p| p.users_enabled.is_some()),
+                report
+                    .metrics
+                    .collection_policy
+                    .as_ref()
+                    .is_some_and(|p| p.permissions_enabled.is_some()),
+                report.metrics.collection_policy.as_ref().is_some_and(|p|p.proxy_enabled.is_some()),
+            ),
+        ),
     }))
 }
 
 async fn list_nodes(State(state): State<AppState>) -> Result<Json<NodeListResponse>, ApiError> {
     let rows = sqlx::query(
         r"
-        SELECT n.id, COALESCE(NULLIF(n.display_name,''),n.hostname) AS hostname, n.os_name, n.os_version, n.kernel_version, n.architecture,
+        SELECT n.id, n.monitoring_paused, n.monitoring_revision, n.monitoring_applied_revision, COALESCE(NULLIF(n.display_name,''),n.hostname) AS hostname, n.os_name, n.os_version, n.kernel_version, n.architecture,
                n.cpu_model, n.cpu_logical_cores, n.cpu_physical_cores, n.agent_version,
                n.last_seen, m.metrics
         FROM nodes n
@@ -550,6 +582,30 @@ async fn list_nodes(State(state): State<AppState>) -> Result<Json<NodeListRespon
         generated_at: Utc::now(),
         nodes,
     }))
+}
+
+async fn agent_control(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<easymanage_protocol::AgentControlRequest>,
+) -> Result<Json<easymanage_protocol::AgentControlResponse>, ApiError> {
+    verify_control_revision(&request.applied)?;
+    let token = header_value(&headers, AGENT_TOKEN_HEADER)?;
+    authenticate_agent(&state.pool, request.node_id, token).await?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
+    let control = crate::agent_control::desired(&mut tx, request.node_id, Some(&request.applied))
+        .await.map_err(ApiError::database)?;
+    tx.commit().await.map_err(ApiError::database)?;
+    Ok(Json(easymanage_protocol::AgentControlResponse {
+        control,
+        collection_policy: state.collection.for_node_with_proxy(request.node_id, true, true, request.supports_proxy_collection),
+    }))
+}
+fn verify_control_revision(control: &easymanage_protocol::AgentControl) -> Result<(), ApiError> {
+    if control.revision > i64::MAX as u64 {
+        return Err(ApiError::bad_request("invalid monitoring control revision"));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -700,7 +756,20 @@ fn aggregate_disk_io(disks: &[easymanage_protocol::DiskMetric]) -> (Option<f64>,
     (read, written)
 }
 
+fn monitoring_report_current(revision: u64, applied: Option<u64>, control: Option<&easymanage_protocol::AgentControl>) -> bool {
+    match control {
+        Some(control) => control.revision == revision && !control.paused,
+        // Legacy collectors cannot acknowledge pause/resume. Their real, fresh
+        // reports remain usable once the user has explicitly resumed monitoring.
+        // Never use this fallback after a capable Agent has acknowledged control.
+        None => applied.is_none(),
+    }
+}
+
 fn map_node(row: &PgRow, online_cutoff: chrono::DateTime<Utc>) -> Result<NodeSummary, ApiError> {
+    let monitoring_paused:bool=row.try_get("monitoring_paused").map_err(ApiError::database)?;
+    let monitoring_revision=row.try_get::<i64,_>("monitoring_revision").map_err(ApiError::database)? as u64;
+    let monitoring_applied_revision=row.try_get::<Option<i64>,_>("monitoring_applied_revision").map_err(ApiError::database)?.map(|revision|revision as u64);
     let last_seen = row.try_get("last_seen").map_err(ApiError::database)?;
     let metrics = row
         .try_get::<Option<Value>, _>("metrics")
@@ -710,6 +779,9 @@ fn map_node(row: &PgRow, online_cutoff: chrono::DateTime<Utc>) -> Result<NodeSum
         .map_err(|error| ApiError::internal(error.to_string()))?;
 
     Ok(NodeSummary {
+        monitoring_paused,
+        monitoring_revision,
+        monitoring_applied_revision,
         id: row.try_get("id").map_err(ApiError::database)?,
         hostname: row.try_get("hostname").map_err(ApiError::database)?,
         os_name: row.try_get("os_name").map_err(ApiError::database)?,
@@ -730,9 +802,25 @@ fn map_node(row: &PgRow, online_cutoff: chrono::DateTime<Utc>) -> Result<NodeSum
             .map_err(|_| ApiError::internal("invalid cpu_physical_cores"))?,
         agent_version: row.try_get("agent_version").map_err(ApiError::database)?,
         last_seen,
-        online: last_seen >= online_cutoff,
+        online: !monitoring_paused && last_seen >= online_cutoff && (monitoring_revision==0 || metrics.as_ref().is_some_and(|snapshot|monitoring_report_current(monitoring_revision,monitoring_applied_revision,snapshot.agent_control.as_ref()))),
         metrics,
     })
+}
+
+#[cfg(test)]
+mod monitoring_compatibility_tests {
+    use super::monitoring_report_current;
+    use easymanage_protocol::AgentControl;
+
+    #[test]
+    fn legacy_resume_does_not_require_an_impossible_control_acknowledgement() {
+        assert!(monitoring_report_current(2, None, None));
+        assert!(!monitoring_report_current(2, Some(1), None));
+        assert!(!monitoring_report_current(2, Some(2), None));
+        assert!(!monitoring_report_current(2, None, Some(&AgentControl { revision: 0, paused: false })));
+        assert!(!monitoring_report_current(2, Some(2), Some(&AgentControl { revision: 1, paused: true })));
+        assert!(monitoring_report_current(2, Some(2), Some(&AgentControl { revision: 2, paused: false })));
+    }
 }
 
 async fn authenticate_agent(pool: &PgPool, node_id: Uuid, token: &str) -> Result<(), ApiError> {

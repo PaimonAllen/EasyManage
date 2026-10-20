@@ -67,7 +67,7 @@ export function NodeCard({
         </div>
       </header>
       {!node.online && (
-        <p className="stale-note">节点离线，下方保留最后一次采集结果。</p>
+        <p className="stale-note">{node.monitoring_paused ? "已请求暂停监控；确认状态见机器管理。下方仅保留历史采集结果，恢复请点“恢复监控”。" : "节点离线，下方保留最后一次采集结果。"}</p>
       )}
 
       {!metrics ? (

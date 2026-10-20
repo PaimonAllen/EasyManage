@@ -161,7 +161,32 @@ fn binding(target: &Target) -> Result<Vec<u8>, OperationsError> {
     .into_bytes())
 }
 
+fn scoped_binding(target: &Target, admin: bool) -> Result<Vec<u8>, OperationsError> {
+    let mut aad = binding(target)?;
+    if admin {
+        aad.extend_from_slice(b"\nadministrator-only-v1");
+    }
+    Ok(aad)
+}
+
+fn record_name(target: &Target, admin: bool) -> String {
+    format!(
+        "{}{}.enc",
+        if admin { "admin-" } else { "" },
+        target.node_id
+    )
+}
+
 fn store(registry: &FsPath, target: &Target, saved: &Saved) -> Result<(), OperationsError> {
+    store_scoped(registry, target, saved, false)
+}
+
+fn store_scoped(
+    registry: &FsPath,
+    target: &Target,
+    saved: &Saved,
+    admin: bool,
+) -> Result<(), OperationsError> {
     let directory = directory(registry, true)?;
     let key = key(&directory, true)?;
     let mut nonce = [0_u8; 12];
@@ -193,7 +218,7 @@ fn store(registry: &FsPath, target: &Target, saved: &Saved) -> Result<(), Operat
     let mut ciphertext = Zeroizing::new(serde_json::to_vec(&view).map_err(|_| failure())?);
     key.seal_in_place_append_tag(
         aead::Nonce::assume_unique_for_key(nonce),
-        aead::Aad::from(binding(target)?),
+        aead::Aad::from(scoped_binding(target, admin)?),
         &mut *ciphertext,
     )
     .map_err(|_| failure())?;
@@ -203,19 +228,16 @@ fn store(registry: &FsPath, target: &Target, saved: &Saved) -> Result<(), Operat
     if record.len() > MAX_RECORD {
         return Err(failure());
     }
-    write_private(
-        &directory.join(format!("{}.enc", target.node_id)),
-        &record,
-        false,
-    )
+    write_private(&directory.join(record_name(target, admin)), &record, false)
 }
 
 pub(super) fn load(registry: &FsPath, target: &Target) -> Result<Saved, OperationsError> {
+    load_scoped(registry, target, false)
+}
+
+fn load_scoped(registry: &FsPath, target: &Target, admin: bool) -> Result<Saved, OperationsError> {
     let directory = directory(registry, false)?;
-    let mut record = read_private(
-        &directory.join(format!("{}.enc", target.node_id)),
-        MAX_RECORD,
-    )?;
+    let mut record = read_private(&directory.join(record_name(target, admin)), MAX_RECORD)?;
     if record.len() < 33 || &record[..5] != b"EMSV1" {
         return Err(failure());
     }
@@ -223,12 +245,12 @@ pub(super) fn load(registry: &FsPath, target: &Target) -> Result<Saved, Operatio
     let plaintext = key(&directory, false)?
         .open_in_place(
             aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(binding(target)?),
+            aead::Aad::from(scoped_binding(target, admin)?),
             &mut record[17..],
         )
         .map_err(|_| failure())?;
     let saved: Saved = serde_json::from_slice(plaintext).map_err(|_| failure())?;
-    if saved.username != target.default_user {
+    if !valid_username(&saved.username) || (!admin && saved.username != target.default_user) {
         return Err(failure());
     }
     Ok(saved)
@@ -298,7 +320,20 @@ pub(super) fn browser_token(
     target: &Target,
     headers: &HeaderMap,
 ) -> Option<Zeroizing<String>> {
-    let name = format!("em_ssh_{}=", target.node_id.simple());
+    scoped_token(saved, target, headers, false)
+}
+
+fn scoped_token(
+    saved: &Saved,
+    target: &Target,
+    headers: &HeaderMap,
+    admin: bool,
+) -> Option<Zeroizing<String>> {
+    let name = format!(
+        "em_{}{}=",
+        if admin { "admin_" } else { "ssh_" },
+        target.node_id.simple()
+    );
     if saved.browser_expires <= chrono::Utc::now().timestamp() {
         return None;
     }
@@ -316,6 +351,90 @@ pub(super) fn browser_token(
                 )
         })
         .map(|token| Zeroizing::new(token.to_owned()))
+}
+
+pub(super) fn load_admin(
+    registry: &FsPath,
+    target: &Target,
+    headers: &HeaderMap,
+) -> Result<Saved, OperationsError> {
+    let saved = load_scoped(registry, target, true)?;
+    if scoped_token(&saved, target, headers, true).is_none() {
+        return Err(OperationsError(
+            StatusCode::UNAUTHORIZED,
+            "当前浏览器未授权使用此机器的管理员凭据，请完成首次鉴权",
+        ));
+    }
+    Ok(saved)
+}
+
+pub(super) fn admin_available(registry: &FsPath, target: &Target, headers: &HeaderMap) -> bool {
+    load_admin(registry, target, headers).is_ok()
+}
+
+pub(super) fn save_admin(
+    registry: &FsPath,
+    target: &Target,
+    credentials: &Credentials,
+) -> Result<String, OperationsError> {
+    save_admin_with_token(registry, target, credentials, None)
+}
+
+pub(super) fn admin_token(
+    registry: &FsPath,
+    target: &Target,
+    headers: &HeaderMap,
+) -> Result<Zeroizing<String>, OperationsError> {
+    let saved = load_admin(registry, target, headers)?;
+    scoped_token(&saved, target, headers, true).ok_or_else(failure)
+}
+
+pub(super) fn save_admin_with_token(
+    registry: &FsPath,
+    target: &Target,
+    credentials: &Credentials,
+    token: Option<Zeroizing<String>>,
+) -> Result<String, OperationsError> {
+    let token = token.unwrap_or_else(|| {
+        Zeroizing::new(format!(
+            "{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        ))
+    });
+    store_scoped(
+        registry,
+        target,
+        &Saved {
+            username: credentials.username.clone(),
+            password: credentials.password.clone(),
+            key: credentials.private_key.clone(),
+            passphrase: credentials.passphrase.clone(),
+            sudo_password: Zeroizing::new(credentials.sudo_secret().to_owned()),
+            enabled: false,
+            browser_hash: crate::api::hash_token(&token),
+            browser_expires: chrono::Utc::now().timestamp() + COOKIE_AGE,
+        },
+        true,
+    )?;
+    Ok(format!(
+        "em_admin_{}={}; Path=/api/v1; Secure; HttpOnly; SameSite=Strict; Max-Age={COOKIE_AGE}",
+        target.node_id.simple(),
+        &*token
+    ))
+}
+
+pub(super) fn forget_admin(
+    registry: &FsPath,
+    target: &Target,
+    headers: &HeaderMap,
+) -> Result<(), OperationsError> {
+    load_admin(registry, target, headers)?;
+    let directory = directory(registry, false)?;
+    fs::remove_file(directory.join(record_name(target, true))).map_err(|_| failure())?;
+    fs::File::open(directory)
+        .and_then(|f| f.sync_all())
+        .map_err(|_| failure())
 }
 
 pub(super) fn cookie(target: &Target, token: &str) -> String {
@@ -533,5 +652,90 @@ mod tests {
         forget(&fixture.registry, &fixture.target).unwrap();
         assert!(!exists(&fixture.registry, &fixture.target));
         assert!(fixture.target.known_hosts.exists() && fixture.key().exists());
+    }
+
+    #[test]
+    fn administrator_records_and_browser_authority_cannot_replace_transport_credentials() {
+        let fixture = Fixture::new();
+        let transport_token = fixture.save();
+        let original = fs::read(fixture.record()).unwrap();
+        let credentials = Credentials {
+            username: "administrator".into(),
+            private_key: Zeroizing::new("-----BEGIN synthetic-private-key".into()),
+            passphrase: Zeroizing::new("synthetic-admin-phrase".into()),
+            sudo_password: Zeroizing::new("synthetic-admin-sudo".into()),
+            ..Default::default()
+        };
+        let cookie = save_admin(&fixture.registry, &fixture.target, &credentials).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", cookie.split(';').next().unwrap().parse().unwrap());
+        let admin_record = fixture
+            .directory
+            .join("ssh-vault")
+            .join(record_name(&fixture.target, true));
+        let bytes = fs::read(&admin_record).unwrap();
+        for secret in [
+            &*credentials.private_key,
+            &*credentials.passphrase,
+            &*credentials.sudo_password,
+        ] {
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|chunk| chunk == secret.as_bytes())
+            );
+        }
+        assert_eq!(
+            load_admin(&fixture.registry, &fixture.target, &headers)
+                .unwrap()
+                .username,
+            "administrator"
+        );
+        assert_eq!(original, fs::read(fixture.record()).unwrap());
+        assert!(!authorized(
+            &load(&fixture.registry, &fixture.target).unwrap(),
+            &fixture.target,
+            &headers
+        ));
+        let mut transport_headers = HeaderMap::new();
+        transport_headers.insert(
+            "cookie",
+            format!(
+                "em_ssh_{}={transport_token}",
+                fixture.target.node_id.simple()
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert!(load_admin(&fixture.registry, &fixture.target, &transport_headers).is_err());
+        assert!(load_admin(&fixture.registry, &fixture.target, &HeaderMap::new()).is_err());
+        let token = admin_token(&fixture.registry, &fixture.target, &headers).unwrap();
+        let renewed = save_admin_with_token(
+            &fixture.registry,
+            &fixture.target,
+            &credentials,
+            Some(token),
+        )
+        .unwrap();
+        assert_eq!(cookie, renewed);
+        assert_ne!(bytes, fs::read(&admin_record).unwrap());
+        let mut changed = fixture.target.clone();
+        changed.default_user = "other-owner".into();
+        assert!(load_admin(&fixture.registry, &changed, &headers).is_err());
+        fs::copy(&admin_record, fixture.record()).unwrap();
+        assert!(load(&fixture.registry, &fixture.target).is_err());
+        write_private(&fixture.record(), &original, false).unwrap();
+        let mut saved = load_scoped(&fixture.registry, &fixture.target, true).unwrap();
+        saved.browser_expires = 0;
+        store_scoped(&fixture.registry, &fixture.target, &saved, true).unwrap();
+        assert!(load_admin(&fixture.registry, &fixture.target, &headers).is_err());
+        save_admin(&fixture.registry, &fixture.target, &credentials).unwrap();
+        // A new successful authentication revokes the old browser capability.
+        assert!(load_admin(&fixture.registry, &fixture.target, &headers).is_err());
+        let fresh = save_admin(&fixture.registry, &fixture.target, &credentials).unwrap();
+        headers.insert("cookie", fresh.split(';').next().unwrap().parse().unwrap());
+        forget_admin(&fixture.registry, &fixture.target, &headers).unwrap();
+        assert!(!admin_record.exists());
+        assert_eq!(original, fs::read(fixture.record()).unwrap());
     }
 }

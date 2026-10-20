@@ -6,6 +6,7 @@ import { PageHeading } from "../components/PageHeading";
 import { formatDate } from "../lib/format";
 import { samePermissionCheck } from "../lib/permissionReviews";
 import type { NodeSummary, PermissionCheck } from "../types/monitoring";
+import { NodeCollectionToggle, useNodeCollection } from "../components/NodeCollectionControl";
 
 const categories = [
   { id: "home", title: "个人目录隔离" },
@@ -104,6 +105,8 @@ function Summary({ checks, isReviewed }: { checks: PermissionCheck[]; isReviewed
 }
 
 export function PermissionChecks({ nodes }: { nodes: NodeSummary[] }) {
+  const {settings,settingsError,busy,errors,toggle}=useNodeCollection("permissions");
+  const enabledFor=(id:string)=>settings?.agents.find(agent=>agent.node_id===id)?.permissions_enabled;
   const [reason, setReason] = useState<ReasonSelection | null>(null);
   const [reviews, setReviews] = useState<PermissionReview[]>([]);
   const [reviewError, setReviewError] = useState("");
@@ -131,7 +134,7 @@ export function PermissionChecks({ nodes }: { nodes: NodeSummary[] }) {
   const reviewFor = (nodeId: string, check: PermissionCheck) => reviewsReady ? reviews.find((review) => review.node_id === nodeId && samePermissionCheck(review.check, check)) : undefined;
   const liveSelection = reason ? nodes.find((node) => node.id === reason.nodeId) : undefined;
   const selectedAudit = liveSelection?.metrics?.permission_audit;
-  const canMark = Boolean(reviewsReady && liveSelection?.online && selectedAudit && Date.now() - Date.parse(selectedAudit.collected_at) < 8 * 60_000
+  const canMark = Boolean(reviewsReady && liveSelection?.online && enabledFor(liveSelection.id)!==false && liveSelection.metrics?.collection_policy?.permissions_enabled!==false && selectedAudit && Date.now() - Date.parse(selectedAudit.collected_at) < 8 * 60_000
     && reason && selectedAudit.checks.some((item) => samePermissionCheck(item, reason.item)));
   async function saveReview(accepted: boolean, note: string) {
     if (!reason) return;
@@ -143,19 +146,27 @@ export function PermissionChecks({ nodes }: { nodes: NodeSummary[] }) {
   return <>
     <PageHeading eyebrow="Permissions · read only" title="权限检查" description="按服务器管理操作手册核对目录入口、项目组、sudo 和 root 的只读权限快照" />
     <section className="page-content">
+      {settingsError&&<p className="form-error" role="alert">{settingsError}</p>}
+      <p className="hint">每台机器可独立暂停权限检查采集，重启后保留；不修改实际权限，也不影响用户状态和其他监控。恢复开启后重新检查。</p>
       {reviewError && <p className="form-error" role="alert">{reviewError}；人工 OK 暂不显示，自动结果不受影响。</p>}
       <p className="hint">检查基准：个人目录仅本人可访问；共享目录为 lab-users 组并启用 setgid/默认 ACL；合作项目使用 proj-* 组；临时目录采用文档规定的 3777。项目目录的组 rwx、setgid、其他用户无权限是依据文档隔离目标采用的检查基准，原文未指定精确 chmod。仅检查目录入口与指定配置文件，不递归扫描项目内容，也不尝试以其他用户身份访问。缺失、过期或无法读取的结果不算通过。</p>
       {nodes.map((node) => {
+        const enabled=enabledFor(node.id);
         const audit = node.metrics?.permission_audit;
         const collected = audit ? Date.parse(audit.collected_at) : NaN;
-        const current = node.online && Number.isFinite(collected) && Date.now() - collected < permissionFreshSeconds(node) * 1000;
+        const current = enabled!==false && node.metrics?.collection_policy?.permissions_enabled!==false && node.online && Number.isFinite(collected) && Date.now() - collected < permissionFreshSeconds(node) * 1000;
         const isReviewed = (item: PermissionCheck) => Boolean(current && reviewFor(node.id, item));
         return <article className="data-panel" key={node.id}>
           <header className="panel-header">
             <div><h2>{node.hostname} <NodeStatus node={node} /></h2><p>权限采集于 {formatDate(audit?.collected_at)} · Agent {node.metrics?.privilege?.mode === "full" ? "Full" : "Basic"}</p></div>
-            <span className={current ? "positive" : "muted"}>{current ? "当前快照" : "历史或待采集"}</span>
+            <div className="user-collection-actions"><span className={current ? "positive" : "muted"}>{enabled===false?"采集已关闭":current?"当前快照":"历史或待采集"}</span>
+              <NodeCollectionToggle hostname={node.hostname} label="权限检查采集" enabled={enabled}
+                applied={node.metrics?.collection_policy?.permissions_enabled} online={node.online} busy={!!busy[node.id]}
+                onChange={()=>{if(enabled!==undefined){setReason(null);void toggle(node.id,enabled);}}}/>
+            </div>
           </header>
-          {!audit ? <p className="table-empty">尚未收到权限审计数据；需要更新平台 Server 和此节点的 Agent。不能把缺少结果当作安全通过。</p> : <>
+          {errors[node.id]&&<p className="form-error" role="alert">{errors[node.id]}</p>}
+          {enabled===false?<p className="table-empty">权限检查采集已关闭，不展示旧快照。{node.metrics?.collection_policy?.permissions_enabled===false?"Agent 已确认停止采集。":"等待 Agent 应用；离线或旧版节点暂不能确认。"}</p>:!audit ? <p className="table-empty">尚未收到权限审计数据；需要更新平台 Server 和此节点的 Agent。不能把缺少结果当作安全通过。</p> : <>
             <Summary checks={audit.checks} isReviewed={isReviewed} />
             {audit.truncated && <p className="permission-limit">扫描超过上限：最多展示 64 个个人目录、32 个项目目录和 64 个 sudo 附加规则文件；未覆盖的路径状态未知。</p>}
             {!current && <p className="permission-limit">节点离线或权限快照超过 8 分钟，以下结果仅供历史参考。</p>}
@@ -178,7 +189,7 @@ export function PermissionChecks({ nodes }: { nodes: NodeSummary[] }) {
               </section>;
             })}
           </>}
-          <CollectionNotes node={node} components={["permissions"]} />
+          {enabled!==false&&<CollectionNotes node={node} components={["permissions"]} />}
         </article>;
       })}
       {!nodes.length && <p className="table-empty">尚无受管节点。</p>}

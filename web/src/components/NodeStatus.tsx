@@ -43,12 +43,14 @@ export function SnapshotAge({
 }
 
 export function NodeStatus({ node }: { node: NodeSummary }) {
+  const confirmed=node.monitoring_revision!==undefined && node.monitoring_applied_revision===node.monitoring_revision;
+  const label=node.monitoring_paused ? confirmed?"监控已暂停":"暂停待确认" : node.online?"在线":"离线";
   return (
     <span
-      className={`status ${node.online ? "status--online" : "status--offline"}`}
+      className={`status ${node.monitoring_paused ? "status--paused" : node.online ? "status--online" : "status--offline"}`}
     >
       <i />
-      {node.online ? "在线" : "离线"}
+      {label}
     </span>
   );
 }

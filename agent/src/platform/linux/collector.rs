@@ -43,9 +43,10 @@ pub struct Collector {
     inventory: Option<NodeInventory>,
     inventory_refreshed_at: Instant,
     extended: ExtendedInventory,
+    user_inventory_ready: bool,
     extended_refreshed_at: Instant,
     extended_task: Option<tokio::task::JoinHandle<ExtendedInventory>>,
-    permission_audit: PermissionAudit,
+    permission_audit: Option<PermissionAudit>,
     permission_refreshed_at: Instant,
     permission_task: Option<tokio::task::JoinHandle<PermissionAudit>>,
     process: ProcessSampler,
@@ -67,8 +68,16 @@ impl Collector {
         let network_refreshed_at = Instant::now();
         tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
         system.refresh_cpu_usage();
-        let extended = ExtendedInventory::collect().await;
-        let permission_audit = permissions::collect(&extended.users).await;
+        // Read the persisted switch before any session/group probes, including startup.
+        let users_enabled = store.users_enabled().await.unwrap_or(false);
+        let proxy_enabled = store.proxy_enabled().await.unwrap_or(false);
+        let extended = ExtendedInventory::collect(users_enabled, proxy_enabled).await;
+        let permissions_enabled = store.permissions_enabled().await.unwrap_or(false);
+        let permission_audit = if permissions_enabled {
+            Some(permissions::collect(&extended.users).await)
+        } else {
+            None
+        };
         let hardware = store
             .hardware_details(extended.privilege.uid)
             .await
@@ -83,7 +92,12 @@ impl Collector {
         Self {
             cached_temperatures: None,
             temperature_refreshed_at: None,
-            policy: CollectionPolicy::default(),
+            policy: CollectionPolicy {
+                users_enabled: Some(users_enabled),
+                permissions_enabled: Some(permissions_enabled),
+                proxy_enabled: Some(proxy_enabled),
+                ..Default::default()
+            },
             cached_gpus: Vec::new(),
             gpu_refreshed_at: None,
             gpu_collected_at: None,
@@ -104,6 +118,7 @@ impl Collector {
             inventory: None,
             inventory_refreshed_at: Instant::now(),
             extended,
+            user_inventory_ready: users_enabled,
             extended_refreshed_at: Instant::now(),
             extended_task: None,
             permission_audit,
@@ -120,6 +135,41 @@ impl Collector {
     }
 
     pub fn apply_policy(&mut self, policy: CollectionPolicy) {
+        if policy.proxy_enabled.unwrap_or(true) != self.policy.proxy_enabled.unwrap_or(true) {
+            // Never publish a previous-mode proxy scan, including after re-enable.
+            if let Some(task) = self.extended_task.take() {
+                task.abort();
+            }
+            self.extended.proxy_services.clear();
+            self.extended
+                .issues
+                .retain(|issue| issue.component != "proxy");
+            self.extended_refreshed_at = Instant::now()
+                .checked_sub(Duration::from_secs(3601))
+                .unwrap_or_else(Instant::now);
+        }
+        if policy.permissions_enabled.unwrap_or(true)
+            != self.policy.permissions_enabled.unwrap_or(true)
+        {
+            if let Some(task) = self.permission_task.take() {
+                task.abort();
+            }
+            self.permission_audit = None;
+            self.permission_refreshed_at = Instant::now()
+                .checked_sub(Duration::from_secs(3601))
+                .unwrap_or_else(Instant::now);
+        }
+        if policy.users_enabled.unwrap_or(true) != self.policy.users_enabled.unwrap_or(true) {
+            // Discard in-flight old-mode work, never publish its session evidence later.
+            if let Some(task) = self.extended_task.take() {
+                task.abort();
+            }
+            self.extended.clear_user_status();
+            self.user_inventory_ready = false;
+            self.extended_refreshed_at = Instant::now()
+                .checked_sub(Duration::from_secs(3601))
+                .unwrap_or_else(Instant::now);
+        }
         self.policy = policy;
     }
 
@@ -165,7 +215,10 @@ impl Collector {
         {
             if let Some(task) = self.extended_task.take() {
                 match task.await {
-                    Ok(extended) => self.extended = extended,
+                    Ok(extended) => {
+                        self.extended = extended;
+                        self.user_inventory_ready = self.policy.users_enabled.unwrap_or(true);
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "inventory refresh failed; retaining prior snapshot")
                     }
@@ -177,7 +230,10 @@ impl Collector {
             >= Duration::from_secs(self.policy.extended_seconds)
             && self.extended_task.is_none()
         {
-            self.extended_task = Some(tokio::spawn(ExtendedInventory::collect()));
+            self.extended_task = Some(tokio::spawn(ExtendedInventory::collect(
+                self.policy.users_enabled.unwrap_or(true),
+                self.policy.proxy_enabled.unwrap_or(true),
+            )));
         }
         if self
             .permission_task
@@ -186,7 +242,7 @@ impl Collector {
         {
             if let Some(task) = self.permission_task.take() {
                 match task.await {
-                    Ok(audit) => self.permission_audit = audit,
+                    Ok(audit) => self.permission_audit = Some(audit),
                     Err(error) => {
                         tracing::warn!(%error, "permission refresh failed; retaining prior snapshot")
                     }
@@ -194,8 +250,9 @@ impl Collector {
                 self.permission_refreshed_at = Instant::now();
             }
         }
-        if self.permission_refreshed_at.elapsed() + Duration::from_millis(250)
-            >= Duration::from_secs(self.policy.permission_seconds)
+        if self.policy.permissions_enabled.unwrap_or(true)
+            && self.permission_refreshed_at.elapsed() + Duration::from_millis(250)
+                >= Duration::from_secs(self.policy.permission_seconds)
             && self.permission_task.is_none()
         {
             let users = self.extended.users.clone();
@@ -283,6 +340,8 @@ impl Collector {
             self.storage_refreshed_at = Some(Instant::now());
         }
         MetricsSnapshot {
+            agent_control: None,
+            network_activity: None,
             hardware_details: self.hardware.clone(),
             temperatures: self.cached_temperatures.clone(),
             collection_policy: Some(self.policy.clone()),
@@ -306,7 +365,11 @@ impl Collector {
             platform_process: Some(self.process.sample()),
             platform_storage: self.cached_storage.clone(),
             privilege: Some(self.extended.privilege.clone()),
-            users: self.extended.users.clone(),
+            users: if self.policy.users_enabled.unwrap_or(true) && self.user_inventory_ready {
+                self.extended.users.clone()
+            } else {
+                Vec::new()
+            },
             interfaces: self.extended.interfaces.clone(),
             overlay_networks: self.extended.overlay_networks.clone(),
             routes: self.extended.routes.clone(),
@@ -316,7 +379,7 @@ impl Collector {
             software_packages: self.extended.software_packages.clone(),
             running_services: self.extended.running_services.clone(),
             host_security: Some(self.extended.host_security.clone()),
-            permission_audit: Some(self.permission_audit.clone()),
+            permission_audit: self.permission_audit.clone(),
             ai_tools: self.extended.ai_tools.clone(),
             programming_tools: self.extended.programming_tools.clone(),
         }
@@ -511,7 +574,7 @@ mod tests {
         let inventory_task = collector.extended_task.as_ref().unwrap().id();
         let permission_task = collector.permission_task.as_ref().unwrap().id();
         let inventory_at = collector.extended.collected_at;
-        let permissions_at = collector.permission_audit.collected_at;
+        let permissions_at = collector.permission_audit.as_ref().unwrap().collected_at;
         // Skip other slow first-use probes: this regression isolates the two tasks.
         collector.gpu_refreshed_at = Some(Instant::now());
         collector.disk_collected_at = Some(chrono::Utc::now());
@@ -537,6 +600,113 @@ mod tests {
         }
         let inventory_abort = collector.extended_task.as_ref().unwrap().abort_handle();
         let permission_abort = collector.permission_task.as_ref().unwrap().abort_handle();
+        collector.apply_policy(easymanage_protocol::CollectionPolicy {
+            users_enabled: Some(false),
+            ..Default::default()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            inventory_abort.is_finished(),
+            "old-mode inventory task is cancelled immediately"
+        );
+        assert!(
+            !permission_abort.is_finished(),
+            "separate permission checks remain running"
+        );
+        // Hold a disabled-mode scan pending; reports must not expose old evidence.
+        collector.extended_task = Some(tokio::spawn(std::future::pending()));
+        let snapshot = collector.collect().await;
+        assert!(snapshot.users.is_empty());
+        assert_eq!(
+            snapshot.collection_policy.unwrap().users_enabled,
+            Some(false)
+        );
+        collector.apply_policy(easymanage_protocol::CollectionPolicy {
+            users_enabled: Some(true),
+            ..Default::default()
+        });
+        assert!(
+            !collector.user_inventory_ready,
+            "re-enable waits for a new scan instead of recycling old status"
+        );
+        collector.apply_policy(easymanage_protocol::CollectionPolicy {
+            users_enabled: Some(true),
+            permissions_enabled: Some(false),
+            ..Default::default()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            permission_abort.is_finished(),
+            "disabling permission collection cancels the pending task"
+        );
+        assert!(collector.permission_audit.is_none());
+        let snapshot = collector.collect().await;
+        assert!(snapshot.permission_audit.is_none());
+        assert!(
+            collector.permission_task.is_none(),
+            "disabled permission checks never schedule new scans"
+        );
+        collector.apply_policy(easymanage_protocol::CollectionPolicy {
+            users_enabled: Some(true),
+            permissions_enabled: Some(true),
+            ..Default::default()
+        });
+        assert!(
+            collector.permission_audit.is_none(),
+            "re-enable must not reuse old evidence"
+        );
+        collector.collect().await;
+        assert!(
+            collector.permission_task.is_some(),
+            "re-enable schedules a fresh check"
+        );
+        if let Some(task) = collector.extended_task.take() {
+            task.abort();
+        }
+        collector.extended_task = Some(tokio::spawn(std::future::pending()));
+        let proxy_abort = collector.extended_task.as_ref().unwrap().abort_handle();
+        let users_before = collector.extended.users.len();
+        collector
+            .extended
+            .proxy_services
+            .push(easymanage_protocol::ProxyService {
+                name: "mihomo".into(),
+                pid: 123,
+                uid: 1000,
+                username: "fixture".into(),
+                listen_addresses: vec!["tcp://127.0.0.1:12345".into()],
+            });
+        let mut policy = collector.policy.clone();
+        policy.proxy_enabled = Some(false);
+        collector.apply_policy(policy.clone());
+        tokio::task::yield_now().await;
+        assert!(
+            proxy_abort.is_finished(),
+            "proxy mode change cancels old shared inventory work"
+        );
+        assert!(collector.extended.proxy_services.is_empty());
+        assert_eq!(
+            collector.extended.users.len(),
+            users_before,
+            "proxy switch does not clear user observations"
+        );
+        assert!(
+            collector.permission_task.is_some(),
+            "independent permission work remains scheduled"
+        );
+        collector.extended_task = Some(tokio::spawn(std::future::pending()));
+        let snapshot = collector.collect().await;
+        assert!(snapshot.proxy_services.is_empty());
+        assert_eq!(
+            snapshot.collection_policy.unwrap().proxy_enabled,
+            Some(false)
+        );
+        policy.proxy_enabled = Some(true);
+        collector.apply_policy(policy);
+        assert!(
+            collector.extended.proxy_services.is_empty(),
+            "re-enable never restores old proxy evidence"
+        );
         drop(collector);
         tokio::task::yield_now().await;
         assert!(inventory_abort.is_finished() && permission_abort.is_finished());

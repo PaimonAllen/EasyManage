@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchPlatformUpdateStatus, updatePlatform, type PlatformUpdateStatus } from "../api/client";
 import { formatDate } from "../lib/format";
+import { AdminCredentialFields, useAdminCredentials } from "./AdminCredentials";
 
 export function PlatformUpdateDialog({candidate, onClose}: {candidate: PlatformUpdateStatus; onClose: () => void}) {
   const dialog = useRef<HTMLDialogElement>(null);
   const mounted = useRef(true);
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
+  const auth = useAdminCredentials([null]);
   const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [submitted, setSubmitted] = useState(false);
@@ -56,22 +56,23 @@ export function PlatformUpdateDialog({candidate, onClose}: {candidate: PlatformU
   }, [submitted, candidate.candidate_sha256]);
   async function submit() {
     if (busy || submitted || !candidate.candidate_sha256 || !confirmed) return;
-    const credentials = {username: username.trim(), password};
-    setPassword("");
     setBusy(true);
     setError("");
+    let operationStarted = false;
     try {
+      const credentials = await auth.prepare();
+      operationStarted = true;
       const result = await updatePlatform(credentials, candidate.candidate_sha256, AbortSignal.timeout(75_000));
       if (mounted.current) { setMessage(result.message); setSubmitted(true); }
     } catch (caught) {
       if (!mounted.current) return;
       // A lost response is not proof that scheduling failed. Never automatically retry a mutation.
       const text = caught instanceof Error ? caught.message : "提交失败";
-      if (caught instanceof TypeError || (caught instanceof DOMException && caught.name === "TimeoutError")) {
+      if (operationStarted && (caught instanceof TypeError || (caught instanceof DOMException && caught.name === "TimeoutError"))) {
         setMessage("提交响应中断，正在检查平台是否已开始更新；不会重复提交。");
         setSubmitted(true);
       } else { setError(text); setBusy(false); }
-    } finally { credentials.password = ""; }
+    }
   }
   return <dialog ref={dialog} className="credentials-dialog" aria-label="更新平台并重启"
     onCancel={(event) => { if (busy) event.preventDefault(); else onClose(); }}>
@@ -82,14 +83,13 @@ export function PlatformUpdateDialog({candidate, onClose}: {candidate: PlatformU
       {!submitted && <>
         <p className="form-error">平台将短暂离线。失败时回退平台文件，但已执行的数据库迁移不能自动回退。</p>
         <p className="hint">平台重启后会使用私有保险库中的加密凭据恢复已启用的 SSH 长连接；手动断开的连接不会自动恢复。</p>
-        <label>平台服务器管理员用户名<input required autoFocus autoComplete="off" maxLength={64} disabled={busy} value={username} onChange={(event) => setUsername(event.target.value)} /></label>
-        <label>管理员密码<input required type="password" autoComplete="off" maxLength={1024} disabled={busy} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        <AdminCredentialFields auth={auth} disabled={busy} />
         <label className="machine-confirm"><input type="checkbox" disabled={busy} checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> 我已确认候选版本、数据库备份和短暂离线风险</label>
       </>}
       {message && <div className={`notice ${finished ? "notice--success" : ""}`} role="status">{message}</div>}
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="dialog-actions"><button className="button button--secondary" type="button" disabled={busy} onClick={onClose}>{submitted ? "关闭" : "取消"}</button>
-        {!submitted && <button className="button" type="submit" disabled={busy || !username.trim() || !password || !confirmed}>{busy ? "正在验证并安排更新…" : "确认更新平台并重启"}</button>}
+        {!submitted && <button className="button" type="submit" disabled={busy || !auth.ready || !confirmed}>{busy ? "正在验证并安排更新…" : "确认更新平台并重启"}</button>}
         {finished && <button className="button" type="button" onClick={() => window.location.reload()}>载入新版平台</button>}
       </div>
     </form>

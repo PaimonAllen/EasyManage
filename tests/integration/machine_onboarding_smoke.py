@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 
-def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False):
+def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False, admin_only=False):
     import paramiko
     logging.getLogger("paramiko").setLevel(logging.CRITICAL)
     mounts = Path("/proc/self/mountinfo").read_text().splitlines()
@@ -152,6 +152,17 @@ sys.exit(2)
                 sudo_checks.append(secrets.compare_digest(submitted.rstrip(b"\n"),password.encode()))
                 for index in range(len(submitted)): submitted[index]=0
                 result=0 if allow_full.is_set() else 1  # No host sudo/systemd.
+            elif command.startswith("/usr/bin/sudo -k -S -p '' /usr/bin/env -i ") and ('test "$(/usr/bin/id -u)" = 0' in command or '# Fixed, root-only service restart.' in command):
+                # Administrator vault / restart fixture: authenticate the actual
+                # channel stdin, but never run host sudo or service managers.
+                submitted=bytearray()
+                while not submitted.endswith(b"\n"):
+                    data=channel.recv(1024)
+                    if not data: break
+                    submitted.extend(data)
+                correct=secrets.compare_digest(submitted.rstrip(b"\n"),password.encode())
+                for index in range(len(submitted)): submitted[index]=0
+                result=0 if allow_full.is_set() and correct else 1
             elif command.startswith('test ! -e "$HOME/.local/share/easymanage/'):
                 result=0
             elif command.startswith("python3 -c ") and ("/api/v1/health/ready" in command or "/proc/net/tcp" in command):
@@ -361,7 +372,73 @@ sys.exit(0)
             status,result=request(f'/api/v1/machines/{node_id}/redeploy',body)
             if status!=429 or time.monotonic()>=deadline:return status,result
             time.sleep(5)  # Respect per-node operation limits from earlier tests.
+    def exercise_admin(full_created):
+        admin_path=f'/api/v1/nodes/{full_created["node_id"]}/admin-credentials'
+        def admin_request(body):
+            deadline=time.monotonic()+70
+            while True:
+                status,value=request(admin_path,body)
+                if status!=429 or time.monotonic()>deadline: return status,value
+                time.sleep(5)
+        require(request(admin_path)[1]=={'available':False},'ordinary transport authorization cannot authorize administrator credential reuse')
+        admin_key={'username':current.pw_name,'private_key':ed_private,'passphrase':key_phrase,'sudo_password':password}
+        require(admin_request(admin_key|{'passphrase':'wrong-fixture-key-phrase'})[0]==401,
+                'administrator private-key authentication failure is rejected before vault persistence')
+        admin_file=root/'ssh-vault'/('admin-'+full_created['node_id']+'.enc')
+        require(not admin_file.exists(),'failed administrator authentication does not create encrypted credential record')
+        require(admin_request({'username':current.pw_name,'password':password})[0]==200,
+                'first administrator password authentication verifies root authorization and saves encrypted credentials')
+        require(request(admin_path)[1]=={'available':True},'only authorized browser sees saved administrator credentials as usable')
+        no_cookie=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=context))
+        with no_cookie.open(base_url+admin_path,timeout=5) as response:
+            require(json.load(response)=={'available':False},'administrator status never authorizes a different browser or reveals credentials')
+        require(admin_request(admin_key|{'sudo_password':'wrong-fixture-sudo'})[0]!=200,
+                'valid SSH key without successful sudo cannot replace administrator credentials')
+        require(request(admin_path)[1]['available'],'failed sudo preserves previously verified administrator authorization')
+        require(admin_request({'use_saved':True,'username':current.pw_name})[0]==400,'mixed saved and supplied administrator credentials are refused')
+        require(admin_request(admin_key)[0]==200,'encrypted OpenSSH key, passphrase and distinct sudo credential are accepted by administrator vault')
+        for secret in (password.encode(),key_phrase.encode(),ed_private.encode()):
+            require(secret not in admin_file.read_bytes(),'administrator ciphertext contains no plaintext fixture secret')
+        admin_cookie=next(c.value for c in cookies if c.name=='em_admin_'+full_created['node_id'].replace('-',''))
+        require(admin_request({'use_saved':True})[0]==200,'saved administrator credentials verify and renew without resubmitting passwords or keys')
+        require(next(c.value for c in cookies if c.name=='em_admin_'+full_created['node_id'].replace('-',''))==admin_cookie,'sliding authorization renewal does not rotate active browser capability')
+        restart_path=f'/api/v1/nodes/{full_created["node_id"]}/agent/restart'
+        deadline=time.monotonic()+70
+        while True:
+            status,restarted=request(restart_path,{'use_saved':True})
+            if status!=429 or time.monotonic()>deadline:break
+            time.sleep(5)
+        if status!=200:
+            print('DIAGNOSTIC saved Full restart:',status,restarted.get('message'), 'mock errors:',errors,flush=True)
+            _,listing=request('/api/v1/nodes')
+            observed=next(node for node in listing['nodes'] if node['id']==full_created['node_id'])
+            print('DIAGNOSTIC Full heartbeat:',observed['last_seen'],observed['metrics'].get('agent_control'),flush=True)
+        require(status==200,'Full Agent restart resolves encrypted administrator credentials without explicit SSH password or key')
+        if restart_controller is not None:
+            restart_controller()
+            require(request(admin_path)[1]['available'],'platform restart preserves encrypted administrator credentials and scoped browser authorization')
+        deadline=time.monotonic()+70
+        while True:
+            try:
+                with opener.open(urllib.request.Request(base_url+admin_path,method='DELETE',headers={'Origin':base_url}),timeout=10) as response:
+                    require(json.load(response)=={'available':False},'administrator credentials can be explicitly cleared')
+                break
+            except urllib.error.HTTPError as error:
+                if error.code!=429 or time.monotonic()>deadline:raise
+                time.sleep(1)  # Platform readiness precedes the background SSH restore lease being released.
+        require(not admin_file.exists() and (root/'ssh-vault'/(full_created['node_id']+'.enc')).is_file(),
+                'clearing administrator credentials leaves ordinary SSH transport credentials intact')
     try:
+        if admin_only:
+            allow_full.set()
+            _,probe=request('/api/v1/machines/probe',{'host':'10.222.0.10','port':2222})
+            payload={'host':'10.222.0.10','port':2222,'display_name':'Admin SSH fixture','server_url':base_url,
+                'fingerprint':probe['fingerprint'],'username':current.pw_name,'auth_method':'private_key',
+                'private_key':ed_private,'passphrase':key_phrase,'sudo_password':password,'deployment_mode':'full','connection_mode':'ssh'}
+            status,created=request('/api/v1/machines',payload)
+            require(status==200 and wait_job(created)['status']=='success','administrator fixture starts with real Full SSH installation and heartbeat')
+            exercise_admin(created)
+            return
         _,probe=request("/api/v1/machines/probe",{"host":"10.222.0.9","port":2222})
         require("fingerprint" in probe and not attempts,"onboarding fingerprint probe never sends SSH credentials")
         payload={"host":"10.222.0.9","port":2222,"display_name":"SSH fixture","server_url":base_url,
@@ -416,6 +493,14 @@ sys.exit(0)
         _,machines=request("/api/v1/machines")
         persistent=next(machine for machine in machines["machines"] if machine["node_id"]==node_id)
         require(persistent["connection_mode"]=="ssh" and persistent["ssh_transport"]["connections"]==2,"control and reverse HTTPS use exactly two long TCP SSH connections")
+        net=request('/api/v1/platform-network')[1]
+        net_groups={g['group']:g for g in net['server']['groups']}
+        ssh_started=net_groups['ssh_connect']['started']
+        require(ssh_started>=2 and 2<=net_groups['ssh_connect']['open_connections']<=3
+                and net_groups['ssh_exec']['started']>0
+                and net_groups['ssh_scp']['submitted_bytes']>=binary.stat().st_size
+                and net_groups['ssh_tunnel']['received_bytes']>0 and net_groups['ssh_tunnel']['submitted_bytes']>0,
+                'real SSH handshakes, exec/SCP data and reverse HTTPS bytes are counted separately without extra connections')
         require(persistent["credentials_saved"] and persistent["saved_credentials_usable"],"successful verified onboarding encrypts credentials and authorizes only this browser")
         require(persistent['deployment_mode']=='basic' and not persistent['redeploy_available'],"online machines expose their original mode but cannot be redeployed")
         redeploy_request={'confirmation':node_id,'username':current.pw_name,'use_saved':True,'connection_mode':'ssh','server_url':base_url}
@@ -431,6 +516,40 @@ sys.exit(0)
             require(request("/api/v1/machines/probe",{"host":"10.222.0.9","port":2222})[0]==200,"repeated fingerprint reads reuse the authenticated control handshake")
             request("/api/v1/platform-health")
         require(len(transports)==dial_count,"status/fingerprint/health inspection does not initiate more SSH connections")
+        current_net=request('/api/v1/platform-network')[1]
+        require(next(g for g in current_net['server']['groups'] if g['group']=='ssh_connect')['started']==ssh_started,
+                'reused channels and network inspection never masquerade as new SSH connection attempts')
+        monitoring_path=f'/api/v1/machines/{node_id}/monitoring'
+        require(request(monitoring_path,{'confirmation':node_id,'paused':True,'expected_revision':0})[0]==200,
+                'SSH-only node accepts monitoring pause without new authentication or installation')
+        deadline=time.monotonic()+25
+        while time.monotonic()<deadline:
+            paused_machine=next(m for m in request('/api/v1/machines')[1]['machines'] if m['node_id']==node_id)
+            if paused_machine['monitoring_applied_revision']==1:break
+            time.sleep(.25)
+        else:raise AssertionError('SSH-only Agent did not acknowledge monitoring pause')
+        frozen=next(n for n in request('/api/v1/nodes')[1]['nodes'] if n['id']==node_id)
+        time.sleep(12)
+        retained=next(m for m in request('/api/v1/machines')[1]['machines'] if m['node_id']==node_id)
+        require(retained['ssh_transport']['connections']==2 and len(transports)==dial_count
+                and next(n for n in request('/api/v1/nodes')[1]['nodes'] if n['id']==node_id)['metrics']==frozen['metrics'],
+                'pause stops SSH Agent metrics while retaining the same two established SSH sessions')
+        require(request(monitoring_path,{'confirmation':node_id,'paused':False,'expected_revision':1})[0]==200,
+                'page resume reuses the original SSH-only Agent identity')
+        deadline=time.monotonic()+75
+        while time.monotonic()<deadline:
+            resumed_node=next(n for n in request('/api/v1/nodes')[1]['nodes'] if n['id']==node_id)
+            if resumed_node['online'] and resumed_node['metrics'].get('agent_control')=={'revision':2,'paused':False}:break
+            time.sleep(.5)
+        else:
+            observed=next(m for m in request('/api/v1/machines')[1]['machines'] if m['node_id']==node_id)
+            print('DIAGNOSTIC SSH pause:',{k:observed.get(k) for k in ['monitoring_revision','monitoring_applied_revision','control_seen_at','ssh_transport']},flush=True)
+            log_path=home/'.easymanage/logs/agent.log'
+            if log_path.is_file():
+                with log_path.open() as paused_log: print_isolated_log_tail(paused_log,'SSH pause Agent',[enrollment,password,key_phrase,ed_private])
+            raise AssertionError('SSH-only Agent did not resume through its minute control poll')
+        require(len(transports)==dial_count and resumed_node['metrics']['privilege']==frozen['metrics']['privilege'],
+                'SSH-only minute control resumes real metrics without additional SSH handshakes or privilege changes')
         for transport in transports: transport.close()
         after_disconnect=time.time()
         deadline=time.monotonic()+110
@@ -646,6 +765,7 @@ sys.exit(0)
         require(full_node["metrics"]["privilege"]["uid"]==0 and full_node["metrics"]["privilege"]["mode"]=="full",
                 "Full deployment success requires the selected privilege and UID 0, not a Basic heartbeat")
         require(all(secret not in json.dumps(full_job) for secret in (password,key_phrase,ed_private)),"Full deployment logs exclude SSH keys, sudo passwords and private-key passphrases")
+        exercise_admin(full_created)
     finally:
         helper=home/".easymanage/bin/agent-user-control.py"
         if helper.is_file(): subprocess.run(["/usr/bin/python3",str(helper),"stop"],env=ssh_env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=25)

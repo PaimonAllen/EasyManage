@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
-import { addMachine, changeMachine, fetchMachineJob, fetchMachines, probeMachine, manageMachineSsh, redeployMachine } from "../api/client";
+import { addMachine, changeMachine, fetchMachineJob, fetchMachines, probeMachine, manageMachineSsh, redeployMachine, setMachineMonitoring } from "../api/client";
 import type { ManagedMachine, MachineDeployment, MachineStatus } from "../api/client";
 import { formatDate } from "../lib/format";
 import { MAX_PRIVATE_KEY_BYTES, clearMachineAuthentication, type MachineAuthentication, type MachineAuthMethod, type MachineDeploymentMode } from "../lib/machineAuthentication";
@@ -14,6 +14,16 @@ export function MachineManagement({ onRefresh }: { onRefresh: () => void }) {
   const [selected,setSelected]=useState<{machine:ManagedMachine;action:"edit"|"delete"|"restore"}|null>(null);
   const [job,setJob]=useState<{id:string;key:string}|null>(null);
   const [progress,setProgress]=useState<MachineDeployment|null>(null);
+  const [monitoringBusy,setMonitoringBusy]=useState(false);
+  async function toggleMonitoring(machine:ManagedMachine) {
+    if(monitoringBusy || job)return;
+    const paused=!machine.monitoring_paused;
+    if(!window.confirm(`${paused?"暂停":"恢复"}「${machine.display_name||machine.hostname}」的 Agent 监控？\n暂停后停止指标采集和上报，仅每分钟保留轻量控制；SSH 长连接保留。机器身份、历史和权限不变，恢复无需重装。`))return;
+    setMonitoringBusy(true);setError("");setMessage("");
+    try {setMessage((await setMachineMonitoring(machine,paused)).message);await refresh();onRefresh();}
+    catch(error){setError(error instanceof Error?error.message:"监控设置保存失败");}
+    finally{setMonitoringBusy(false);}
+  }
   const refresh=useCallback(async()=>{
     try {setStatus(await fetchMachines(AbortSignal.timeout(10_000)));setError("");}
     catch(error){setError(error instanceof Error?error.message:"机器管理接口不可用");}
@@ -36,7 +46,7 @@ export function MachineManagement({ onRefresh }: { onRefresh: () => void }) {
     void poll();return()=>{controller.abort();window.clearTimeout(timer);};
   },[job,refresh,onRefresh]);
   return <article className="data-panel machine-management">
-    <header className="panel-header"><div><h2>机器管理</h2><p>新增可选普通用户 / 管理员 · 默认 Basic，可后续提权 · 软删除保留历史和身份 · 当前仅支持 Linux</p></div>
+    <header className="panel-header"><div><h2>机器管理</h2><p>新增可选普通用户 / 管理员 · 默认 Basic，可后续提权 · 软删除保留历史和身份 · 当前仅支持 Linux</p><p>展开下方机器列表可暂停 / 恢复监控；暂停只保留每分钟轻量控制与 SSH 长连接，不删除机器。</p></div>
       <button className="button button--small" disabled={!status?.candidate_available||!status.ca_available||!status.registry_writable||!!job} onClick={()=>{setError("");setAdding(true);}}>添加机器</button></header>
     {status&&!status.candidate_available&&<p className="hint">最新 Agent 候选尚未发布，请先构建并发布后添加。</p>}
     {status&&!status.ca_available&&<p className="hint">Agent 信任 CA 尚不可用，请配置 EASYMANAGE_AGENT_CA_CERTIFICATE。</p>}
@@ -51,11 +61,12 @@ export function MachineManagement({ onRefresh }: { onRefresh: () => void }) {
       <div className="table-scroll"><table><thead><tr><th>机器</th><th>SSH 地址 / 用户</th><th>状态</th><th>操作</th></tr></thead><tbody>
         {status?.machines.map(machine=><tr key={machine.node_id}><td><strong>{machine.display_name||machine.hostname}</strong><small className="block">{machine.note||machine.hostname}</small></td>
           <td>{machine.host?`${machine.host}:${machine.port}`:"未配置可信目标"}<small className="block">{machine.username}</small></td>
-          <td>{machine.deleted_at?"已软删除":Date.now()-Date.parse(machine.last_seen)<45_000?"在线":"离线 / 等待部署"}
+          <td>{machine.deleted_at?"已软删除":machineMonitoringLabel(machine)}
             {machine.connection_mode==="ssh"&&<small className="block">SSH · {sshLabel(machine.ssh_transport?.status)} · {machine.ssh_transport?.connections??0}/3 条连接{machine.ssh_transport?.status==="reconnecting"?` · 重试 ${machine.ssh_transport.retry_attempt??0}/3（每 60 秒）`:""}</small>}
             {machine.ssh_transport?.last_error&&<small className="block">{machine.ssh_transport.last_error}</small>}
             {machine.credentials_saved&&<small className="block">SSH 凭据已加密保存</small>}</td>
           <td><div className="machine-actions"><button className="button button--small button--secondary" disabled={!machine.manageable||!!job} onClick={()=>setSelected({machine,action:"edit"})}>编辑</button>
+            {!machine.deleted_at&&<MachineMonitoringButton machine={machine} busy={monitoringBusy||!!job} onToggle={()=>void toggleMonitoring(machine)}/>}
             <button className="button button--small button--secondary" disabled={!machine.manageable||!!job} onClick={()=>setSelected({machine,action:machine.deleted_at?"restore":"delete"})}>{machine.deleted_at?"恢复":"软删除"}</button>
             {!machine.deleted_at&&machine.host&&<><button className="button button--small button--secondary" disabled={!!job} onClick={()=>setSshMachine(machine)}>SSH 长连接</button>
               <button className="button button--small button--secondary" disabled={!!job||!machine.redeploy_available||!status?.candidate_available||!status.ca_available||!status.registry_writable}
@@ -69,6 +80,25 @@ export function MachineManagement({ onRefresh }: { onRefresh: () => void }) {
       setRedeployTarget(null);setProgress({node_id:started.node_id,status:"running",progress:0,events:[]});setJob({id:started.job_id,key:started.job_key});
     }}/>}
   </article>;
+}
+
+export function machineMonitoringLabel(machine:ManagedMachine):string {
+  if(machine.monitoring_paused) {
+    if(!machine.monitoring_supported)return "暂停待确认 · 需更新 Agent";
+    if(machine.monitoring_applied_revision!==machine.monitoring_revision)return "暂停待确认";
+    return machine.control_seen_at && Date.now()-Date.parse(machine.control_seen_at)<150_000 ? "已暂停 · 轻量控制在线" : "已暂停 · 控制连接离线";
+  }
+  if((machine.monitoring_revision??0)>0 && machine.monitoring_applied_revision!==machine.monitoring_revision)return "恢复待确认（最多约 1 分钟）";
+  if((machine.monitoring_revision??0)>0 && machine.monitoring_reported_revision!==machine.monitoring_revision)return "已恢复 · 等待新指标";
+  return Date.now()-Date.parse(machine.last_seen)<45_000?"在线":"离线 / 等待部署";
+}
+
+export function MachineMonitoringButton({machine,busy,onToggle}:{machine:ManagedMachine;busy:boolean;onToggle:()=>void}) {
+  const label=machine.monitoring_paused?"恢复监控":"暂停监控";
+  return <button className="button button--small button--secondary" disabled={busy||machine.monitoring_revision===undefined}
+    aria-label={`${machine.display_name||machine.hostname} ${label}`}
+    title={machine.monitoring_revision===undefined?"需先更新平台后端":"只暂停采集与上报；保留每分钟控制检查和 SSH 长连接，恢复无需重新部署"}
+    onClick={onToggle}>{label}</button>;
 }
 
 export function RedeployMachineDialog({machine,onClose,onStarted}:{machine:ManagedMachine;onClose:()=>void;onStarted:(job:{job_id:string;job_key:string;node_id:string})=>void}){

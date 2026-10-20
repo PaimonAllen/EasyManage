@@ -8,7 +8,7 @@ mod linux;
 
 pub(crate) use contract::PlatformCollector;
 #[cfg(target_os = "linux")]
-pub(crate) use linux::inventory::effective_uid;
+pub(crate) use linux::NativeCollector;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::paths;
 
@@ -17,6 +17,6 @@ pub(crate) use linux::paths;
 pub(crate) async fn initialize(
     state_database: &std::path::Path,
     store: &crate::store::Store,
-) -> anyhow::Result<impl PlatformCollector> {
+) -> anyhow::Result<NativeCollector> {
     <linux::NativeCollector as PlatformCollector>::initialize(state_database, store).await
 }

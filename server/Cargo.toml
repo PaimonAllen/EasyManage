@@ -16,6 +16,7 @@ dotenvy.workspace = true
 easymanage-protocol = { path = "../protocol" }
 easymanage-runtime = { path = "../runtime" }
 hex.workspace = true
+http-body = "1.0.1"
 reqwest.workspace = true
 ring = "0.17.14"
 ssh2 = "0.9.6"

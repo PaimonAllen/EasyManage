@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { CollectionNotes, NodeStatus, SnapshotAge } from "../components/NodeStatus";
 import { PageHeading } from "../components/PageHeading";
+import { NodeCollectionToggle, useNodeCollection } from "../components/NodeCollectionControl";
 import { analyzeProxyPorts } from "../lib/proxyPorts";
 import type { NodeSummary, ProxyService } from "../types/monitoring";
 
@@ -18,22 +19,31 @@ interface ProxyRow {
   service: ProxyService;
 }
 
+export function proxyMonitoringVisible(node:NodeSummary,desired:boolean|undefined) {
+  return desired!==false && node.metrics?.collection_policy?.proxy_enabled!==false;
+}
+
 export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
   const [selectedNode, setSelectedNode] = useState("");
+  const {settings,settingsError,busy,errors,toggle}=useNodeCollection("proxy");
+  const enabledById=useMemo(()=>new Map(settings?.agents.map(agent=>[agent.node_id,agent.proxy_enabled])),[settings]);
+  const enabledFor=(id:string)=>enabledById.get(id);
   const visibleNodes = nodes.filter((node) => !selectedNode || node.id === selectedNode);
   const rows = useMemo<ProxyRow[]>(() => nodes
     .filter((node) => !selectedNode || node.id === selectedNode)
+    .filter((node) => proxyMonitoringVisible(node,enabledById.get(node.id)))
     .flatMap((node) => (node.metrics?.proxy_services ?? []).map((service) => ({ node, service })))
     .sort((left, right) => left.node.hostname.localeCompare(right.node.hostname)
       || left.service.username.localeCompare(right.service.username)
-      || left.service.name.localeCompare(right.service.name)), [nodes, selectedNode]);
+      || left.service.name.localeCompare(right.service.name)), [nodes, selectedNode,enabledById]);
   const current = rows.filter(({ node }) => inventoryFresh(node));
   const users = new Set(current.map(({ node, service }) => `${node.id}:${service.uid}`));
   const visibleListeners = current.reduce((count, { service }) => count + service.listen_addresses.length, 0);
   const portAnalysis = analyzeProxyPorts(current.map(({ node, service }) => ({
     nodeId: node.id, hostname: node.hostname, service,
   })));
-  const incomplete = visibleNodes.some((node) => !inventoryFresh(node)
+  const monitoredNodes = visibleNodes.filter(node=>proxyMonitoringVisible(node,enabledFor(node.id)));
+  const incomplete = monitoredNodes.some((node) => !inventoryFresh(node)
     || node.metrics?.privilege?.mode !== "full"
     || node.metrics?.collection_issues?.some((issue) =>
       (issue.component === "proxy" || issue.component === "processes")
@@ -46,11 +56,12 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
         ? { tone: "uncertain", label: "部分监听待确认" }
         : portAnalysis.observedListeners
           ? { tone: "healthy", label: "未发现可见冲突" }
-          : { tone: "unknown", label: "无可见监听" };
+          : { tone: "unknown", label: visibleNodes.length>0&&!monitoredNodes.length?"代理监控关闭或等待开启":"无可见监听" };
 
   return <>
     <PageHeading eyebrow="Proxy observability" title="Global Network · 代理" description="按服务器和用户查看 Clash / Mihomo、sing-box、V2Ray 等代理服务的只读运行观测" />
     <section className="page-content">
+      {settingsError&&<p className="form-error" role="alert">{settingsError}</p>}
       <article className="data-panel">
         <header className="panel-header"><div><h2>代理运行概览</h2><p>只统计新鲜 Agent 清单；不将历史快照算作当前运行。</p></div></header>
         <div className="health-grid">
@@ -60,16 +71,27 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
           <div><strong>跨境出口</strong><span className="muted">未验证</span><small>不主动探测外部站点</small></div>
         </div>
         <p className="hint">本页所说 Global Network 指跨境代理基础设施，不指 ZeroTier、VLAN 或节点拓扑。网卡与路由在「网络状态」，平台链路在「平台」。</p>
+        <p className="hint">每台机器可独立关闭代理采集；关闭机器不计入进程、用户、监听和冲突统计，也不展示旧代理快照。只关闭监控，不会停止实际代理，不影响其他指标；整机监控暂停时须先恢复整机监控。</p>
       </article>
       <div className="filters"><label htmlFor="proxy-node">查看节点</label><select id="proxy-node" value={selectedNode} onChange={(event) => setSelectedNode(event.target.value)}><option value="">所有节点</option>{nodes.map((node) => <option key={node.id} value={node.id}>{node.hostname}</option>)}</select></div>
       {visibleNodes.map((node) => {
+        const enabled=enabledFor(node.id);
+        const applied=node.metrics?.collection_policy?.proxy_enabled;
+        const hidden=!proxyMonitoringVisible(node,enabled);
         const services = node.metrics?.proxy_services ?? [];
         const accounts = new Set(services.map((service) => service.uid));
         return <article className="data-panel" key={node.id}>
-          <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p><SnapshotAge node={node} inventory /></p></div><span className={inventoryFresh(node) ? "positive" : "muted"}>{inventoryFresh(node) ? "当前观测" : "历史或未知"}</span></header>
+          <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p><SnapshotAge node={node} inventory /></p></div>
+            <NodeCollectionToggle hostname={node.hostname} label="代理监控采集" enabled={enabled} applied={applied}
+              unavailable={settings!==null&&enabled===undefined}
+              online={node.online} busy={!!busy[node.id]} onChange={()=>{if(enabled!==undefined)void toggle(node.id,enabled);}}/>
+          </header>
+          {errors[node.id]&&<p className="form-error" role="alert">{errors[node.id]}</p>}
+          {hidden?<p className="table-empty">{enabled===true?"代理采集正在开启，等待 Agent 应用并采集新清单。":"代理监控采集已关闭，不展示旧快照。"}{enabled===false?(applied===false?"Agent 已确认停止代理采集。":"等待 Agent 应用；离线或旧版节点暂不能确认。"):""}</p>:<>
           <p>{services.length} 个可见代理进程 · {accounts.size} 个用户上下文 · Agent {node.metrics?.privilege?.mode ?? "未知"} 权限</p>
           {!services.length && <p className="table-empty">当前权限下未观测到已识别的代理进程；不代表该节点没有代理。</p>}
           <CollectionNotes node={node} components={["proxy", "processes", "privilege"]} />
+          </>}
         </article>;
       })}
       <article className="data-panel">
@@ -92,7 +114,7 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
             <td className={inventoryFresh(node) ? "positive" : "muted"}>{inventoryFresh(node) ? "新鲜" : "历史"}</td>
           </tr>)}
         </tbody></table></div>
-        {!rows.length && <p className="table-empty">所选节点当前没有可见的代理实例。</p>}
+        {!rows.length && <p className="table-empty">{visibleNodes.length>0&&!monitoredNodes.length?"所选机器的代理监控已关闭或等待开启，不展示历史实例。":"所选节点当前没有可见的代理实例。"}</p>}
         <p className="hint">“疑似冲突”指同一节点、同一协议与地址族中，不同代理进程的实际监听地址重叠；共享套接字等合法复用无法仅凭快照排除。不同节点、TCP 与 UDP 同号端口不算冲突，IPv4/IPv6 双栈重叠因 v6only 未知单独标为待确认。未发现可见冲突不代表配置端口未被其他进程占用。Basic Agent 可能看不到其他用户的进程或监听；不读取代理配置、环境变量、订阅和凭据，也不测试境外出口。</p>
       </article>
     </section>

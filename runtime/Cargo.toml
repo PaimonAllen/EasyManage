@@ -10,5 +10,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+chrono.workspace = true
 easymanage-protocol = { path = "../protocol" }
 tokio.workspace = true

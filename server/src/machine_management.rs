@@ -305,11 +305,12 @@ async fn redeploy(State(state): State<OperationsState>, Path(id): Path<Uuid>, ur
     if request.username!=target.default_user {
         return Err(OperationsError::bad_request("重新部署必须使用原登记 SSH 账户、地址和主机公钥，不能更换机器身份"));
     }
-    let row = sqlx::query("SELECT n.deleted_at,n.last_seen,COALESCE(n.display_name,n.hostname) AS name,m.metrics->'privilege'->>'mode' AS mode FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.id=$1")
+    let row = sqlx::query("SELECT n.deleted_at,n.last_seen,n.monitoring_paused,COALESCE(n.display_name,n.hostname) AS name,m.metrics->'privilege'->>'mode' AS mode FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.id=$1")
         .bind(id).fetch_optional(&state.pool).await.map_err(|_|OperationsError::busy())?
         .ok_or(OperationsError::bad_request("原机器不存在，不能重新部署"))?;
     let deleted: Option<DateTime<Utc>> = row.get("deleted_at");
     if deleted.is_some() { return Err(OperationsError::bad_request("请先恢复已软删除的机器，再按原 ID 重新部署")); }
+    if row.get::<bool,_>("monitoring_paused") { return Err(OperationsError::bad_request("机器监控已暂停；恢复监控即可，不应重新部署或更换身份")); }
     let last_seen: DateTime<Utc> = row.get("last_seen");
     if last_seen>Utc::now()-chrono::Duration::seconds(state.config.online_window_seconds) {
         return Err(OperationsError::bad_request("机器仍有近期心跳；重新部署仅用于已卸载的离线机器，在线机器请使用更新或重启"));
@@ -552,7 +553,7 @@ fn configure_network(session: &Session, request: &AddMachine, target: &Target, u
         shell_quote(&target.agent_home.to_string_lossy()), shell_quote(&target.node_id.to_string()), shell_quote(url),
         shell_quote(target.ca_sha256.as_deref().ok_or(OperationsError::registry())?), shell_quote(request.deployment_mode.name()));
     let invocation = if request.deployment_mode==DeploymentMode::Full && request.username!="root" { format!("/usr/bin/sudo -k -S -p '' {invocation}") } else { invocation };
-    let mut channel = session.channel_session().map_err(|_| OperationsError::ssh("网络配置通道不可用"))?;
+    let mut channel = crate::network::ssh_channel(&session).map_err(|_| OperationsError::ssh("网络配置通道不可用"))?;
     channel.handle_extended_data(ExtendedData::Ignore).map_err(|_| OperationsError::busy())?;
     channel.exec(&invocation).map_err(|_| OperationsError::ssh("网络配置启动失败"))?;
     if request.deployment_mode==DeploymentMode::Full && request.username!="root" {
@@ -654,7 +655,7 @@ async fn list(
 ) -> Result<Json<serde_json::Value>, OperationsError> {
     let targets = load_all_targets(&state.registry)?;
     let platform_admin_available = platform_target(&state).is_ok();
-    let rows = sqlx::query("SELECT n.id,n.hostname,n.display_name,n.management_note,n.deleted_at,n.last_seen,m.metrics->'privilege'->>'mode' AS mode FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id ORDER BY n.hostname")
+    let rows = sqlx::query("SELECT n.id,n.hostname,n.display_name,n.management_note,n.deleted_at,n.last_seen,n.monitoring_paused,n.monitoring_revision,n.monitoring_applied_revision,n.control_seen_at,m.metrics->'agent_control' AS agent_control,m.metrics->'privilege'->>'mode' AS mode FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id ORDER BY n.hostname")
         .fetch_all(&state.pool).await.map_err(|_| OperationsError::busy())?;
     let machines: Vec<_> = rows.iter().map(|row| {
         let id: Uuid = row.get("id");
@@ -663,6 +664,12 @@ async fn list(
         let last_seen: DateTime<Utc> = row.get("last_seen");
         let deleted: Option<DateTime<Utc>> = row.get("deleted_at");
         json!({"node_id":id,"hostname":row.get::<String,_>("hostname"),
+            "monitoring_paused":row.get::<bool,_>("monitoring_paused"),
+            "monitoring_revision":row.get::<i64,_>("monitoring_revision"),
+            "monitoring_applied_revision":row.get::<Option<i64>,_>("monitoring_applied_revision"),
+            "control_seen_at":row.get::<Option<DateTime<Utc>>,_>("control_seen_at"),
+            "monitoring_supported":row.get::<Option<serde_json::Value>,_>("agent_control").is_some_and(|v|!v.is_null()) || row.get::<Option<i64>,_>("monitoring_applied_revision").is_some(),
+            "monitoring_reported_revision":row.get::<Option<serde_json::Value>,_>("agent_control").and_then(|v|v.get("revision").and_then(serde_json::Value::as_u64)),
             "display_name":row.get::<Option<String>,_>("display_name"),
             "note":row.get::<String,_>("management_note"),"deleted_at":row.get::<Option<DateTime<Utc>>,_>("deleted_at"),
             "last_seen":row.get::<DateTime<Utc>,_>("last_seen"),
@@ -671,7 +678,7 @@ async fn list(
             "connection_mode":target.map(|t|t.connection_mode),
             "credentials_saved":target.is_some_and(|t|ssh_vault::exists(&state.registry,t)),
             "deployment_mode":target.map(|t|preserved_mode(t,observed.as_deref()).name()),
-            "redeploy_available":deleted.is_none() && last_seen<=Utc::now()-chrono::Duration::seconds(state.config.online_window_seconds)
+            "redeploy_available":!row.get::<bool,_>("monitoring_paused") && deleted.is_none() && last_seen<=Utc::now()-chrono::Duration::seconds(state.config.online_window_seconds)
                 && target.is_some_and(|t|t.ssh_alias.as_deref()!=Some("local")),
             "saved_credentials_usable":target.is_some_and(|t|ssh_vault::load(&state.registry,t).is_ok_and(|s|ssh_vault::authorized(&s,t,&headers))),
             "ssh_transport":target.filter(|t|t.connection_mode==ssh_transport::Mode::Ssh).map(ssh_transport::status)})
@@ -905,8 +912,7 @@ fn agent_ca(state: &OperationsState) -> Result<Vec<u8>, OperationsError> {
 }
 
 pub(super) fn command(session: &Session, invocation: &str) -> Result<String, OperationsError> {
-    let mut channel = session
-        .channel_session()
+    let mut channel = crate::network::ssh_channel(session)
         .map_err(|_| OperationsError::ssh("SSH 通道不可用"))?;
     channel.handle_extended_data(ExtendedData::Merge).map_err(|_| OperationsError::ssh("SSH 通道初始化失败"))?;
     channel
@@ -1018,8 +1024,7 @@ fn upload(
     bytes: &[u8],
     mode: i32,
 ) -> Result<(), OperationsError> {
-    let mut stream = session
-        .scp_send(path, mode, bytes.len() as u64, None)
+    let mut stream = crate::network::scp_send(session,path, mode, bytes.len() as u64)
         .map_err(|_| OperationsError::ssh("上传暂存文件失败"))?;
     stream
         .write_all(bytes)
@@ -1081,9 +1086,10 @@ pub(super) fn update_over_ssh(target: &Target, binary: &FsPath, full: bool) -> R
 pub(super) fn finish_full_ssh_update(target: &Target, credentials: Credentials, stage: &str, hash: &str, cancellation: &Cancellation) -> Result<(), OperationsError> {
     let session = ssh_connect(target, &credentials, cancellation)?;
     session.set_timeout(60_000);
+    let sudo_password = Zeroizing::new(credentials.sudo_secret().to_owned());
     let request = AddMachine { host:target.host,port:target.port,display_name:target.hostname.clone(),server_url:target.server_url.clone().unwrap_or_default(),
         connection_mode:ssh_transport::Mode::Ssh,fingerprint:String::new(),username:credentials.username,deployment_mode:DeploymentMode::Full,
-        sudo_password:credentials.password,auth_method:AuthMethod::Password,password:Zeroizing::new(String::new()),private_key:Zeroizing::new(String::new()),passphrase:Zeroizing::new(String::new()) };
+        sudo_password,auth_method:AuthMethod::Password,password:Zeroizing::new(String::new()),private_key:Zeroizing::new(String::new()),passphrase:Zeroizing::new(String::new()) };
     let invocation = format!("/usr/bin/timeout --signal=TERM --kill-after=3s 50s /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -c {} -- {} {} {} {}",
         shell_quote(include_str!("../../deploy/linux/operations/update-full-over-ssh.sh")),shell_quote(stage),shell_quote(&target.node_id.to_string()),shell_quote(hash),shell_quote(target.ca_sha256.as_deref().ok_or(OperationsError::registry())?));
     admin_command(&session,&request,&invocation)
@@ -1115,8 +1121,8 @@ fn checked_local_https(state: &OperationsState, handle: &tokio::runtime::Handle,
     let client = reqwest::Client::builder().add_root_certificate(certificate).no_proxy()
         .redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(5)).build()
         .map_err(|_| OperationsError::registry())?;
-    let ready = handle.block_on(async { client.get(format!("https://{local}/api/v1/health/ready")).send().await
-        .is_ok_and(|response| response.status().is_success()) });
+    let ready = handle.block_on(async { crate::network::service_request(client.get(format!("https://{local}/api/v1/health/ready")),easymanage_protocol::NetworkGroup::HttpProbe).await
+        .is_ok_and(|response| response.status.is_success()) });
     if !ready { return Err(OperationsError::ssh("SSH 上报需要平台回环 HTTPS 可达且证书包含 127.0.0.1；请检查 CA/证书，不会跳过校验")); }
     Ok(local)
 }
@@ -1126,7 +1132,7 @@ fn checked_local_https(state: &OperationsState, handle: &tokio::runtime::Handle,
 fn admin_command(session: &Session, request: &AddMachine, invocation: &str) -> Result<(), OperationsError> {
     let invocation = if request.username == "root" { invocation.to_owned() }
         else { format!("/usr/bin/sudo -k -S -p '' {invocation}") };
-    let mut channel = session.channel_session().map_err(|_| OperationsError::ssh("管理员通道不可用"))?;
+    let mut channel = crate::network::ssh_channel(session).map_err(|_| OperationsError::ssh("管理员通道不可用"))?;
     channel.handle_extended_data(ExtendedData::Merge).map_err(|_| OperationsError::ssh("管理员通道初始化失败"))?;
     channel.exec(&invocation).map_err(|_| OperationsError::ssh("管理员操作启动失败"))?;
     if request.username != "root" {
@@ -1565,6 +1571,7 @@ async fn change(
     let credentials = Credentials {
         username: request.username,
         password: request.password,
+        ..Default::default()
     };
     let actor = credentials.username.clone();
     validate_credentials(&credentials)?;
@@ -1671,8 +1678,7 @@ fn verify_admin(session: &Session, credentials: &Credentials) -> Result<(), Oper
     if command(session, "/usr/bin/id -u")?.trim() == "0" {
         return Ok(());
     }
-    let mut channel = session
-        .channel_session()
+    let mut channel = crate::network::ssh_channel(&session)
         .map_err(|_| OperationsError::ssh("管理员认证通道失败"))?;
     channel
         .exec("/usr/bin/sudo -k -S -p '' /usr/bin/true")

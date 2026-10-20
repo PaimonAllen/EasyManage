@@ -266,6 +266,8 @@ summary:focus-visible {
 .node-card--offline {
   opacity: 0.65;
 }
+.status--paused { color: var(--muted); }
+.status--paused i { background: currentColor; }
 .node-card__header {
   padding: 10px 10px;
   display: flex;
@@ -1793,6 +1795,9 @@ select:disabled {
 }
 .agent-management-hint { padding: 0 24px; }
 .agent-management-form { padding: 0 24px; }
+.admin-credentials { min-width: 0; margin: 12px 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
+.admin-credentials legend { padding: 0 6px; }
+.admin-credentials label { display: grid; gap: 8px; margin-bottom: 12px; }
 .agent-management-results { padding: 0 24px; font-size: 12px; }
 .agent-management-results p { margin: 8px 0; overflow-wrap: anywhere; }
 .platform-performance-hint { padding: 0 24px; }
@@ -1996,3 +2001,13 @@ select:disabled {
 .collection-settings-table td:nth-child(4) { white-space: nowrap; }
 .collection-settings-table input { width: 110px; padding: 8px; background: var(--surface); color: inherit; border: 1px solid var(--line); border-radius: 6px; }
 .collection-settings-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 16px 24px; }
+.user-collection-actions { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.user-collection-control { display: grid; gap: 4px; }
+.user-collection-control label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.user-collection-control input { appearance: none; position: relative; width: 34px; height: 20px; padding: 0; margin: 0; border: 1px solid var(--border); border-radius: 12px; background: var(--muted); cursor: pointer; }
+.user-collection-control input::before { content: ""; position: absolute; width: 14px; height: 14px; left: 2px; top: 2px; border-radius: 50%; background: white; transition: transform .15s; }
+.user-collection-control input:checked { background: var(--cyan); }
+.user-collection-control input:checked::before { transform: translateX(14px); }
+.user-collection-control input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+.user-collection-control input:disabled { cursor: wait; }
+.network-resource-table { min-width: 1250px; }

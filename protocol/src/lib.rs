@@ -282,9 +282,17 @@ pub struct HostTemperatures {
 
 pub mod collection;
 pub use collection::CollectionPolicy;
+pub mod control;
+pub use control::{AgentControl, AgentControlRequest, AgentControlResponse};
+pub mod network;
+pub use network::{NetworkActivity,NetworkGroup,NetworkGroupMetric};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MetricsSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_control: Option<AgentControl>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub network_activity: Option<NetworkActivity>,
     #[serde(default)]
     pub hardware_details: Option<HardwareDetails>,
     #[serde(default)]
@@ -372,6 +380,8 @@ pub struct AgentReport {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AgentReportResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_control: Option<AgentControl>,
     pub accepted_at: DateTime<Utc>,
     #[serde(default)]
     pub collection_policy: Option<CollectionPolicy>,
@@ -409,6 +419,12 @@ pub struct LiveNodeListResponse {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NodeSummary {
+    #[serde(default)]
+    pub monitoring_paused: bool,
+    #[serde(default)]
+    pub monitoring_revision: u64,
+    #[serde(default)]
+    pub monitoring_applied_revision: Option<u64>,
     pub id: Uuid,
     pub hostname: String,
     pub os_name: String,
