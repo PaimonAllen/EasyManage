@@ -29,3 +29,25 @@ expiring, single-node onboarding tokens, consumed within the enrollment transact
 Deletion/restore/enrollment share a per-node advisory transaction lock. The schema
 change needs a brief exclusive lock with a 2-second lock timeout; deploy only in
 an approved maintenance window. No remote service is changed by this migration.
+
+`0009_node_user_collection.sql` creates a per-node user/session collection switch.
+Absent rows default to enabled. It does not rewrite metrics, change accounts or
+services, or remove history. The foreign key uses a 2-second lock timeout; apply
+only during an approved platform update. Update the platform before Agents.
+
+`0010_node_permission_collection.sql` adds a separate per-node permission-audit
+switch, defaulting to enabled. It never changes filesystem/account permissions or
+rewrites history. It uses a 2-second lock timeout; deploy the platform first, then
+Agents, only in an approved production update window.
+
+`0011_node_monitoring_pause.sql` stores per-node monitoring intent, revision and
+Agent acknowledgement/control timestamp. Defaults retain current monitoring.
+It does not delete history, rotate credentials, stop services or change privileges.
+Adding columns requires a brief exclusive table lock, bounded by a 2-second lock
+timeout. Apply only during an approved platform update, then update Agents.
+
+`0012_node_proxy_collection.sql` adds an independent per-node proxy-monitoring
+switch, default enabled. It never stops real proxies or modifies their settings,
+accounts or history. The foreign key takes a brief table lock, bounded by a
+2-second lock timeout; apply only during an approved platform update, before
+updating Agents. Older Agent report/control peers omit unsupported policy flags.
