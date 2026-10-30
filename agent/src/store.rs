@@ -13,6 +13,14 @@ pub struct Store {
 }
 
 impl Store {
+    pub(crate) async fn network_capacity_cache(&self) -> Result<Option<String>> {
+        self.metadata("network_capacity_v1").await
+    }
+
+    pub(crate) async fn save_network_capacity_cache(&self, value: &str) -> Result<()> {
+        self.set_metadata("network_capacity_v1", value).await
+    }
+
     pub async fn proxy_enabled(&self) -> Result<bool> {
         match self.metadata("proxy_enabled").await?.as_deref() {
             None | Some("true") => Ok(true),

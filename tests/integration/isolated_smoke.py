@@ -226,6 +226,9 @@ def exercise_api(base_url, context, enrollment_token, node_id):
         "disks": [
             {"name": "synthetic-disk", "mount_point": "/", "file_system": "ext4", "total_bytes": 1000000, "available_bytes": 600000, "read_bytes_per_second": 1536.0, "written_bytes_per_second": 768.0},
             {"name": "synthetic-disk", "mount_point": "/data", "file_system": "ext4", "total_bytes": 1000000, "available_bytes": 600000, "read_bytes_per_second": 1536.0, "written_bytes_per_second": 768.0},
+            {"name":"198.51.100.1:/export","mount_point":"/nfs","file_system":"nfs4","total_bytes":0,"available_bytes":0,"read_bytes_per_second":None,"written_bytes_per_second":None,
+             "mount":{"device_id":"0:41","root":"/","source":"198.51.100.1:/export","network":True,"read_only":False,"capacity_known":False,
+                      "capacity_probe":{"interval_seconds":3600,"attempted_at":collected.isoformat(),"collected_at":None,"status":"timeout"}}},
         ],
         "block_devices": [{"name": "synthetic-disk", "path": "/dev/synthetic-disk", "kind": "disk", "size_bytes": 1000000,
                            "filesystem": None, "label": None, "mount_points": [], "model": "Test Drive", "transport": "virtio",
@@ -299,6 +302,14 @@ def exercise_api(base_url, context, enrollment_token, node_id):
             and node["metrics"]["overlay_networks"][0]["provider"] == "tailscale"
             and parse_timestamp(node["metrics"]["disk_collected_at"]) == collected,
             "CPU/memory/disk/network/GPU/user payload round trip")
+    network_mount=next(disk for disk in node['metrics']['disks'] if disk['mount_point']=='/nfs')
+    require(network_mount['mount']['capacity_probe']['interval_seconds']==3600
+            and network_mount['mount']['capacity_probe']['status']=='timeout'
+            and network_mount['mount']['capacity_probe']['collected_at'] is None,
+            'hourly network capacity timestamps and failure state survive HTTPS/database round trip')
+    require(network_mount['mount']['network'] and network_mount['mount']['capacity_known'] is False
+            and network_mount['mount']['source']=='198.51.100.1:/export',
+            'network mount identity and explicit unknown capacity survive HTTPS/database round trip alongside legacy disks')
     status, history = request(f"/api/v1/nodes/{node_id}/history")
     require(status == 200 and history["node_id"] == node_id and history["window_seconds"] == 600
             and len(history["points"]) == 1 and history["points"][0]["cpu_usage_percent"] == 37.5

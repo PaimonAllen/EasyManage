@@ -6,6 +6,10 @@ export interface DiskMetric {
   available_bytes: number;
   read_bytes_per_second?: number | null;
   written_bytes_per_second?: number | null;
+  mount?: {
+    device_id:string;root:string;source:string;network:boolean;read_only:boolean;capacity_known:boolean;
+    capacity_probe?: {interval_seconds:number;attempted_at:string|null;collected_at:string|null;status:string} | null;
+  } | null;
 }
 
 export interface BlockDevice {

@@ -14,6 +14,7 @@ easymanage-protocol = { path = "../protocol" }
 easymanage-runtime = { path = "../runtime" }
 reqwest.workspace = true
 rustls.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sqlx = { workspace = true, features = ["sqlite"] }
 sysinfo.workspace = true

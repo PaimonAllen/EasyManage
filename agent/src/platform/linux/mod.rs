@@ -5,6 +5,8 @@ mod ai_tools;
 mod block_devices;
 mod collector;
 mod hardware;
+mod mounts;
+mod network_capacity;
 pub(super) mod inventory;
 mod overlay_networks;
 pub(crate) mod paths;

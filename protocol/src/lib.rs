@@ -32,6 +32,28 @@ pub struct DiskMetric {
     pub read_bytes_per_second: Option<f64>,
     #[serde(default)]
     pub written_bytes_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount: Option<MountIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MountIdentity {
+    pub device_id: String,
+    pub root: String,
+    pub source: String,
+    pub network: bool,
+    pub read_only: bool,
+    pub capacity_known: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_probe: Option<NetworkCapacityProbe>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NetworkCapacityProbe {
+    pub interval_seconds: u64,
+    pub attempted_at: Option<DateTime<Utc>>,
+    pub collected_at: Option<DateTime<Utc>>,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -155,9 +177,19 @@ pub struct HardwareDetails {
 
 impl HardwareDetails {
     pub fn valid(&self) -> bool {
-        [&self.processors, &self.motherboard, &self.memory, &self.graphics,
-         &self.displays, &self.disks, &self.audio, &self.network, &self.notes]
-            .into_iter().all(|items| items.len() <= 128 && items.iter().all(|text| text.len() <= 1024))
+        [
+            &self.processors,
+            &self.motherboard,
+            &self.memory,
+            &self.graphics,
+            &self.displays,
+            &self.disks,
+            &self.audio,
+            &self.network,
+            &self.notes,
+        ]
+        .into_iter()
+        .all(|items| items.len() <= 128 && items.iter().all(|text| text.len() <= 1024))
     }
 }
 
@@ -285,13 +317,13 @@ pub use collection::CollectionPolicy;
 pub mod control;
 pub use control::{AgentControl, AgentControlRequest, AgentControlResponse};
 pub mod network;
-pub use network::{NetworkActivity,NetworkGroup,NetworkGroupMetric};
+pub use network::{NetworkActivity, NetworkGroup, NetworkGroupMetric};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MetricsSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_control: Option<AgentControl>,
-    #[serde(default,skip_serializing_if="Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_activity: Option<NetworkActivity>,
     #[serde(default)]
     pub hardware_details: Option<HardwareDetails>,

@@ -1,5 +1,5 @@
 use super::inventory::{ExtendedInventory, issue};
-use super::{hardware, permissions, temperature};
+use super::{hardware, mounts, network_capacity, permissions, temperature};
 use crate::platform::common::gpu;
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{DiskRefreshKind, Disks, Networks, System};
 
 const GPU_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const STORAGE_FOOTPRINT_INTERVAL: Duration = Duration::from_secs(3_600);
@@ -38,6 +38,8 @@ pub struct Collector {
     disk_refreshed_at: Instant,
     disk_collected_at: Option<DateTime<Utc>>,
     cached_disks: Vec<DiskMetric>,
+    mount_inventory_failed: bool,
+    network_capacity: network_capacity::Sampler,
     gpu_retry_at: Option<Instant>,
     gpu_issue: Option<String>,
     inventory: Option<NodeInventory>,
@@ -63,7 +65,7 @@ impl Collector {
         let mut system = System::new();
         system.refresh_cpu_all();
         system.refresh_memory();
-        let disks = Disks::new_with_refreshed_list();
+        let disks = Disks::new();
         let networks = Networks::new_with_refreshed_list();
         let network_refreshed_at = Instant::now();
         tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
@@ -89,6 +91,8 @@ impl Collector {
             .and_then(|details| hardware::cache_age(details.collected_at, Utc::now()))
             .and_then(|age| Instant::now().checked_sub(age));
 
+        let network_capacity =
+            network_capacity::Sampler::load(state_database, extended.privilege.uid, store).await;
         Self {
             cached_temperatures: None,
             temperature_refreshed_at: None,
@@ -113,6 +117,8 @@ impl Collector {
             disk_refreshed_at: Instant::now(),
             disk_collected_at: None,
             cached_disks: Vec::new(),
+            mount_inventory_failed: false,
+            network_capacity,
             gpu_retry_at: None,
             gpu_issue: None,
             inventory: None,
@@ -261,6 +267,9 @@ impl Collector {
             ));
         }
         self.collect_disks();
+        self.network_capacity
+            .refresh(&mut self.cached_disks, &self.store)
+            .await;
         if self.temperature_refreshed_at.is_none_or(|at| {
             at.elapsed() + Duration::from_millis(250)
                 >= Duration::from_secs(self.policy.disk_seconds.max(30))
@@ -289,6 +298,12 @@ impl Collector {
             self.gpu_collected_at = Some(Utc::now());
         }
         let mut collection_issues = self.extended.issues.clone();
+        if self.mount_inventory_failed {
+            collection_issues.push(issue(
+                "disk",
+                "挂载清单不可读取；网络挂载及共享关系可能不完整",
+            ));
+        }
         if let Some(message) = &self.gpu_issue {
             collection_issues.push(issue("gpu", &message));
         }
@@ -442,7 +457,17 @@ impl Collector {
             || self.disk_refreshed_at.elapsed() + Duration::from_millis(250)
                 >= Duration::from_secs(self.policy.disk_seconds)
         {
-            self.disks.refresh(true);
+            // Discover without statvfs; sysinfo only excludes a subset of
+            // network filesystem types by default (e.g. not SSHFS or Ceph).
+            self.disks
+                .refresh_specifics(true, DiskRefreshKind::nothing());
+            for disk in self.disks.list_mut() {
+                if !mounts::is_network_filesystem(&disk.file_system().to_string_lossy())
+                    && disk.file_system() != "autofs"
+                {
+                    disk.refresh_specifics(DiskRefreshKind::nothing().with_storage());
+                }
+            }
             let disk_totals = read_disk_totals();
             let disk_refreshed_at = Instant::now();
             let disk_elapsed = disk_refreshed_at
@@ -459,6 +484,7 @@ impl Collector {
                         .and_then(|key| self.disk_totals.as_ref()?.get(key));
                     let (read_rate, write_rate) = disk_rates(previous, current, disk_elapsed);
                     DiskMetric {
+                        mount: None,
                         name: disk.name().to_string_lossy().into_owned(),
                         mount_point: disk.mount_point().to_string_lossy().into_owned(),
                         file_system: disk.file_system().to_string_lossy().into_owned(),
@@ -471,6 +497,13 @@ impl Collector {
                     }
                 })
                 .collect();
+            match mounts::read() {
+                Ok(inventory) => {
+                    mounts::enrich(&mut self.cached_disks, inventory);
+                    self.mount_inventory_failed = false;
+                }
+                Err(_) => self.mount_inventory_failed = true,
+            }
             self.disk_totals = disk_totals;
             self.disk_refreshed_at = disk_refreshed_at;
             self.disk_collected_at = Some(Utc::now());
