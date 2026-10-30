@@ -400,7 +400,7 @@ try {
   assert.ok(redeployDialog.includes("重新部署 Agent")&&redeployDialog.includes("original-fixture-uuid")&&redeployDialog.includes("保留原机器 ID、历史、名称和备注"));
   assert.ok(redeployDialog.includes("保持原权限：管理员 Full")&&redeployDialog.includes('value="ssh" selected=""'));
   assert.ok(!redeployDialog.includes('type="password"')&&!redeployDialog.includes('type="file"'));
-  assert.ok(redeployDialog.includes("拒绝覆盖")&&redeployDialog.includes("确认原 Agent 已卸载")&&redeployDialog.includes("disabled"));
+  assert.ok(redeployDialog.includes("覆盖修复")&&redeployDialog.includes("保留历史和本地数据库")&&redeployDialog.includes("其他机器 ID")&&redeployDialog.includes("disabled"));
   const manualRedeploy=renderToStaticMarkup(React.createElement(RedeployMachineDialog,{...redeployProps,machine:{...redeployProps.machine,saved_credentials_usable:false}}));
   assert.ok(manualRedeploy.includes('type="password"')&&manualRedeploy.includes("sudo 密码"));
   console.log("PASS same-UUID redeployment confirmation, preserved Full privilege, original target and encrypted-credential reuse");

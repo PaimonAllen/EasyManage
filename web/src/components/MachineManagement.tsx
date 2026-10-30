@@ -70,7 +70,7 @@ export function MachineManagement({ onRefresh }: { onRefresh: () => void }) {
             <button className="button button--small button--secondary" disabled={!machine.manageable||!!job} onClick={()=>setSelected({machine,action:machine.deleted_at?"restore":"delete"})}>{machine.deleted_at?"恢复":"软删除"}</button>
             {!machine.deleted_at&&machine.host&&<><button className="button button--small button--secondary" disabled={!!job} onClick={()=>setSshMachine(machine)}>SSH 长连接</button>
               <button className="button button--small button--secondary" disabled={!!job||!machine.redeploy_available||!status?.candidate_available||!status.ca_available||!status.registry_writable}
-                title="仅用于已卸载的离线节点；保留原机器 ID 和历史，不覆盖仍存在的身份数据" onClick={()=>setRedeployTarget(machine)}>重新部署</button></>}</div></td></tr>)}
+                title="离线节点可覆盖修复原 Agent；保留原机器 ID、本地数据库和平台历史" onClick={()=>setRedeployTarget(machine)}>重新部署</button></>}</div></td></tr>)}
       </tbody></table></div>
     </details>
     {adding&&<AddMachineDialog onClose={()=>setAdding(false)} onStarted={started=>{setAdding(false);setProgress({node_id:started.node_id,status:"running",progress:0,events:[]});setJob({id:started.job_id,key:started.job_key});}}/>}
@@ -137,12 +137,12 @@ export function RedeployMachineDialog({machine,onClose,onStarted}:{machine:Manag
     <p>{machine.username}@{machine.host}:{machine.port}</p>
     <div className="notice"><strong>保留原机器 ID、历史、名称和备注</strong><code className="block">{machine.node_id}</code>
       <p>保持原权限：{machine.deployment_mode==="full"?"管理员 Full（root 系统服务）":"普通用户 Basic（全部位于原 SSH 用户 ~/.easymanage 内）"}。此入口不更换地址、账户、主机公钥或权限级别。</p></div>
-    <p className="hint">仅用于已经卸载的离线节点。平台下发最新候选，重新安装并等待新的真实心跳；注册成功后旧 Agent 凭据失效。若仍有进程、配置、服务或身份库，将拒绝覆盖，请使用更新或 SSH 重连。不会删除旧文件、强杀进程或重启目标机器。</p>
+    <p className="hint">支持离线节点覆盖修复，也支持已卸载后重装。核验属于同一机器 ID 后，备份并覆盖程序、配置和服务，仅重启本 Agent；保留原 SQLite 身份、待上报数据、采集设置和平台历史，不删除数据库、不重启机器。其他机器 ID 或 Basic / Full 冲突仍会拒绝覆盖。连接凭据会重新签发，原机器 ID 不变。</p>
     <AgentConnectionSettings url={url} busy={busy} onChange={setUrl} mode={connectionMode} onModeChange={setConnectionMode}/>
     {machine.saved_credentials_usable&&<label className="machine-confirm"><input type="checkbox" checked={useSaved} disabled={busy} onChange={event=>{clear();setUseSaved(event.target.checked);}}/>使用平台已加密保存的 SSH 凭据</label>}
     {!useSaved&&<SshAuthenticationFields method={method} onMethodChange={value=>{clear();setMethod(value);}} busy={busy} required passwordRef={password} keyRef={key} passphraseRef={phrase}/>}
     {!useSaved&&machine.deployment_mode==="full"&&machine.username!=="root"&&<label>sudo 密码（如需）<input ref={sudo} type="password" autoComplete="off" maxLength={1024} disabled={busy}/><small>密码登录时留空复用 SSH 密码；私钥登录可单独提供 sudo 密码。</small></label>}
-    <label className="machine-confirm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event=>setConfirmed(event.target.checked)}/>确认原 Agent 已卸载；按以上原机器 ID 重新部署，不新增机器。</label>
+    <label className="machine-confirm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event=>setConfirmed(event.target.checked)}/>确认按以上原机器 ID 覆盖修复并重启 Agent；保留历史和本地数据库，不新增机器。</label>
     <p className="hint">凭据仅以密文保存在平台，不回传明文、不写日志；复用可信 SSH，最多 3 条长连接。任务进度和日志会显示在机器管理中。</p>
     {error&&<p className="form-error" role="alert">{error}</p>}
     <div className="dialog-actions"><button type="button" className="button button--secondary" disabled={busy} onClick={onClose}>取消</button><button className="button" disabled={busy||!confirmed}>{busy?"提交中…":"确认重新部署"}</button></div>

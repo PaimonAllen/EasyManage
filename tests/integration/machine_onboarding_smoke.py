@@ -23,6 +23,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 
 def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False, admin_only=False):
@@ -178,7 +179,7 @@ sys.exit(2)
                 completed=subprocess.run(shlex.split(command),input=payload,env=ssh_env,capture_output=True,timeout=15)
                 for index in range(len(payload)): payload[index]=0
                 channel.sendall(completed.stdout);result=completed.returncode
-            elif command.startswith("/usr/bin/python3 -c ") and "EasyManage redeploy preflight" in command:
+            elif command.startswith("/usr/bin/python3 -c ") and "same-identity Agent repair" in command:
                 completed=subprocess.run(shlex.split(command),env=ssh_env,capture_output=True,timeout=10)
                 channel.sendall(completed.stdout);result=completed.returncode
             elif "test ! -e /etc/easymanage/agent.env" in command:
@@ -671,18 +672,44 @@ sys.exit(0)
                 if inactive['redeploy_available']:break
                 time.sleep(0.5)
             require(inactive['redeploy_available'],"offline original node becomes eligible after the actual online window expires")
-            # A stopped installation still contains identity: it must not be
-            # silently overwritten, and the existing browser capability survives.
+            # Reject another identity, but explicitly repair this original one.
             original_env=(home/'.easymanage/config/agent.env').read_bytes()
-            original_db=(home/'.easymanage/state/state.db').read_bytes()
+            database=home/'.easymanage/state/state.db'
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE metadata SET value=? WHERE key='node_id'",(str(uuid.uuid4()),))
+            original_db=database.read_bytes()
             status,blocked=begin_redeployment(node_id,redeploy_request)
             blocked_job=wait_job(blocked) if status==200 else None
             if not blocked_job or blocked_job['status']!='failed' or any('已上传' in event['message'] for event in blocked_job['events']):
                 print('DIAGNOSTIC residual redeploy:',status,blocked.get('message') if status!=200 else [event['message'] for event in blocked_job['events']],errors,flush=True)
-            require(blocked_job and blocked_job['status']=='failed' and not any('已上传' in event['message'] for event in blocked_job['events']),"stopped residual Agent configuration/identity refuses redeploy before upload")
-            require((home/'.easymanage/config/agent.env').read_bytes()==original_env and (home/'.easymanage/state/state.db').read_bytes()==original_db,"failed redeployment does not rewrite existing target config or SQLite bytes")
+            require(blocked_job and blocked_job['status']=='failed' and not any('已上传' in event['message'] for event in blocked_job['events']),"another node's SQLite identity refuses overwrite before upload")
+            require((home/'.easymanage/config/agent.env').read_bytes()==original_env and database.read_bytes()==original_db,"refused cross-node overwrite does not rewrite config or SQLite bytes")
             _,machines=request('/api/v1/machines')
             require(next(machine for machine in machines['machines'] if machine['node_id']==node_id)['saved_credentials_usable'],"failed preflight does not revoke the authorized browser's saved-credential capability")
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE metadata SET value=? WHERE key='node_id'",(node_id,))
+                db.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('repair-history-sentinel','preserve-me')")
+                invalid_retained_token=secrets.token_hex(32)
+                db.execute("UPDATE metadata SET value=? WHERE key='agent_token'",(invalid_retained_token,))
+            status,repaired=begin_redeployment(node_id,redeploy_request)
+            repaired_job=wait_job(repaired) if status==200 else None
+            if not repaired_job or repaired_job['status']!='success':print('DIAGNOSTIC overwrite repair:',status,[event['message'] for event in (repaired_job or {}).get('events',[])],errors,flush=True)
+            require(repaired_job and repaired_job['status']=='success','same-UUID stopped installation can be overwritten without uninstalling its database')
+            with sqlite3.connect(database) as db:
+                repaired_identity=dict(db.execute("SELECT key,value FROM metadata WHERE key IN ('node_id','agent_token','repair-history-sentinel')"))
+                require(repaired_identity['node_id']==node_id and repaired_identity['agent_token'] not in (invalid_retained_token,identity_before['agent_token'])
+                        and repaired_identity['repair-history-sentinel']=='preserve-me','overwrite retains UUID and local history while recovering an invalid retained Agent token')
+            backups=list((home/'.easymanage').glob('install-backup.*/state.db'))
+            require(backups,'overwrite creates a consistent private SQLite recovery backup')
+            require(preserved_points<={point['collected_at'] for point in request(f'/api/v1/nodes/{node_id}/history')[1]['points']},'overwrite retains every pre-existing platform history point')
+            subprocess.run(['/usr/bin/python3',str(home/'.easymanage/bin/agent-user-control.py'),'stop'],env=ssh_env,check=True,capture_output=True,timeout=25)
+            deadline=time.monotonic()+70
+            while time.monotonic()<deadline:
+                inactive=next(machine for machine in request('/api/v1/machines')[1]['machines'] if machine['node_id']==node_id)
+                if inactive['redeploy_available']:break
+                time.sleep(.5)
+            require(inactive['redeploy_available'],'repaired fixture can be stopped for the separate missing-install redeployment test')
+            original_db=database.read_bytes()
             archive=home/('.easymanage-uninstalled-'+secrets.token_hex(4))
             (home/'.easymanage').rename(archive)  # Only this isolated fixture.
             require(request(f'/api/v1/machines/{node_id}/redeploy',redeploy_request|{'confirmation':'wrong'})[0]==400,"redeployment requires explicit confirmation of the original UUID")
@@ -751,7 +778,7 @@ sys.exit(0)
         require(status==200 and wait_job(failed)["status"]=="failed","other invalid prerequisites still fail without claiming deployment success")
         failure.clear()
         allow_full.set()
-        status,full_created=request("/api/v1/machines",key_payload|{"host":"10.222.0.10","deployment_mode":"full","sudo_password":password})
+        status,full_created=request("/api/v1/machines",key_payload|{"host":"10.222.0.10","deployment_mode":"full","sudo_password":password,"connection_mode":"ssh"})
         full_job=wait_job(full_created) if status==200 else None
         if not full_job or full_job["status"]!="success":
             print("DIAGNOSTIC Full onboarding:",status,[event["message"] for event in (full_job or {}).get("events",[])],"fixture errors:",errors,flush=True)

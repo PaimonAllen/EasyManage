@@ -12,6 +12,7 @@ const USER_UNIT: &str = include_str!("../../deploy/linux/user/easymanage-agent.u
 const USER_CONTROL: &str = include_str!("../../deploy/linux/user/agent-user-control.py");
 const FULL_INSTALL: &str = include_str!("../../deploy/linux/operations/install-new-full-agent.sh");
 const NETWORK_CONFIG: &str = include_str!("../../deploy/linux/operations/configure-ssh-network.py");
+const REDEPLOY_CHECK: &str = include_str!("../../deploy/linux/operations/check-redeployment.py");
 const JOB_TTL: Duration = Duration::from_mins(30);
 const MAX_PRIVATE_KEY_BYTES: usize = 12 * 1024;
 
@@ -313,7 +314,7 @@ async fn redeploy(State(state): State<OperationsState>, Path(id): Path<Uuid>, ur
     if row.get::<bool,_>("monitoring_paused") { return Err(OperationsError::bad_request("机器监控已暂停；恢复监控即可，不应重新部署或更换身份")); }
     let last_seen: DateTime<Utc> = row.get("last_seen");
     if last_seen>Utc::now()-chrono::Duration::seconds(state.config.online_window_seconds) {
-        return Err(OperationsError::bad_request("机器仍有近期心跳；重新部署仅用于已卸载的离线机器，在线机器请使用更新或重启"));
+        return Err(OperationsError::bad_request("机器仍有近期心跳；重新部署用于离线机器的覆盖修复，在线机器请使用更新或重启"));
     }
     let observed: Option<String> = row.get("mode");
     let mode = preserved_mode(&target,observed.as_deref());
@@ -344,7 +345,7 @@ async fn redeploy(State(state): State<OperationsState>, Path(id): Path<Uuid>, ur
     let permit=state.machines.permits.clone().try_acquire_owned().map_err(|_|OperationsError::busy())?;
     audit(&state.pool,id,&install.username,"machine.redeploy.request","requested").await?;
     let key=state.machines.begin(id,target.host)?;
-    state.machines.event(id,0,"running","重新部署任务已创建：复用原机器 ID，保留历史、名称和备注；拒绝覆盖仍存在的 Agent 身份，保持原 Basic / Full 权限");
+    state.machines.event(id,0,"running","重新部署任务已创建：允许覆盖修复同一机器 ID 的安装；保留本地数据库、待上报数据、平台历史、名称和备注，保持原 Basic / Full 权限");
     launch_deployment(state,id,install,permit,&key,DeploymentContext {existing:Some(target),lease:Some(lease),browser_token})
 }
 
@@ -832,7 +833,7 @@ fn launch_deployment(state: OperationsState,id: Uuid,request: AddMachine,
             Ok(Ok(())) => {
                 state
                     .machines
-                    .event(id, 100, "success", if redeploy {"已收到重新部署后的真实心跳；原机器 ID、历史和显示信息保留，旧 Agent 凭据已失效"}
+                    .event(id, 100, "success", if redeploy {"已收到重新部署后新进程的真实心跳；原机器 ID、本地数据库、待上报数据和平台历史保留，连接凭据已更新"}
                         else if deployment_mode == DeploymentMode::Basic { "已收到新 Agent 的 Basic 心跳，部署完成；后续可通过设备总览提权" } else { "已收到新 Agent 的 Full / UID 0 心跳，管理员部署完成" })
             }
             Ok(Err(error)) => state.machines.event(id, 100, "failed", error.1),
@@ -1248,16 +1249,19 @@ fn deploy(
             "候选 Agent 与目标 CPU 架构不匹配；未安装任何文件",
         ));
     }
-    // Refuse an existing Agent, even if stopped. Onboarding never reassigns its UUID.
+    // New onboarding never reassigns an existing UUID. Explicit original-node
+    // repair may replace files, but only after checking all retained identity data.
     command(&session, "test ! -e \"$HOME/.local/share/easymanage/config/agent.env\" && test ! -e \"$HOME/.local/share/easymanage/state/state.db\"")
         .map_err(|_| OperationsError::bad_request("检测到旧用户目录 Agent 身份，请先迁移到 ~/.easymanage，不允许重复注册"))?;
+    if existing.is_none() {
     command(&session,"/bin/bash --noprofile --norc -c 'set -eu; if command -v systemctl >/dev/null; then state=$(systemctl show easymanage-agent.service -p LoadState --value 2>/dev/null || true); test -z \"$state\" || test \"$state\" = not-found; fi; test ! -e /etc/systemd/system/easymanage-agent.service; test ! -d /var/lib/easymanage-agent; test ! -e /usr/local/sbin/easymanage-agent; test ! -d /etc/easymanage || test -x /etc/easymanage; test ! -e /etc/easymanage/agent.env; test ! -e \"$HOME/.easymanage/state/state.db\"; test ! -e \"$HOME/.easymanage/config/agent.env\"; test ! -e \"$HOME/.config/systemd/user/easymanage-agent.service\"' ")
         .map_err(|_|OperationsError::bad_request("目标已存在 Agent 配置、用户单元或身份库；请恢复/接管原节点，不允许覆盖安装"))?;
-    if existing.is_some() {
-        let script = "# EasyManage redeploy preflight: read-only, no process termination\nfrom pathlib import Path\nfor p in Path('/proc').glob('[0-9]*/comm'):\n try:\n  name=p.read_text().strip()\n  if name in ('easymanage-agent','easymanage-agen') and p.with_name('stat').read_text().rsplit(')',1)[1].split()[0] not in ('Z','X'):\n   raise SystemExit(1)\n except (FileNotFoundError,PermissionError,ProcessLookupError):\n  continue\n";
-        let check=format!("/usr/bin/python3 -c {}",shell_quote(script));
+    } else {
+        let check=format!("/usr/bin/python3 -c {} {} {} {}",shell_quote(REDEPLOY_CHECK),
+            shell_quote(&format!("{}/.easymanage",fields[1])),shell_quote(&id.to_string()),mode.name());
         let checked=if mode==DeploymentMode::Full {admin_command(&session,&request,&check)} else {command(&session,&check).map(|_|())};
-        checked.map_err(|_|OperationsError::bad_request("目标仍有 Agent 进程或无法确认其已退出；请先完成原卸载，不会强杀进程或覆盖安装"))?;
+        checked.map_err(|_|OperationsError::bad_request("已有安装的机器 ID、数据库路径或权限与原节点不符；未覆盖任何文件，请核对原身份，Basic 不会覆盖 Full 服务"))?;
+        state.machines.event(id,12,"running","已核验已有安装属于原机器 ID；将备份程序/配置并保留 SQLite 身份、待上报数据和采集设置，仅重启本 Agent");
     }
     let bootstrap = Zeroizing::new(format!(
         "{}{}",
@@ -1326,7 +1330,7 @@ fn deploy(
         agent_mode: Some(mode.name().to_owned()),
     });
     target.hostname=request.display_name.clone();
-    target.agent_sha256=None;
+    if existing.is_none() { target.agent_sha256=None; }
     target.server_url=Some(request.server_url.clone());
     target.ca_sha256=Some(hex::encode(Sha256::digest(&ca)));
     target.release_sha256=Some(hash);
@@ -1360,9 +1364,9 @@ fn deploy(
         let mut tx=state.pool.begin().await.map_err(|_|OperationsError::busy())?;
         if existing.is_some() {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))").bind(id.to_string()).execute(&mut *tx).await.map_err(|_|OperationsError::busy())?;
-            let allowed=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM nodes WHERE id=$1 AND deleted_at IS NULL AND last_seen<=NOW()-make_interval(secs=>$2))")
-                .bind(id).bind(state.config.online_window_seconds as f64).fetch_one(&mut *tx).await.map_err(|_|OperationsError::busy())?;
-            if !allowed { return Err(OperationsError::bad_request("原机器已恢复心跳或被软删除；已停止重新部署，未改注册凭据")); }
+            let allowed=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM nodes WHERE id=$1 AND deleted_at IS NULL AND NOT monitoring_paused)")
+                .bind(id).fetch_one(&mut *tx).await.map_err(|_|OperationsError::busy())?;
+            if !allowed { return Err(OperationsError::bad_request("原机器已被暂停或软删除；已停止重新部署，未改注册凭据")); }
         } else {
         sqlx::query("INSERT INTO nodes(id,hostname,display_name,os_name,os_version,kernel_version,architecture,cpu_model,cpu_logical_cores,agent_version,last_seen) VALUES($1,$2,$2,'等待 Agent','','',$3,'',0,'等待 Agent',NOW()-INTERVAL '1 day')")
             .bind(id).bind(&request.display_name).bind(fields[2]).execute(&mut *tx).await.map_err(|_|OperationsError::busy())?;
@@ -1446,9 +1450,13 @@ fn deploy(
         else { "以 root/sudo 安装系统服务并直接启动 Full Agent；不创建 Basic 用户服务" },
     );
     let invocation = format!(
-        "/usr/bin/timeout --signal=TERM --kill-after=3s 90s /bin/bash {}",
-        shell_quote(&format!("{stage}/install-user-agent.sh"))
+        "/usr/bin/timeout --signal=TERM --kill-after=3s 90s /bin/bash {}{}",
+        shell_quote(&format!("{stage}/install-user-agent.sh")), if existing.is_some(){" --repair"}else{""}
     );
+    let previous_pid = if existing.is_some() {
+        handle.block_on(sqlx::query_scalar::<_,Option<String>>("SELECT metrics->'platform_process'->>'pid' FROM metrics_latest WHERE node_id=$1")
+            .bind(id).fetch_optional(&state.pool)).map_err(|_|OperationsError::busy())?.flatten()
+    } else { None };
     let installation_started=Utc::now();
     session.set_timeout(100_000);
     if mode == DeploymentMode::Basic { command(&session, &invocation).map_err(|_| {
@@ -1466,16 +1474,14 @@ fn deploy(
         };
         state.machines.event(id, 75, "running", message);
     } else {
-        let invocation = format!("/usr/bin/timeout --signal=TERM --kill-after=3s 90s /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -c {} -- {} {} {} {} {} {}",
+        let invocation = format!("/usr/bin/timeout --signal=TERM --kill-after=3s 90s /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -c {} -- {} {} {} {} {} {} {}",
             shell_quote(FULL_INSTALL), shell_quote(&stage), shell_quote(&target.release_sha256.clone().unwrap_or_default()),
             shell_quote(target.ca_sha256.as_deref().unwrap_or_default()), shell_quote(&hex::encode(Sha256::digest(env.as_bytes()))),
-            shell_quote(&id.to_string()), shell_quote(&request.server_url));
+            shell_quote(&id.to_string()), shell_quote(&request.server_url),if existing.is_some(){"repair"}else{"new"});
         let result = admin_command(&session, &request, &invocation);
         request.sudo_password.zeroize();
         result?;
     }
-    target.agent_sha256 = target.release_sha256.clone();
-    save_target(state, &target)?;
     state.machines.event(
         id,
         80,
@@ -1486,10 +1492,12 @@ fn deploy(
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         let confirmed=handle.block_on(async {
-            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM nodes n JOIN metrics_latest m ON m.node_id=n.id JOIN agents a ON a.node_id=n.id WHERE n.id=$1 AND n.deleted_at IS NULL AND n.last_seen>NOW()-INTERVAL '30 seconds' AND m.metrics->'privilege'->>'mode'=$2 AND m.metrics->'privilege'->>'uid'=$3 AND a.enrolled_at>=$4 AND m.updated_at>=$4)")
-                .bind(id).bind(mode.name()).bind(if mode == DeploymentMode::Basic { uid.to_string() } else { "0".to_owned() }).bind(installation_started).fetch_one(&state.pool).await
+            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM nodes n JOIN metrics_latest m ON m.node_id=n.id JOIN agents a ON a.node_id=n.id WHERE n.id=$1 AND n.deleted_at IS NULL AND n.last_seen>NOW()-INTERVAL '30 seconds' AND m.metrics->'privilege'->>'mode'=$2 AND m.metrics->'privilege'->>'uid'=$3 AND a.enrolled_at>=$4 AND m.updated_at>=$4 AND (m.metrics->>'collected_at')::timestamptz>=$4 AND (NOT $5 OR m.metrics->'platform_process'->>'pid' IS NOT NULL) AND ($6::text IS NULL OR m.metrics->'platform_process'->>'pid' IS DISTINCT FROM $6))")
+                .bind(id).bind(mode.name()).bind(if mode == DeploymentMode::Basic { uid.to_string() } else { "0".to_owned() }).bind(installation_started).bind(existing.is_some()).bind(previous_pid.as_deref()).fetch_one(&state.pool).await
         }).unwrap_or(false);
         if confirmed {
+            target.agent_sha256 = target.release_sha256.clone();
+            save_target(state, &target)?;
             ssh_vault::set_enabled(&state.registry,&target,target.connection_mode==ssh_transport::Mode::Ssh)?;
             if let Some(setup) = setup.as_mut() { setup.commit(); }
             // Remove only the exact uploaded files, never recursive cleanup.

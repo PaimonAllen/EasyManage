@@ -3,6 +3,8 @@
 # Verified, reversible install as the target SSH user. Never invokes sudo.
 set -Eeuo pipefail
 umask 0077
+repair=false
+if (( $# )); then [[ $# == 1 && "$1" == --repair ]] || exit 64; repair=true; fi
 if (( EUID == 0 )); then
   printf 'Run this installer as the intended ordinary agent user.\n' >&2
   exit 1
@@ -79,6 +81,22 @@ if state.exists():
         existing = db.execute("SELECT value FROM metadata WHERE key='node_id'").fetchone()
     if not existing or uuid.UUID(existing[0]) != node_id:
         raise SystemExit("Persisted identity differs; administrator review is required")
+old_env = pathlib.Path(base) / 'config/agent.env'
+if old_env.exists():
+    import shlex
+    old = {}
+    for line in old_env.read_text().splitlines():
+        parts = shlex.split(line, comments=True)
+        if parts and parts[0] == 'export': parts = parts[1:]
+        if not parts: continue
+        if len(parts) != 1 or '=' not in parts[0]: raise SystemExit('Invalid existing configuration')
+        key, value = parts[0].split('=', 1)
+        if key in old: raise SystemExit('Duplicate existing configuration')
+        old[key] = value
+    if old.get('EASYMANAGE_NODE_ID') and uuid.UUID(old['EASYMANAGE_NODE_ID']) != node_id:
+        raise SystemExit('Existing configuration belongs to another node')
+    if old.get('EASYMANAGE_AGENT_STATE_DB', str(state)) != str(state):
+        raise SystemExit('Custom state location requires explicit migration')
 PY
 backend=compatibility
 if [[ "$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null || true)" == yes ]] && systemctl --user show-environment >/dev/null 2>&1; then
@@ -115,6 +133,19 @@ restore_on_exit() {
       if [[ -f "$target" && ! -L "$target" ]]; then mv -- "$target" "$backup_dir/failed-$index"; fi
       if [[ -f "$backup_dir/previous-$index" ]]; then cp -p -- "$backup_dir/previous-$index" "$target"; fi
     done
+    # If enrollment never completed, restore only the previous credential;
+    # never overwrite a newly issued token or roll back queued/history data.
+    python3 - "$agent_base/state/state.db" "$backup_dir/state.db" <<'PY'
+import pathlib, sqlite3, sys
+from urllib.parse import quote
+state, backup = map(pathlib.Path, sys.argv[1:])
+if state.is_file() and backup.is_file():
+    with sqlite3.connect('file:' + quote(str(backup), safe='/') + '?mode=ro', uri=True) as previous:
+        row = previous.execute("SELECT value FROM metadata WHERE key='agent_token'").fetchone()
+    if row:
+        with sqlite3.connect(state) as current:
+            current.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('agent_token',?)", row)
+PY
     systemctl --user daemon-reload
     if [[ "$was_enabled" == true ]]; then
       systemctl --user enable easymanage-agent.service
@@ -132,6 +163,22 @@ mutation_started=true
 # Stop only this agent while replacing its executable, configuration and unit together.
 systemctl --user stop easymanage-agent.service 2>/dev/null || [[ "$was_active" == false ]]
 if [[ -f "$agent_base/bin/agent-user-control.py" ]]; then python3 "$agent_base/bin/agent-user-control.py" stop; fi
+# A consistent recovery copy includes committed WAL data. The live database,
+# queued reports and collection settings are never replaced/reset. Explicit
+# repair renews only the credential, so an invalid retained token is recoverable.
+python3 - "$agent_base/state/state.db" "$backup_dir/state.db" "$repair" <<'PY'
+import os, pathlib, sqlite3, sys
+from urllib.parse import quote
+source, backup = map(pathlib.Path, sys.argv[1:3])
+if source.exists():
+    with sqlite3.connect('file:' + quote(str(source), safe='/') + '?mode=ro', uri=True, timeout=5) as original:
+        with sqlite3.connect(backup) as recovery:
+            original.backup(recovery)
+    os.chmod(backup, 0o600)
+    if sys.argv[3] == 'true':
+        with sqlite3.connect(source) as current:
+            current.execute("DELETE FROM metadata WHERE key='agent_token'")
+PY
 for index in "${!sources[@]}"; do
   if [[ "$backend" != systemd && "$index" == 3 ]]; then continue; fi
   target="${targets[$index]}"
