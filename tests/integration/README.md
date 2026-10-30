@@ -1,5 +1,13 @@
 # 隔离集成测试
 
+存储挂载回归：Agent `platform::linux::mounts::tests` 使用合成 mountinfo 验证 NFS/autofs 清单、绑定目录身份、未知容量、转义路径和凭据不输出，不连接网络文件系统。HTTPS smoke 验证新增元数据入库与旧 Agent 兼容，且未知 NFS I/O 不影响已有块设备的速率。前端 `storageMounts.test.ts` 和 SSR 验证启动分区默认隐藏、真实布局保留、共享容量和未知值显示。
+
+全机磁盘扫描回归在私有 mount namespace 创建两个小型 tmpfs 和重叠的 bind mount，验证各文件系统覆盖、绑定去重、真实路径、全局预算、取消和不可读主入口的绑定回退；生产默认仍禁止扫描 tmpfs。HTTP 用 `all_local` 加 1 条预算验证新范围持久化，在发现或枚举文件系统前停止，不扫描宿主目录。
+
+磁盘扫描无限制回归：合成 32,010 个文件，并模拟超过原时间上限，验证文件计入汇总、只保存一个目录且不生成临时 SQLite。HTTP/PostgreSQL 用 26,001 个子目录验证完整目录排序、跨页搜索、末页和祖先导航；root 明细分页沿用管理员授权。测试保留有限预算、手动取消和旧版快照的回归。
+
+磁盘空间分析：`disk_space_scanner_smoke.py` 在上述隔离环境中接收宿主 net/mnt ID，使用合成目录验证实际/逻辑大小、稀疏文件、硬链接、符号链接竞态、FIFO、无权限目录、取消和条目/深度限制。嵌套私有 root/mount namespace 验证同设备 bind mount 不被跨越。`isolated_smoke.py --disk-space` 运行真实临时 HTTPS/PostgreSQL 和固定扫描器，只读取只读绑定的仓库测试夹具，验证权限、输入、跨源拦截、持久任务和虚拟文件系统拒绝。`web/tests/diskSpace.test.ts` 检查父级分母和矩形面积，SSR 检查不完整值提示及文件名转义。测试不连接生产 SSH、不扫描生产数据目录。
+
 管理员凭据回归可用 `--machine-admin-credentials` 快速入口（自动启用 SSH fixture，仍须下述私有网络、目录遮蔽及 Paramiko venv）。它执行真实 Full 安装和 SSH 密码/加密私钥认证，root 权限检查和服务管理为 mock；验证错误口令/sudo 不保存或覆盖、普通 SSH 授权不能用于管理员操作、保存后不重传秘密即可重启、授权续期、平台重启持久化以及清除管理员密文不影响普通连接凭据。完整 `--machine-redeployment` 也执行这些检查。回归遵守原操作频率和 SSH 恢复互斥，不降低生产保护来通过测试。
 
 网络资源统计回归：Rust 单测检查计数/取消/连接生命周期、饱和运算及流式 Body 保留大小提示；HTTP smoke 比较准确消费的请求正文长度、响应正文、失败计数与内容不留存，真实 Agent 检查客户端分类、生命周期重置及平台读取的认证快照。SSH fixture 同时核对真实握手计数、exec/SCP/反向隧道字节和原有最多三连接限制。前端 SSR 与 `networkActivity.test.ts` 覆盖未知/离线、首次/重复/重启/回退时不伪造速率及跨层不可相加提示。全部在本文隔离环境运行，不抓取生产流量。
@@ -50,7 +58,9 @@ Rust 单元测试同样在上述隔离环境执行编译得到的 `target/debug/
 
 可选 `--machine-onboarding` 回归需临时测试 venv 的 Paramiko 3.5.1（不是平台依赖）和 C 编译器。仍须使用上面的私有网络、`/home` 与 `/tmp`，将 venv 只读映射至 `/tmp/ssh-env` 并用其 Python 调用隔离入口。测试会生成临时 SSH 密钥和凭据，SSH/SCP、摘要校验、用户安装脚本与 Agent 上报是真实执行；systemd 用户 manager 为 mock。`fixtures/ssh_loopback_redirect.c` 仅预加载到该临时 Server，将两个合成内网 IP 的 SSH 连接转到隔离 loopback，不改网络配置、不接触生产 SSH。严禁对生产进程使用该测试 shim。
 
-SSH fixture 还强制遮蔽 `/var`、`/etc/easymanage`、`/etc/systemd/system` 和 `/usr/local/sbin`，对私有环境执行真实安装残留检查，不读取生产 Agent 路径。`--machine-redeployment` 自动启用 onboarding，并增加实际卸载归档后原 UUID 的重新部署、在线/残留/覆盖字段/重复任务拒绝、历史/名称/备注保留、原 SSH 通道复用与旧 Agent token 失效验证；该入口跳过单独的三分钟重试耗尽用例，后者仍由 `--machine-onboarding` 覆盖。Full 级别不降权及请求不可覆盖地址/模式另有 Rust 单测，前端 SSR 检查确认窗口、原 ID/权限展示及已保存凭据模式。
+SSH fixture 还强制遮蔽 `/var`、`/etc/easymanage`、`/etc/systemd/system` 和 `/usr/local/sbin`，对私有环境执行真实安装残留检查，不读取生产 Agent 路径。`--machine-redeployment` 自动启用 onboarding，并增加实际卸载归档后原 UUID 的重新部署、在线/跨机器身份/覆盖字段/重复任务拒绝、历史/名称/备注保留、原 SSH 通道复用与旧 Agent token 失效验证；该入口跳过单独的三分钟重试耗尽用例，后者仍由 `--machine-onboarding` 覆盖。Full 级别不降权及请求不可覆盖地址/模式另有 Rust 单测，前端 SSR 检查确认窗口、原 ID/权限展示及已保存凭据模式。
+
+覆盖修复回归额外验证：不同 UUID 在上传前拒绝；同一 UUID 的停机残留允许覆盖，即使原连接凭据已失效也能注册恢复，保留本地历史哨兵与全部已有平台历史，创建一致 SQLite 恢复副本且保持三连接限制；之后再单独测试已卸载后的全新安装/凭据轮换。`first_full_install_smoke.py` 同时检查 root Full 覆盖修复、原身份/队列/关闭采集设置保留、仅重置连接凭据、不同 UUID 拒绝和启动失败后恢复旧文件/凭据；仅使用私有 root namespace 及 mock systemd，不能当作生产 root 服务交接验证。
 
 新增机器鉴权回归包含旧版密码请求兼容、未加密/加密 PEM RSA 私钥、带口令 OpenSSH Ed25519 私钥完成真实部署、错误口令和指纹阻断；还检查解析错误不回显秘密，任务日志、运行日志、清单和安装后的 Agent 文件不含密码/私钥/口令。所有密钥均在隔离测试运行时生成，不使用个人 SSH 密钥。`web/tests/machineAuthentication.test.ts` 检查请求序列化后及异常时的引用清理，SSR 检查鉴权选项、密码/口令掩码和不回显正文的私钥上传。
 
@@ -64,4 +74,10 @@ SSH fixture 还强制遮蔽 `/var`、`/etc/easymanage`、`/etc/systemd/system` �
 
 温度回归使用合成 hwmon 数据，覆盖 CPU / SSD 分类、机械盘排除、错误读数、缓存、采集时间与数据库历史兼容。隔离入口遮蔽 `/sys`，真实 Agent 测试不会读取生产硬件传感器。前端 `web/tests/temperature.test.ts` 检查缺失读数与采样去重；`web/tests/charts-smoke.mjs` 使用 Vite + React 服务端渲染检查五图布局、三条独立温度曲线及旧版数据，要求传入宿主网络 / 挂载命名空间 ID。两者也必须在上述隔离环境运行；服务端渲染检查不等同真实浏览器截图测试。
 
+网络盘容量回归：`network_capacity_smoke.py` 在上述私有 namespace 运行，传入宿主 net/mnt ID，只对私有 tmpfs 查询容量；核对跨进程文件锁、受限输出和挂载替换拒绝。Agent `platform::linux::network_capacity::tests` 验证真实子进程超时回收、阻塞任务不会阻塞采样或重复启动、失败保留缓存、重启后的小时级间隔、共享挂载去重和 UID 缓存隔离；同样在隔离环境执行。HTTP 集成测试验证容量采集时间和错误状态往返数据库；SSR 验证缓存值、采集时间、超时与过期提示。未在生产环境制造 NFS 故障。
+
+磁盘空间保护回归：运行隔离入口 `--disk-space` 时，在私有挂载 namespace 中提供 `/tmp/easymanage-low-space` 的 16 MiB tmpfs。新版 bwrap 可用 `--size 16777216 --tmpfs /tmp/easymanage-low-space`；旧版在完整隔离的 bwrap 内以 namespace root 挂载，再通过嵌套 user namespace 映射回非 root UID 执行测试（PostgreSQL 测试拒绝 root）。测试将私有存储检查路径临时指向该空盘，验证 HTTP 507 和没有启动任务；随后在私有 PostgreSQL 用临时触发器模拟 SQLSTATE `53100`，检查准确错误及不泄漏诊断。没有填满任何生产或测试磁盘。Rust 单测核对 2 GiB 边界及正常收尾的不完整结果保留；SSR 检查空间保护提示。
+
 平台自身更新回归：`test_platform_release.py` 为临时目录纯逻辑测试，覆盖发布不影响运行服务、逐文件摘要检查、允许组可写的 home 上级目录、拒绝平台自身目录组写入及越界/符号链接、成功安装只改变平台、就绪失败回退和版本比较。机器管理 Rust 单测同样覆盖共享 home 下私有清单目录可用，清单目录组写入和符号链接仍拒绝。`platform_update_smoke.py` 在上述隔离环境运行并接收宿主 net/mnt 命名空间 ID，通过嵌套私有 namespace 模拟 systemd/runuser，覆盖管理员固定调度、错误单元/候选拦截、重复任务拒绝和 Agent 不被触及。HTTP smoke 覆盖平台更新接口跨源拒绝与无候选禁用。所有测试均不重启生产服务；纯逻辑测试也不会真正联系 systemd 或 HTTPS。
+
+目录汇总模式回归：`disk_space_scanner_smoke.py` 验证稀疏文件与硬链接仍计入总量，但输出不含文件名；32,010 个文件只保存一个目录，无临时 SQLite。`isolated_smoke.py --disk-space` 在私有数据库中验证 26,001 个子目录的分页与排序、未被筛选影响的本层占用、目录约束拒绝文件行；另在私有 schema 重演 0013–0016，验证旧流式/JSON 快照的目录 ID 与总量保留、失败任务保留及旧表/文件名清除。

@@ -1045,6 +1045,7 @@ def smoke(args):
                 (web / "guide/easymanage.html").write_text("<!doctype html><html><body>isolated-smoke-platform-docs</body></html>")
                 (web / "guide/assets/app.js").write_text("console.log('isolated-smoke-vitepress')")
                 empty_env = root / "server.env"
+                (root / "storage-guard").symlink_to(root, target_is_directory=True)
                 empty_env.write_text("")
                 known_hosts = root / "known_hosts"
                 known_hosts.write_text("")
@@ -1056,7 +1057,7 @@ def smoke(args):
                     "default_user": "smoke", "agent_home": "/home/smoke/.easymanage", "known_hosts": str(known_hosts),
                     "agent_sha256": "a" * 64, "server_url": base_url, "ca_sha256": hashlib.sha256(ca_certificate.read_bytes()).hexdigest()}]}))
                 registry.chmod(0o600)
-                server_env = env | {"EASYMANAGE_ENV_FILE": str(empty_env), "DATABASE_URL": "postgresql://smoke@127.0.0.1:55432/easymanage_smoke",
+                server_env = env | {"EASYMANAGE_ENV_FILE": str(empty_env), "EASYMANAGE_DISK_SCAN_STORAGE_PATH": str(root / "storage-guard"), "DATABASE_URL": "postgresql://smoke@127.0.0.1:55432/easymanage_smoke",
                     "EASYMANAGE_ENROLLMENT_TOKEN": enrollment, "EASYMANAGE_BIND": "127.0.0.1:58443", "EASYMANAGE_DATABASE_MAX_CONNECTIONS": "2",
                     "EASYMANAGE_TLS_CERTIFICATE": str(certificate), "EASYMANAGE_TLS_PRIVATE_KEY": str(key), "EASYMANAGE_WEB_ROOT": str(web),
                     "EASYMANAGE_OPERATIONS_TARGETS": str(registry), "RUST_LOG": "warn", "TOKIO_WORKER_THREADS": "2"}
@@ -1088,6 +1089,9 @@ def smoke(args):
                         raise RuntimeError("Isolated EasyManage server did not become ready")
                     time.sleep(0.1)
                 exercise_api(base_url, context, enrollment, node_id)
+                if args.disk_space:
+                    from disk_space_api_smoke import exercise as exercise_disk_space
+                    exercise_disk_space(root, base_url, context, enrollment, require)
                 if args.agent_binary is not None and not args.machine_onboarding:
                     exercise_agent(args.agent_binary, root, env, base_url, ca_certificate, enrollment)
                 if args.machine_onboarding:
@@ -1103,7 +1107,7 @@ def smoke(args):
                                     if response.status==200:return
                             except OSError:time.sleep(0.1)
                         raise RuntimeError('Isolated controller restart failed')
-                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment, args.machine_admin_credentials)
+                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment, args.machine_admin_credentials, args.machine_disk_space)
                 with opener.open(base_url + "/api/v1/operations/targets", timeout=2) as response:
                     expected_target_count = len(json.load(response)["targets"])
                 # Reproduce PostgreSQL outage and restart the Server with DB down.
@@ -1201,8 +1205,10 @@ if __name__ == "__main__":
     parser.add_argument("--machine-onboarding", action="store_true", help="Opt-in SSH/SCP fixture with mocked systemd and a real installed Agent; temporary Paramiko venv required")
     parser.add_argument("--machine-redeployment",action="store_true",help="Add real same-UUID uninstalled Agent redeployment coverage; skips the separate three-minute retry-exhaustion scenario")
     parser.add_argument("--machine-admin-credentials",action="store_true",help="Focused real SSH administrator password/key vault and saved-credential operations regression")
+    parser.add_argument("--disk-space",action="store_true",help="Read-only disk scanner task, permission and database API regression")
+    parser.add_argument("--machine-disk-space",action="store_true",help="Focused disk scanner over real persistent SSH with a real Basic Agent")
     parser.add_argument("--host-netns", required=True)
     parser.add_argument("--host-mntns", required=True)
     args=parser.parse_args()
-    if args.machine_redeployment or args.machine_admin_credentials:args.machine_onboarding=True
+    if args.machine_redeployment or args.machine_admin_credentials or args.machine_disk_space:args.machine_onboarding=True
     smoke(args)

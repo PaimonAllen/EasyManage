@@ -18,6 +18,30 @@ const server = await createServer({
   server: { middlewareMode: true, watch: null },
 });
 try {
+  const {SpaceVisualization,DiskSpaceExplorer}=await server.ssrLoadModule("/src/components/DiskSpaceExplorer.tsx");
+  const diskTree=[
+    {id:0,parent:null,name:"/fixture",kind:"directory",allocated:100,apparent:1000,files:2,directories:1,issue:null,incomplete:true,mtime:0},
+    {id:1,parent:0,name:"large",kind:"directory",allocated:80,apparent:800,files:1,directories:0,issue:null,incomplete:false,mtime:0},
+    {id:2,parent:0,name:"<script>fixture</script>",kind:"file",allocated:20,apparent:200,files:1,directories:0,issue:null,incomplete:false,mtime:0},
+  ];
+  const diskHtml=renderToStaticMarkup(React.createElement(SpaceVisualization,{result:{root:"/fixture",uid:1000,username:"fixture",status:"partial",reason:"time_limit",elapsed_seconds:60,filesystem:"ext4",visited:3,errors:0,skipped_mounts:0,symlinks:0,hardlinks:0,nodes:diskTree},onChoosePath:()=>{}}));
+  assert.ok(diskHtml.includes("80.0%")&&diskHtml.includes("占上一层")&&diskHtml.includes("达到所选扫描时限"));
+  assert.ok(diskHtml.includes("不代表完整目录")&&diskHtml.includes("实际磁盘占用")&&diskHtml.includes("矩形图"));
+  assert.ok(!diskHtml.includes("<script>fixture</script>")&&diskHtml.includes("&lt;script&gt;"));
+  console.log("PASS hierarchical disk usage, parent percentages, partial lower-bound notices, treemap and escaped filenames");
+  const controls=renderToStaticMarkup(React.createElement(DiskSpaceExplorer,{nodes:[{id:'fixture',hostname:'fixture',online:true,metrics:null}]}));
+  assert.equal((controls.match(/value="0" selected="">无限制/g)??[]).length,2);
+  assert.ok(controls.includes('关闭页面后任务继续')&&controls.includes('仅保存目录大小、数量和层级'));
+  assert.ok(controls.includes('扫描范围')&&controls.includes('全部本地磁盘')&&controls.includes('指定目录仅扫描所在文件系统'));
+  assert.ok(controls.includes('<option value="disk">指定磁盘</option>'));
+  const {PagedSpaceVisualization}=await server.ssrLoadModule('/src/components/PagedSpaceVisualization.tsx');
+  const paged=renderToStaticMarkup(React.createElement(PagedSpaceVisualization,{nodeId:'fixture',scanId:'fixture',result:{root:'/fixture',uid:1000,username:'fixture',status:'cancelled',reason:'cancelled',visited:32011,errors:0,skipped_mounts:0,symlinks:0,hardlinks:0,nodes:[diskTree[0]],paged:true},onChoosePath:()=>{}}));
+  assert.ok(paged.includes('手动取消')&&paged.includes('大小为已读取部分的下限')&&paged.includes('排序作用于全部子目录'));
+  const storageStopped=renderToStaticMarkup(React.createElement(PagedSpaceVisualization,{nodeId:'fixture',scanId:'storage-low',result:{root:'/fixture',uid:1000,username:'fixture',status:'partial',reason:'platform_storage_low',visited:1200,errors:0,skipped_mounts:0,symlinks:0,hardlinks:0,nodes:[diskTree[0]],paged:true},onChoosePath:()=>{}}));
+  assert.ok(storageStopped.includes('平台结果存储空间不足')&&storageStopped.includes('大小为已读取部分的下限'));
+  const allLocal=renderToStaticMarkup(React.createElement(PagedSpaceVisualization,{nodeId:'fixture',scanId:'fixture-all',result:{root:'/',scope:'all_local',uid:0,username:'root',status:'complete',reason:'',visited:5,errors:0,skipped_mounts:2,symlinks:0,hardlinks:0,nodes:[diskTree[0]],paged:true,filesystems:[{id:1,path:'/',filesystem:'ext4',incomplete:false},{id:3,path:'/data/disk',filesystem:'ext4',incomplete:false}]},onChoosePath:()=>{}}));
+  assert.ok(allLocal.includes('全部本地磁盘')&&allLocal.includes('/data/disk')&&allLocal.includes('绑定挂载去重'));
+  console.log('PASS unlimited time/count defaults and paged snapshot partial-result rendering');
   const { AdminCredentialFields }=await server.ssrLoadModule("/src/components/AdminCredentials.tsx");
   const auth={ready:true,loading:false,available:true,mode:"saved",username:"fixture-admin",password:"fixture-password-not-for-render",
     key:"fixture-private-key-not-for-render",passphrase:"fixture-phrase-not-for-render",sudoPassword:"fixture-sudo-not-for-render",error:"",setMode:()=>{}};
@@ -278,7 +302,22 @@ try {
     "table and storage collection notes belong to the collapsible section");
   assert.ok(css.includes('.storage-mounted-section:not([open]) .storage-mounted-toggle::after'));
   assert.ok(css.includes('.storage-mounted-toggle:focus-visible'));
-  assert.equal((storagePage.match(/class="meter__fill meter__fill--storage"/g) ?? []).length, 8);
+  assert.equal((storagePage.match(/class="meter__fill meter__fill--storage"/g) ?? []).length, 7);
+  const boot={...partition,name:'boot-fixture',path:'/dev/boot-fixture',partition_label:'EFI System Partition',mount_points:['/boot/efi']};
+  const nfs={name:'10.0.0.1:/export',mount_point:'/nfs',file_system:'nfs4',total_bytes:0,available_bytes:0,read_bytes_per_second:null,written_bytes_per_second:null,
+    mount:{device_id:'0:41',root:'/',source:'10.0.0.1:/export',network:true,read_only:false,capacity_known:false}};
+  const mountPage=renderToStaticMarkup(React.createElement(Storage,{nodes:[{id:'mount-fixture',hostname:'mount-fixture',online:true,metrics:{...metrics,block_devices:[{...devices[0],children:[boot]}],disks:[mounted('/',99),mounted('/home/tzr/bigdata',99),{...mounted('/boot/efi',100),name:'/dev/boot-fixture'},nfs]}}]}));
+  assert.ok(mountPage.includes('显示启动分区')&&mountPage.includes('aria-pressed="false"'));
+  assert.ok(!mountPage.includes('boot-fixture')&&!mountPage.includes('/boot/efi'));
+  assert.ok(mountPage.includes('不是空闲空间')&&mountPage.includes('共享容量 · 2 个挂载点'));
+  assert.ok(mountPage.includes('/nfs')&&mountPage.includes('网络共享 · NFS4')&&mountPage.includes('容量未采集')&&mountPage.includes('未探测远端容量'));
+  const cachedNfs={...nfs,total_bytes:1000,available_bytes:300,mount:{...nfs.mount,capacity_known:true,capacity_probe:{interval_seconds:3600,attempted_at:at,collected_at:'2020-01-01T00:00:00Z',status:'timeout'}}};
+  const cachedMountPage=renderToStaticMarkup(React.createElement(Storage,{nodes:[{id:'cached-nfs',hostname:'cached-nfs',online:true,metrics:{...metrics,disks:[cachedNfs]}}]}));
+  assert.ok(cachedMountPage.includes('每小时采集')&&cachedMountPage.includes('采集于')&&cachedMountPage.includes('查询超时')&&cachedMountPage.includes('保留上次结果')&&cachedMountPage.includes('结果已过期'));
+  assert.ok(!cachedMountPage.includes('容量未采集')&&cachedMountPage.includes('700 B / 1000 B'));
+  const shownBoot=renderToStaticMarkup(React.createElement(BlockDeviceMap,{devices:[{...devices[0],children:[boot]}],disks:[],showBoot:true}));
+  assert.ok(shownBoot.includes('/boot/efi')&&shownBoot.includes('boot-fixture'));
+  console.log('PASS boot partitions hidden by default with preserved geometry, shared filesystem labels and NFS unknown capacity');
   assert.equal((storagePage.match(/class="number storage-table__low-space"/g) ?? []).length, 2);
   assert.equal((storagePage.match(/class="meter__warning" role="img"/g) ?? []).length, 2);
   assert.equal((storagePage.match(/⚠/g) ?? []).length, 2);
@@ -286,7 +325,7 @@ try {
   assert.ok(storagePage.includes('--meter-accent:color-mix(in srgb, var(--storage-orange-light) 50.0%, var(--storage-orange-deep) 50.0%)'));
   assert.ok(storagePage.includes('--meter-accent:var(--chart-hot)'));
   const invalidRow = storagePage.match(/<tr><td><strong>\/data\/invalid<\/strong>[\s\S]*?<\/tr>/)?.[0];
-  assert.ok(invalidRow && invalidRow.includes('<strong>—</strong>') && !invalidRow.includes('meter__warning'));
+  assert.ok(invalidRow && invalidRow.includes('容量未采集') && !invalidRow.includes('meter__warning'));
   console.log("PASS mounted filesystem usage: low green, 20–90 graded orange, >90 red with warning, invalid unknown, duplicate mount points consistent");
   const { StorageCell } = await server.ssrLoadModule("/src/pages/PlatformHealth.tsx");
   const storageWindow = { total_bytes: { average: 4096, maximum: 8192, samples: 2 },

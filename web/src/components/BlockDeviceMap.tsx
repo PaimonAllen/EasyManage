@@ -1,6 +1,7 @@
 import { useId, useState } from "react";
 import { formatBytes } from "../lib/format";
 import { diskRecording } from "../lib/diskRecording";
+import { capacityKnown, isBootPartition } from "../lib/storageMounts";
 import type { BlockDevice, DiskMetric } from "../types/monitoring";
 
 const PARTITION_COLORS = ["#4de2c5", "#9b86f9", "#f3ba63", "#6ab8f2", "#e68cb4", "#93cb78"];
@@ -10,7 +11,7 @@ type Segment = { device: BlockDevice; start: number; size: number };
 function mountedUsage(device: BlockDevice, disks: DiskMetric[]) {
   const path = device.path ?? `/dev/${device.name}`;
   const disk = disks.find((item) => item.name === path && device.mount_points.includes(item.mount_point));
-  if (!disk || !Number.isFinite(disk.total_bytes) || !Number.isFinite(disk.available_bytes)
+  if (!disk || !capacityKnown(disk) || !Number.isFinite(disk.total_bytes) || !Number.isFinite(disk.available_bytes)
     || disk.total_bytes <= 0 || device.size_bytes <= 0 || disk.available_bytes < 0
     || disk.available_bytes > disk.total_bytes) return null;
   const usedBytes = disk.total_bytes - disk.available_bytes;
@@ -48,7 +49,8 @@ function layout(device: BlockDevice): { segments: Segment[]; positioned: boolean
   };
 }
 
-function DeviceRow({ device, depth }: { device: BlockDevice; depth: number }) {
+function DeviceRow({ device, depth, showBoot }: { device: BlockDevice; depth: number; showBoot:boolean }) {
+  if(!showBoot&&isBootPartition(device))return null;
   const title = device.partition_label || device.label || device.name;
   const filesystem = device.filesystem?.trim() || null;
   return <>
@@ -58,6 +60,7 @@ function DeviceRow({ device, depth }: { device: BlockDevice; depth: number }) {
         <strong title={device.path ?? device.name}>{title}</strong>
         {(filesystem || device.kind === "part") && <span className={`block-device-row__filesystem ${filesystem ? "" : "block-device-row__filesystem--unknown"}`} title={`文件系统格式：${filesystem ?? "未识别"}`}>{filesystem ?? "未识别"}</span>}
         <code>{device.path ?? device.name}</code>
+        {device.mount_points.length>1&&<span className="storage-mount-badge">共享挂载 · {device.mount_points.length} 个入口</span>}
       </div>
       <div className="block-device-row__details">
         <span>{formatBytes(device.size_bytes)}</span>
@@ -69,11 +72,11 @@ function DeviceRow({ device, depth }: { device: BlockDevice; depth: number }) {
         {device.read_only && <span className="storage-readonly">只读设备</span>}
       </div>
     </div>
-    {device.children.map((child, index) => <DeviceRow key={`${child.path ?? child.name}-${index}`} device={child} depth={depth + 1} />)}
+    {device.children.map((child, index) => <DeviceRow key={`${child.path ?? child.name}-${index}`} device={child} depth={depth + 1} showBoot={showBoot} />)}
   </>;
 }
 
-function DeviceCard({ device, disks }: { device: BlockDevice; disks: DiskMetric[] }) {
+function DeviceCard({ device, disks, showBoot }: { device: BlockDevice; disks: DiskMetric[]; showBoot:boolean }) {
   const [showRecording, setShowRecording] = useState(false);
   const recordingId = useId();
   const recording = diskRecording(device);
@@ -112,19 +115,21 @@ function DeviceCard({ device, disks }: { device: BlockDevice; disks: DiskMetric[
       <div className={`partition-map ${positioned ? "" : "partition-map--relative"}`} role="img" aria-label={`${device.path ?? device.name} 的分区容量图`}>
         {segments.map((segment, index) => {
           const usage = mountedUsage(segment.device, disks);
+          const hiddenBoot=!showBoot&&isBootPartition(segment.device);
           return <span
-            className="partition-map__segment"
+            className={`partition-map__segment${hiddenBoot?" partition-map__segment--hidden-boot":""}`}
             key={`${segment.device.name}-${index}`}
-            style={{ left: `${(segment.start / denominator) * 100}%`, width: `${(segment.size / denominator) * 100}%`, background: PARTITION_COLORS[index % PARTITION_COLORS.length], color: PARTITION_COLORS[index % PARTITION_COLORS.length] }}
-            title={`${segment.device.path ?? segment.device.name} · ${formatBytes(segment.device.size_bytes)}${segment.device.mount_points.length ? ` · ${segment.device.mount_points.join(" · ")}` : " · 未挂载"}${usage ? ` · 已用 ${formatBytes(usage.usedBytes)} / 文件系统 ${formatBytes(usage.totalBytes)}` : " · 使用量未知"}`}
-          >{usage && usage.widthPercent > 0 && <span className="partition-map__used" style={{ width: `${usage.widthPercent}%` }} />}
-            {usage && usage.widthPercent > 0 && usage.widthPercent < 100 && <span className="partition-map__usage-boundary" style={{ left: `${usage.widthPercent}%` }} aria-hidden="true" />}
+            style={{ left: `${(segment.start / denominator) * 100}%`, width: `${(segment.size / denominator) * 100}%`, background: hiddenBoot?"var(--line)":PARTITION_COLORS[index % PARTITION_COLORS.length], color: hiddenBoot?"var(--line)":PARTITION_COLORS[index % PARTITION_COLORS.length] }}
+            title={hiddenBoot?"启动分区已隐藏，保留实际位置；不是空闲空间":`${segment.device.path ?? segment.device.name} · ${formatBytes(segment.device.size_bytes)}${segment.device.mount_points.length ? ` · ${segment.device.mount_points.join(" · ")}` : " · 未挂载"}${usage ? ` · 已用 ${formatBytes(usage.usedBytes)} / 文件系统 ${formatBytes(usage.totalBytes)}` : " · 使用量未知"}`}
+          >{!hiddenBoot&&usage && usage.widthPercent > 0 && <span className="partition-map__used" style={{ width: `${usage.widthPercent}%` }} />}
+            {!hiddenBoot&&usage && usage.widthPercent > 0 && usage.widthPercent < 100 && <span className="partition-map__usage-boundary" style={{ left: `${usage.widthPercent}%` }} aria-hidden="true" />}
           </span>;
         })}
         {trailingFreePercent > 0 && <span className="partition-map__trailing-free" style={{ width: `${trailingFreePercent}%` }} aria-hidden="true" />}
       </div>
       <div className="partition-map__legend">
-        {segments.map((segment, index) => <span key={`${segment.device.name}-${index}`}><i style={{ background: PARTITION_COLORS[index % PARTITION_COLORS.length] }} />{segment.device.name} · {formatBytes(segment.device.size_bytes)}</span>)}
+        {segments.map((segment, index) => !showBoot&&isBootPartition(segment.device)?null:<span key={`${segment.device.name}-${index}`}><i style={{ background: PARTITION_COLORS[index % PARTITION_COLORS.length] }} />{segment.device.name} · {formatBytes(segment.device.size_bytes)}</span>)}
+        {!showBoot&&segments.some(segment=>isBootPartition(segment.device))&&<span><i style={{background:"var(--line)"}}/>启动分区已隐藏</span>}
         {positioned && remainder > 0 && <span><i className="partition-map__free" />未分配 / 保留 · {formatBytes(remainder)}</span>}
       </div>
       {!positioned && <p className="storage-device__note">分区起点不可读取，图中仅按容量排列，不表示真实磁盘位置。</p>}
@@ -132,13 +137,13 @@ function DeviceCard({ device, disks }: { device: BlockDevice; disks: DiskMetric[
     </> : <p className="storage-device__note">未识别到直接分区；可能整盘使用或存在未识别布局，不能据此判断空间可用。</p>}
     <details className="storage-device-details">
       <summary>设备与分区详情{device.children.length > 0 && <span>· {device.children.length} 个下属设备</span>}</summary>
-      <div className="block-device-tree"><DeviceRow device={device} depth={0} /></div>
+      <div className="block-device-tree"><DeviceRow device={device} depth={0} showBoot={showBoot}/></div>
     </details>
   </section>;
 }
 
-export function BlockDeviceMap({ devices, disks }: { devices: BlockDevice[]; disks: DiskMetric[] }) {
+export function BlockDeviceMap({ devices, disks, showBoot=true }: { devices: BlockDevice[]; disks: DiskMetric[]; showBoot?:boolean }) {
   return <div className="storage-device-list">
-    {devices.map((device, index) => <DeviceCard key={`${device.path ?? device.name}-${index}`} device={device} disks={disks} />)}
+    {devices.map((device, index) => <DeviceCard key={`${device.path ?? device.name}-${index}`} device={device} disks={disks} showBoot={showBoot}/>)}
   </div>;
 }

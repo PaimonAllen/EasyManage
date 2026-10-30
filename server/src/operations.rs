@@ -46,6 +46,10 @@ mod admin_credentials;
 #[cfg(target_os = "linux")]
 mod platform_update;
 
+#[path = "disk_space.rs"]
+#[cfg(target_os = "linux")]
+mod disk_space;
+
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const SSH_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -71,6 +75,8 @@ struct OperationsState {
     config: Arc<crate::config::ServerConfig>,
     #[cfg(target_os = "linux")]
     platform_update_cache: platform_update::Cache,
+    #[cfg(target_os = "linux")]
+    disk_space: disk_space::Scans,
 }
 
 #[derive(Default)]
@@ -337,9 +343,13 @@ pub fn router(
         config,
         #[cfg(target_os = "linux")]
         platform_update_cache: platform_update::Cache::default(),
+        #[cfg(target_os = "linux")]
+        disk_space: disk_space::Scans::default(),
     };
     #[cfg(target_os = "linux")]
     machines::restore_ssh(state.clone());
+    #[cfg(target_os = "linux")]
+    disk_space::initialize(state.clone());
     Router::new()
         .route("/api/v1/operations/targets", get(list_targets))
         .route("/api/v1/operations/recovery", get(recovery_status))
@@ -359,8 +369,16 @@ pub fn router(
         .route("/api/v1/machines/{node_id}/monitoring", post(change_monitoring))
         .merge(machine_routes())
         .merge(platform_update_routes())
+        .merge(disk_space_routes())
         .layer(DefaultBodyLimit::max(MAX_FRAME_BYTES))
         .with_state(state)
+}
+
+fn disk_space_routes() -> Router<OperationsState> {
+    #[cfg(target_os = "linux")]
+    { disk_space::router() }
+    #[cfg(not(target_os = "linux"))]
+    { Router::new() }
 }
 
 async fn change_monitoring(

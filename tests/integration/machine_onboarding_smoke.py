@@ -26,7 +26,7 @@ import urllib.request
 import uuid
 
 
-def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False, admin_only=False):
+def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False, admin_only=False, disk_only=False):
     import paramiko
     logging.getLogger("paramiko").setLevel(logging.CRITICAL)
     mounts = Path("/proc/self/mountinfo").read_text().splitlines()
@@ -116,7 +116,15 @@ sys.exit(2)
     def serve_command(channel, invocation):
         try:
             command = invocation.decode()
-            if command.startswith("scp "):
+            if command.startswith('/usr/bin/env -i ') and 'Bounded read-only disk analysis.' in command:
+                process=subprocess.Popen(shlex.split(command),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+                while True:
+                    line=process.stdout.readline()
+                    if not line:break
+                    channel.sendall(line)
+                process.stdin.close()
+                result=process.wait(timeout=5)
+            elif command.startswith("scp "):
                 destination = Path(shlex.split(command)[-1])
                 if destination.parent not in stages:
                     raise RuntimeError("SCP escaped its private staging directory")
@@ -494,6 +502,22 @@ sys.exit(0)
         _,machines=request("/api/v1/machines")
         persistent=next(machine for machine in machines["machines"] if machine["node_id"]==node_id)
         require(persistent["connection_mode"]=="ssh" and persistent["ssh_transport"]["connections"]==2,"control and reverse HTTPS use exactly two long TCP SSH connections")
+        if disk_only:
+            dials=len(transports)
+            scan_path=f'/api/v1/nodes/{node_id}/disk-space'
+            status,created_scan=request(scan_path,{'mode':'basic','path':'/tmp/work/tests/integration/fixtures','seconds':30})
+            require(status==200,'SSH-only disk scan starts on the authenticated persistent control session')
+            deadline=time.monotonic()+25
+            while time.monotonic()<deadline:
+                _,snapshot=request(scan_path+'/'+created_scan['id'])
+                if snapshot['status']!='running':break
+                time.sleep(.2)
+            require(snapshot['status']=='complete' and snapshot['result']['uid']==os.getuid(),
+                    'real SSH fixed scanner returns the original ordinary-user identity and directory tree')
+            require(len(transports)==dials,'disk scanning opens a channel without creating any new SSH connections')
+            current_machine=next(m for m in request('/api/v1/machines')[1]['machines'] if m['node_id']==node_id)
+            require(current_machine['ssh_transport']['connections']==2,'reverse HTTPS reporting remains connected during disk analysis')
+            return
         net=request('/api/v1/platform-network')[1]
         net_groups={g['group']:g for g in net['server']['groups']}
         ssh_started=net_groups['ssh_connect']['started']

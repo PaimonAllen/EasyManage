@@ -1,5 +1,34 @@
 # Database migrations
 
+`0016_disk_space_directory_summaries.sql` is a destructive **scan-metadata-only**
+conversion. Back up before upgrading and stop the previous platform process.
+It retains usable directory trees and scan task history, converts legacy JSON,
+and removes historical file-level details plus unusable unfinished entry sets.
+The old heap and four indexes are dropped after copying directory summaries to
+`disk_space_directories` (primary key + parent index). This physically releases
+scan storage without a full-database VACUUM FULL. Node identities, credentials,
+metrics and Agent databases are untouched. Restoring file-level history requires
+the pre-upgrade backup; an older backend cannot use this schema.
+
+
+`0015_disk_space_scope.sql` adds an explicit directory/all-local scan scope and
+nullable filesystem-root paths. Existing snapshots keep directory scope. These
+metadata additions use a 2-second lock timeout; no entry contents are rewritten.
+
+`0014_disk_space_streaming.sql` adds per-entry disk scan storage and directory
+ordering indexes. Unlimited scans stream bounded batches instead of building one
+large JSON value. Legacy snapshots are unchanged; new entry rows cascade when
+their retained scan is removed. This additive migration uses a 2-second lock
+timeout and does not rewrite existing metrics or scan results.
+
+`0013_disk_space_scans.sql` adds a separate bounded history of on-demand read-only
+disk scans. It creates a new table and two indexes, including one active scan per
+node, with a 2-second lock timeout. Existing metrics, identities and credentials
+are not rewritten. Startup marks unfinished scans interrupted; retention keeps
+three snapshots per node/permission level, no more than seven days and thirty
+completed snapshots globally. Platform file rollback leaves this additive table
+in place. No filesystem scan is triggered by the migration or deployment.
+
 Versioned PostgreSQL migrations for the controller belong here.
 
 Migrations are embedded in `easymanage-server` and applied automatically at startup. Never

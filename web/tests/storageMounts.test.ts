@@ -1,0 +1,52 @@
+import assert from "node:assert/strict";
+import {test} from "node:test";
+import {isBootMount,isBootPartition,capacityKnown,sharedStorage,storageMountKey,scanDiskTargets} from "../src/lib/storageMounts.ts";
+import type {BlockDevice,DiskMetric} from "../src/types/monitoring.ts";
+const disk=(name:string,mount_point:string):DiskMetric=>({name,mount_point,file_system:"ext4",total_bytes:100,available_bytes:50});
+test("hide only confirmed boot partitions, never root or ordinary FAT data",()=>{
+  assert.ok(isBootMount('/boot')&&isBootMount('/boot/efi')&&isBootMount('/efi'));
+  assert.ok(!isBootMount('/')&&!isBootMount('/data/boot-backup')&&!isBootMount('/boot-data'));
+  const part={kind:'part',mount_points:[],partition_label:'EFI System Partition',label:null,filesystem:'vfat'} as unknown as BlockDevice;
+  assert.ok(isBootPartition(part));assert.ok(!isBootPartition({...part,mount_points:['/']}));
+  assert.ok(!isBootPartition({...part,partition_label:'Data'}));
+});
+test("disk scan choices prefer whole filesystem mounts and exclude unsupported targets",()=>{
+  const mount={device_id:'8:1',root:'/',source:'/dev/sda1',network:false,read_only:false,capacity_known:true};
+  const original={...disk('/dev/sda1','/data'),mount};
+  const alias={...disk('/dev/sda1','/home/user/bigdata'),mount:{...mount,root:'/users/user'}};
+  const root=disk('/dev/nvme0n1p2','/');
+  const boot={...disk('/dev/nvme0n1p1','/boot/efi'),file_system:'vfat'};
+  const network={...disk('server:/data','/nfs'),file_system:'nfs4'};
+  const overlay={...disk('overlay','/var/lib/docker/rootfs/overlayfs/abc'),file_system:'overlay'};
+  const virtual={...disk('tmpfs','/run'),file_system:'tmpfs'};
+  const options=scanDiskTargets([alias,network,overlay,virtual,original,boot,root],[],false);
+  assert.deepEqual(options.map(o=>o.disk.mount_point),['/','/data']);
+  assert.equal(options[1].aliases,1);assert.equal(options[1].subtree,false);
+  assert.equal(scanDiskTargets([boot],[],true).length,1);
+  assert.equal(scanDiskTargets([{...original,mount:{...mount,network:true}}]).length,0);
+  assert.equal(scanDiskTargets([{...original,total_bytes:0,available_bytes:0}]).length,1);
+  assert.notEqual(scanDiskTargets([original])[0].key,scanDiskTargets([{...original,mount:{...mount,device_id:'8:2'}}])[0].key);
+});
+test("disk scan choices preserve disjoint subvolumes and mark subtree-only mounts",()=>{
+  const mount={device_id:'0:1',root:'/@',source:'/dev/sda1',network:false,read_only:false,capacity_known:true};
+  const a={...disk('/dev/sda1','/'),file_system:'btrfs',mount};
+  const b={...disk('/dev/sda1','/home'),file_system:'btrfs',mount:{...mount,root:'/@home'}};
+  const alias={...b,mount_point:'/other-home'};
+  const options=scanDiskTargets([alias,b,a]);
+  assert.deepEqual(options.map(o=>o.disk.mount_point),['/','/home']);
+  assert.ok(options.every(o=>o.subtree));assert.equal(options[1].aliases,1);
+  const boot={kind:'part',path:'/dev/sdb1',mount_points:['/esp'],partition_label:'EFI System Partition',children:[]} as unknown as BlockDevice;
+  assert.equal(scanDiskTargets([disk('/dev/sdb1','/esp')],[boot],false).length,0);
+  assert.equal(scanDiskTargets([disk('/dev/sdb1','/')],[boot],false).length,1);
+});
+test("shared filesystem grouping uses identity, not matching capacity",()=>{
+  const a=disk('/dev/sda1','/data');const b=disk('/dev/sda1','/home/tzr/bigdata');const other=disk('/dev/sdb1','/other');
+  let groups=sharedStorage([a,b,other]);assert.equal(groups.get(storageMountKey(a))?.members.length,2);assert.ok(!groups.has(storageMountKey(other)));
+  const meta={device_id:'8:1',root:'/',source:'/dev/sda1',network:false,read_only:false,capacity_known:true};
+  const alias={...b,name:'/dev/disk/by-label/data',mount:{...meta,root:'/users/tzr/data'}};
+  groups=sharedStorage([{...a,mount:meta},alias]);assert.equal(groups.get(storageMountKey(alias))?.primary.mount_point,'/data');
+  assert.ok(!capacityKnown({...a,total_bytes:0,available_bytes:0}));
+  assert.ok(!capacityKnown({...a,mount:{...meta,capacity_known:false}}));
+  assert.ok(capacityKnown(a));
+  assert.equal(sharedStorage([disk('overlay','/one'),disk('overlay','/two')]).size,0);
+});
