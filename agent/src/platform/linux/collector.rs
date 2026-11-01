@@ -1,5 +1,7 @@
 use super::inventory::{ExtendedInventory, issue};
-use super::{cpu_frequency, hardware, mounts, network_capacity, permissions, temperature};
+use super::{
+    cpu_frequency, hardware, mounts, network_capacity, permissions, security, temperature,
+};
 use crate::platform::common::gpu;
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -20,6 +22,7 @@ const GPU_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const STORAGE_FOOTPRINT_INTERVAL: Duration = Duration::from_secs(3_600);
 
 pub struct Collector {
+    security: security::Sampler,
     cpu_frequency: cpu_frequency::Sampler,
     cached_temperatures: Option<HostTemperatures>,
     cpu_package_temperatures: std::collections::BTreeMap<u32, f32>,
@@ -99,7 +102,9 @@ impl Collector {
 
         let network_capacity =
             network_capacity::Sampler::load(state_database, extended.privilege.uid, store).await;
+        let security = security::Sampler::load(store, extended.privilege.uid).await;
         Self {
+            security,
             cpu_frequency: cpu_frequency::Sampler::default(),
             cached_temperatures: None,
             cpu_package_temperatures: Default::default(),
@@ -367,6 +372,7 @@ impl Collector {
             });
             self.storage_refreshed_at = Some(Instant::now());
         }
+        let host_security = self.security.sample(&self.store).await;
         MetricsSnapshot {
             agent_control: None,
             network_activity: None,
@@ -410,7 +416,7 @@ impl Collector {
             inventory_collected_at: Some(self.extended.collected_at),
             software_packages: self.extended.software_packages.clone(),
             running_services: self.extended.running_services.clone(),
-            host_security: Some(self.extended.host_security.clone()),
+            host_security: Some(host_security),
             permission_audit: self.permission_audit.clone(),
             ai_tools: self.extended.ai_tools.clone(),
             programming_tools: self.extended.programming_tools.clone(),

@@ -1,7 +1,7 @@
 // Only run in the documented isolated environment.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { inventoryFresh, permissionFreshSeconds, policyApplied } from "../src/lib/collection.ts";
+import { inventoryFresh, permissionFreshSeconds, policyApplied, securityFresh } from "../src/lib/collection.ts";
 import type { CollectionPolicy, NodeSummary } from "../src/types/monitoring.ts";
 
 function node(ageSeconds: number, extendedSeconds?: number): NodeSummary {
@@ -17,6 +17,19 @@ test("freshness follows applied sampling intervals with legacy fallbacks", () =>
 test("permission review age follows the configured audit interval", () => {
   assert.equal(permissionFreshSeconds(node(1)), 480);
   assert.equal(permissionFreshSeconds(node(1, 300)), 730);
+});
+test("hourly security freshness uses its own timestamp, independently of inventory", () => {
+  const host = node(1);
+  const snapshot = (age: number) => ({ ...host, metrics: { ...host.metrics,
+    host_security: { collected_at: new Date(Date.now() - age * 1000).toISOString(), interval_seconds: 3600 },
+  } }) as NodeSummary;
+  assert.equal(securityFresh(snapshot(1800)), true);
+  assert.equal(securityFresh({ ...snapshot(1800), metrics: { ...snapshot(1800).metrics, inventory_collected_at: "invalid" } } as NodeSummary), true);
+  assert.equal(securityFresh(snapshot(3800)), false);
+  assert.equal(securityFresh(snapshot(-30)), false);
+  assert.equal(securityFresh({ ...snapshot(1), online: false }), false);
+  assert.equal(securityFresh(node(1)), true);
+  assert.equal(securityFresh(node(200)), false);
 });
 test("application confirmation checks the actual intervals, not just a revision number", () => {
   const expected = { revision: 3, live_seconds: 2, gpu_seconds: 30 } as CollectionPolicy;

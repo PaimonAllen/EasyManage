@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use easymanage_protocol::{AgentReport, HardwareDetails};
+use easymanage_protocol::{AgentReport, HardwareDetails, HostSecurity};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::path::Path;
@@ -13,6 +13,22 @@ pub struct Store {
 }
 
 impl Store {
+    pub(crate) async fn host_security(&self, uid: u32) -> Result<Option<HostSecurity>> {
+        let Some(value) = self.metadata("host_security_v1").await? else {
+            return Ok(None);
+        };
+        let Ok((cached_uid, snapshot)) = serde_json::from_str::<(u32, HostSecurity)>(&value) else {
+            return Ok(None);
+        };
+        Ok((cached_uid == uid).then_some(snapshot))
+    }
+    pub(crate) async fn save_host_security(&self, uid: u32, snapshot: &HostSecurity) -> Result<()> {
+        self.set_metadata(
+            "host_security_v1",
+            &serde_json::to_string(&(uid, snapshot))?,
+        )
+        .await
+    }
     pub(crate) async fn network_capacity_cache(&self) -> Result<Option<String>> {
         self.metadata("network_capacity_v1").await
     }

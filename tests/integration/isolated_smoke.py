@@ -218,6 +218,8 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     collected = datetime.now(timezone.utc)
     metrics = {
         "collected_at": collected.isoformat(), "cpu_usage_percent": 37.5,
+        "host_security": {"collected_at": (collected-timedelta(minutes=30)).isoformat(), "interval_seconds": 3600,
+                          "apparmor_enabled": True, "aslr_mode": 2, "ptrace_scope": 1, "kernel_lockdown": "integrity"},
         "cpu_frequency": {"collected_at": (collected-timedelta(seconds=20)).isoformat(),"average_mhz":2800,"minimum_mhz":800,"maximum_mhz":4200,"logical_cpus":4},
         "cpu_sockets": [{"id":2,"model":"Fixture package 2","logical_cpus":2,"physical_cores":1,"usage_percent":20,"frequency":None,"temperature_celsius":None},
                         {"id":7,"model":"Fixture package 7","logical_cpus":2,"physical_cores":1,"usage_percent":70,"frequency":None,"temperature_celsius":51}],
@@ -312,6 +314,10 @@ def exercise_api(base_url, context, enrollment_token, node_id):
             and node["metrics"]["overlay_networks"][0]["provider"] == "tailscale"
             and parse_timestamp(node["metrics"]["disk_collected_at"]) == collected,
             "CPU/memory/disk/network/GPU/user payload round trip")
+    require(node['metrics']['host_security']['interval_seconds']==3600
+            and parse_timestamp(node['metrics']['host_security']['collected_at'])==collected-timedelta(minutes=30)
+            and node['metrics']['host_security']['apparmor_enabled'] is True,
+            'hourly security metadata and original sample timestamp survive HTTPS/database round trip')
     network_mount=next(disk for disk in node['metrics']['disks'] if disk['mount_point']=='/nfs')
     require(network_mount['mount']['capacity_probe']['interval_seconds']==3600
             and network_mount['mount']['capacity_probe']['status']=='timeout'
@@ -823,8 +829,11 @@ def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollme
                     for user in metrics["users"]),
                 "real Agent reports bounded per-source login evidence")
         require(isinstance(metrics.get("host_security"), dict)
-                and set(metrics["host_security"]) == {"apparmor_enabled", "aslr_mode", "ptrace_scope", "kernel_lockdown"},
+                and set(metrics["host_security"]) == {"apparmor_enabled", "aslr_mode", "ptrace_scope", "kernel_lockdown", "collected_at", "interval_seconds"}
+                and metrics['host_security']['interval_seconds']==3600,
                 "real Agent reports bounded host security observations without inferring unknowns")
+        require(updated['metrics']['host_security']==metrics['host_security'],
+                'hourly security snapshots retain their actual sample timestamp across heartbeats')
         tools = metrics.get("ai_tools")
         require(isinstance(tools, list) and {"codex", "claude", "gemini", "opencode", "aider"} == {item["name"] for item in tools}
                 and all(item["category"] == "assistant" and set(item) == {"name", "category", "executable_paths", "processes", "service_units"} for item in tools),
@@ -954,6 +963,8 @@ def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollme
                 'disabled proxy collection persists before startup scanning while the actual proxy continues running')
         require(restarted["metrics"]["hardware_details"] == hardware,
                 "daily hardware cache survives Agent restart without changing the sample timestamp")
+        require(restarted['metrics']['host_security']==metrics['host_security'],
+                'hourly security cache survives Agent restart without rescanning or changing its sample timestamp')
         require({node["id"] for node in listing()} == before | {node_id}, "restarting the Agent never creates a duplicate node")
         switch_proxy(True,False)
         proxy_enabled=wait_for_proxy_switch(True)

@@ -13,7 +13,7 @@ import { PermissionChecks } from "../pages/PermissionChecks";
 import { Security } from "../pages/Security";
 import { useFleet } from "../hooks/useFleet";
 import { Dashboard } from "../pages/Dashboard";
-import { Documentation } from "../pages/Documentation";
+// import { Documentation } from "../pages/Documentation";
 import { Network } from "../pages/Network";
 import { Storage } from "../pages/Storage";
 import { Users } from "../pages/Users";
@@ -34,7 +34,7 @@ function savedTheme(): Theme {
 }
 
 const pages = [
-  { id: "docs", label: "操作手册" },
+  // { id: "docs", label: "操作手册" },
   { id: "overview", label: "设备总览" },
   { id: "users", label: "用户状态" },
   { id: "storage", label: "存储" },
@@ -54,7 +54,7 @@ const pages = [
 function currentPage() {
   const hash = window.location.hash.replace(/^#\/?/, "");
   if (hash === "agent-updates") return "agent-management";
-  return pages.some((page) => page.id === hash) ? hash : "docs";
+  return pages.some((page) => page.id === hash) ? hash : "overview";
 }
 
 export function App() {
@@ -138,7 +138,7 @@ export function App() {
   return (
     <div className="dashboard">
       <header className="topbar">
-        <a className="brand" href="#/docs">
+        <a className="brand" href="#/overview">
           <span>E</span>
           <strong>EasyManage</strong>
         </a>
@@ -200,11 +200,11 @@ export function App() {
             平台配置：{configError}
           </div>
         )}
-        {page === "docs" && (
+        {/* {page === "docs" && (
           <Documentation
             url={config.documentation_url}
           />
-        )}
+        )} */}
         {page === "overview" && (
           <Dashboard
             data={fleet.data}

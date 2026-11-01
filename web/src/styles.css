@@ -1285,6 +1285,9 @@ select:disabled {
   margin: 0;
   border-top: 1px solid var(--line);
 }
+.network-route-details > summary { cursor: pointer; }
+.network-route-details > summary:hover { color: var(--cyan); }
+.network-route-details > summary:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
 .storage-topology-toolbar {
   display: flex;
   align-items: center;

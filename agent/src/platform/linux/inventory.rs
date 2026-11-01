@@ -5,9 +5,9 @@ use super::programming_tools;
 use crate::platform::common::command::read_command;
 use chrono::{DateTime, Utc};
 use easymanage_protocol::{
-    AgentPrivilege, AiToolProcess, AiToolStatus, BlockDevice, CollectionIssue, HostSecurity,
-    NetworkInterface, OverlayNetworkStatus, ProxyService, RouteInfo, ServiceStatus,
-    SoftwarePackage, UserSessionEvidence, UserStatus,
+    AgentPrivilege, AiToolProcess, AiToolStatus, BlockDevice, CollectionIssue, NetworkInterface,
+    OverlayNetworkStatus, ProxyService, RouteInfo, ServiceStatus, SoftwarePackage,
+    UserSessionEvidence, UserStatus,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -33,7 +33,6 @@ pub struct ExtendedInventory {
     pub proxy_services: Vec<ProxyService>,
     pub software_packages: Vec<SoftwarePackage>,
     pub running_services: Vec<ServiceStatus>,
-    pub host_security: HostSecurity,
     pub ai_tools: Vec<AiToolStatus>,
     pub programming_tools: Vec<easymanage_protocol::ProgrammingToolStatus>,
     pub issues: Vec<CollectionIssue>,
@@ -141,7 +140,6 @@ impl ExtendedInventory {
             proxy_services: Vec::new(),
             software_packages: Vec::new(),
             running_services: Vec::new(),
-            host_security: collect_host_security(),
             ai_tools: Vec::new(),
             programming_tools: Vec::new(),
             issues: vec![issue("inventory", "扩展信息采集任务失败")],
@@ -399,7 +397,6 @@ impl ExtendedInventory {
             proxy_services,
             software_packages,
             running_services,
-            host_security: collect_host_security(),
             ai_tools,
             programming_tools,
             issues,
@@ -419,37 +416,6 @@ impl ExtendedInventory {
         }
         self.issues
             .retain(|item| !matches!(item.component.as_str(), "users" | "sessions"));
-    }
-}
-
-fn collect_host_security() -> HostSecurity {
-    let apparmor_enabled = read_small("/sys/module/apparmor/parameters/enabled", 64)
-        .ok()
-        .and_then(|value| match value.trim() {
-            "Y" => Some(true),
-            "N" => Some(false),
-            _ => None,
-        });
-    let aslr_mode = read_small("/proc/sys/kernel/randomize_va_space", 64)
-        .ok()
-        .and_then(|value| value.trim().parse().ok());
-    let ptrace_scope = read_small("/proc/sys/kernel/yama/ptrace_scope", 64)
-        .ok()
-        .and_then(|value| value.trim().parse().ok());
-    let kernel_lockdown = read_small("/sys/kernel/security/lockdown", 128)
-        .ok()
-        .and_then(|value| {
-            value
-                .split_whitespace()
-                .find_map(|part| part.strip_prefix('[')?.strip_suffix(']'))
-                .filter(|mode| matches!(*mode, "none" | "integrity" | "confidentiality"))
-                .map(str::to_owned)
-        });
-    HostSecurity {
-        apparmor_enabled,
-        aslr_mode,
-        ptrace_scope,
-        kernel_lockdown,
     }
 }
 

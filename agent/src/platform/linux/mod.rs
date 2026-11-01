@@ -13,6 +13,7 @@ mod overlay_networks;
 pub(crate) mod paths;
 mod permissions;
 mod programming_tools;
+mod security;
 mod temperature;
 
 pub(crate) use collector::Collector as NativeCollector;

@@ -118,6 +118,8 @@ export interface ServiceStatus {
   state: string;
 }
 export interface HostSecurity {
+  collected_at?: string | null;
+  interval_seconds?: number | null;
   apparmor_enabled: boolean | null;
   aslr_mode: number | null;
   ptrace_scope: number | null;

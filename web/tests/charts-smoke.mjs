@@ -18,6 +18,23 @@ const server = await createServer({
   server: { middlewareMode: true, watch: null },
 });
 try {
+  const { Network } = await server.ssrLoadModule("/src/pages/Network.tsx");
+  const networkFixture = { id: "route-one", hostname: "Route machine", online: true, metrics: {
+    inventory_collected_at: new Date().toISOString(), routes: [{ destination: "198.51.100.0/24", gateway: "198.51.100.1", interface: "fixture0", metric: 100 }],
+  } };
+  const routesPage = renderToStaticMarkup(React.createElement(Network, { nodes: [networkFixture, { ...networkFixture, id: "route-two", hostname: "Empty routes", metrics: { routes: [] } }] }));
+  assert.equal((routesPage.match(/<details class="network-route-details"/g) ?? []).length, 2);
+  assert.ok(routesPage.includes("路由 · 1 条") && routesPage.includes("路由 · 0 条") && routesPage.includes("198.51.100.0/24") && routesPage.includes("fixture0"));
+  assert.ok(!/<details class="network-route-details"[^>]*\bopen(?:=|\s|>)/.test(routesPage));
+  const { Security } = await server.ssrLoadModule("/src/pages/Security.tsx");
+  const securityFixture = { ...networkFixture, metrics: { inventory_collected_at: new Date().toISOString(),
+    host_security: { collected_at: new Date(Date.now() - 1800_000).toISOString(), interval_seconds: 3600, apparmor_enabled: true, aslr_mode: 2, ptrace_scope: 1, kernel_lockdown: "integrity" },
+  } };
+  const securityPage = renderToStaticMarkup(React.createElement(Security, { nodes: [securityFixture] }));
+  assert.ok(securityPage.includes("小时快照") && securityPage.includes("每小时一次") && !securityPage.includes("历史或未知") && !securityPage.includes("实时观测"));
+  const legacySecurityPage = renderToStaticMarkup(React.createElement(Security, { nodes: [{ ...securityFixture, metrics: { ...securityFixture.metrics, host_security: { apparmor_enabled: true } } }] }));
+  assert.ok(legacySecurityPage.includes("旧版采样") && legacySecurityPage.includes("更新 Agent 后") && !legacySecurityPage.includes("小时快照"));
+  console.log("PASS routes collapse separately by machine and hourly security retains its own freshness with truthful legacy labels");
   const {SpaceVisualization,DiskSpaceExplorer}=await server.ssrLoadModule("/src/components/DiskSpaceExplorer.tsx");
   const diskTree=[
     {id:0,parent:null,name:"/fixture",kind:"directory",allocated:100,apparent:1000,files:2,directories:1,issue:null,incomplete:true,mtime:0},

@@ -192,7 +192,8 @@ export function Network({ nodes }: { nodes: NodeSummary[] }) {
                   <p className="table-empty">暂未收到接口清单。</p>
                 )}
               </div>
-              <h3 className="section-title">路由</h3>
+              <details className="network-route-details" aria-label={`${node.hostname} 路由`}>
+              <summary className="section-title">路由 · {node.metrics?.routes?.length ?? 0} 条</summary>
               <div className="table-scroll">
                 <table>
                   <thead>
@@ -222,6 +223,7 @@ export function Network({ nodes }: { nodes: NodeSummary[] }) {
                   <p className="table-empty">未采集到路由。</p>
                 )}
               </div>
+              </details>
               <CollectionNotes
                 node={node}
                 components={["network", "interface", "route"]}

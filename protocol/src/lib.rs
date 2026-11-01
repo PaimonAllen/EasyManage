@@ -254,6 +254,10 @@ pub struct ProgrammingToolStatus {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostSecurity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collected_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_seconds: Option<u64>,
     pub apparmor_enabled: Option<bool>,
     pub aslr_mode: Option<u8>,
     pub ptrace_scope: Option<u8>,
