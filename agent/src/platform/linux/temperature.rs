@@ -1,11 +1,75 @@
 //! Bounded read-only hwmon collection. No SMART commands, probes, driver loading or writes.
 use chrono::Utc;
 use easymanage_protocol::{HostTemperatures, SsdTemperature};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const MAX_DEVICES: usize = 128;
 const MAX_CHANNELS: usize = 128;
+const MAX_CPUS: usize = 4096;
+
+#[derive(Default)]
+pub struct CpuThrottleSampler {
+    previous: HashMap<PathBuf, u64>,
+}
+
+impl CpuThrottleSampler {
+    pub fn sample(&mut self) -> Option<bool> {
+        self.sample_from(Path::new("/sys/devices/system/cpu"))
+    }
+
+    fn sample_from(&mut self, root: &Path) -> Option<bool> {
+        let mut current = HashMap::new();
+        if let Ok(cpus) = std::fs::read_dir(root) {
+            for cpu in cpus.take(MAX_CPUS * 8).flatten() {
+                let name = cpu.file_name();
+                let Some(index) = name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("cpu"))
+                    .and_then(|number| number.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                if index >= MAX_CPUS {
+                    continue;
+                }
+                for counter in [
+                    "core_throttle_count",
+                    "package_throttle_count",
+                    "core_throttle_total_time_ms",
+                    "package_throttle_total_time_ms",
+                ] {
+                    let path = cpu.path().join("thermal_throttle").join(counter);
+                    if let Some(value) = read_small(&path).and_then(|text| text.parse::<u64>().ok())
+                    {
+                        current.insert(path, value);
+                    }
+                }
+            }
+        }
+        let mut known = false;
+        let mut detected = false;
+        let mut reset = false;
+        for (path, value) in &current {
+            if let Some(old) = self.previous.get(path) {
+                known = true;
+                detected |= value > old;
+                reset |= value < old;
+            }
+        }
+        self.previous = current;
+        // Never count boot-time totals as new events, or treat missing support
+        // and a reset/overflow as evidence that no throttling occurred.
+        if detected {
+            Some(true)
+        } else if known && !reset {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
 
 fn read_small(path: &Path) -> Option<String> {
     let mut value = String::new();
@@ -93,18 +157,20 @@ fn ssd_device(sys: &Path, hwmon: &Path, driver: &str) -> Option<String> {
     None
 }
 
-pub fn collect() -> HostTemperatures {
+pub fn collect() -> (HostTemperatures, BTreeMap<u32, f32>) {
     collect_from(Path::new("/sys"))
 }
 
-fn collect_from(sys: &Path) -> HostTemperatures {
+fn collect_from(sys: &Path) -> (HostTemperatures, BTreeMap<u32, f32>) {
+    let mut packages: BTreeMap<u32, f32> = BTreeMap::new();
     let mut result = HostTemperatures {
         collected_at: Utc::now(),
         cpu_celsius: None,
+        cpu_thermal_throttling: None,
         ssds: Vec::new(),
     };
     let Ok(entries) = std::fs::read_dir(sys.join("class/hwmon")) else {
-        return result;
+        return (result, packages);
     };
     for entry in entries.take(MAX_DEVICES).flatten() {
         let path: PathBuf = entry.path();
@@ -113,6 +179,19 @@ fn collect_from(sys: &Path) -> HostTemperatures {
         };
         if matches!(driver.as_str(), "coretemp" | "k10temp" | "zenpower") {
             let channels = sensor_channels(&path, &driver);
+            if driver == "coretemp" {
+                for (label, value) in &channels {
+                    if let Some(id) = label
+                        .strip_prefix("Package id ")
+                        .and_then(|id| id.parse::<u32>().ok())
+                    {
+                        packages
+                            .entry(id)
+                            .and_modify(|old| *old = old.max(*value))
+                            .or_insert(*value);
+                    }
+                }
+            }
             if let Some(value) = maximum(channels.into_iter().map(|(_, value)| value)) {
                 result.cpu_celsius = Some(result.cpu_celsius.map_or(value, |old| old.max(value)));
             }
@@ -136,7 +215,7 @@ fn collect_from(sys: &Path) -> HostTemperatures {
         }
     }
     result.ssds.sort_by(|a, b| a.device.cmp(&b.device));
-    result
+    (result, packages)
 }
 
 #[cfg(test)]
@@ -187,8 +266,11 @@ mod tests {
             )
             .unwrap();
         }
-        let result = collect_from(&root);
+        let (result, packages) = collect_from(&root);
+        assert!(packages.is_empty());
         assert_eq!(result.cpu_celsius, Some(51.0));
+        write("class/hwmon/hwmon0/temp1_label", "Package id 2");
+        assert_eq!(collect_from(&root).1.get(&2), Some(&45.0));
         assert_eq!(
             result
                 .ssds
@@ -200,10 +282,34 @@ mod tests {
         write("class/hwmon/hwmon0/name", "k10temp");
         write("class/hwmon/hwmon0/temp1_label", "Tctl");
         write("class/hwmon/hwmon0/temp2_label", "Tdie");
-        assert_eq!(collect_from(&root).cpu_celsius, Some(51.0));
+        assert_eq!(collect_from(&root).0.cpu_celsius, Some(51.0));
         write("class/hwmon/hwmon0/temp2_input", "-273150");
-        assert_eq!(collect_from(&root).cpu_celsius, None);
-        assert_eq!(collect_from(&root.join("absent")).cpu_celsius, None);
+        assert_eq!(collect_from(&root).0.cpu_celsius, None);
+        assert_eq!(collect_from(&root.join("absent")).0.cpu_celsius, None);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn throttle_counter_deltas_exclude_boot_totals_resets_and_unavailable_counters() {
+        let root =
+            std::env::temp_dir().join(format!("easymanage-throttle-{}", uuid::Uuid::new_v4()));
+        let counter = root.join("cpu0/thermal_throttle/core_throttle_count");
+        std::fs::create_dir_all(counter.parent().unwrap()).unwrap();
+        let mut sampler = CpuThrottleSampler::default();
+        std::fs::write(&counter, "123").unwrap();
+        assert_eq!(sampler.sample_from(&root), None);
+        assert_eq!(sampler.sample_from(&root), Some(false));
+        std::fs::write(&counter, "124").unwrap();
+        assert_eq!(sampler.sample_from(&root), Some(true));
+        assert_eq!(sampler.sample_from(&root), Some(false));
+        std::fs::write(&counter, "0").unwrap();
+        assert_eq!(sampler.sample_from(&root), None);
+        let duration = counter.with_file_name("core_throttle_total_time_ms");
+        std::fs::write(&duration, "50").unwrap();
+        assert_eq!(sampler.sample_from(&root), Some(false));
+        std::fs::write(&duration, "60").unwrap();
+        assert_eq!(sampler.sample_from(&root), Some(true));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(sampler.sample_from(&root), None);
     }
 }

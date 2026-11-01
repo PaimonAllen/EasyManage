@@ -37,9 +37,11 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     let index = state.config.web_root.join("index.html");
     let static_files =
-        ServeDir::new(&state.config.web_root).not_found_service(ServeFile::new(index));
+        ServeDir::new(&state.config.web_root).not_found_service(ServeFile::new(index.clone()));
 
     Router::new()
+        .route_service("/usage-history", ServeFile::new(index.clone()))
+        .route_service("/usage-history/", ServeFile::new(index))
         .route("/api/v1/health/live", get(live))
         .route("/api/v1/health/ready", get(ready))
         .route("/api/v1/nodes", get(list_nodes))
@@ -344,6 +346,19 @@ async fn report_metrics(
     if report.metrics.agent_control.as_ref().is_some_and(|control|control.revision>i64::MAX as u64) {
         return Err(ApiError::bad_request("invalid monitoring control revision"));
     }
+    if let Some(frequency) = &report.metrics.cpu_frequency {
+        if !frequency.valid() {
+            return Err(ApiError::bad_request("invalid CPU frequency metrics"));
+        }
+    }
+    let mut socket_ids=std::collections::HashSet::new();
+    if report.metrics.cpu_sockets.len()>64||report.metrics.cpu_sockets.iter().any(|cpu|{
+        !socket_ids.insert(cpu.id)||cpu.model.len()>1024||!(1..=4096).contains(&cpu.logical_cpus)
+            ||cpu.physical_cores.is_some_and(|cores|cores==0||cores>cpu.logical_cpus)
+            ||cpu.usage_percent.is_some_and(|value|!value.is_finite()||!(0.0..=100.0).contains(&value))
+            ||cpu.frequency.as_ref().is_some_and(|frequency|!frequency.valid())
+            ||cpu.temperature_celsius.is_some_and(|value|!value.is_finite()||!(0.0..=150.0).contains(&value))
+    }) {return Err(ApiError::bad_request("invalid CPU socket metrics"));}
     if let Some(temperatures) = &report.metrics.temperatures {
         let valid = |value: f32| value.is_finite() && (0.0..=150.0).contains(&value);
         if temperatures.cpu_celsius.is_some_and(|value| !valid(value))

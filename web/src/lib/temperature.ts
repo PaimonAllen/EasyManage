@@ -13,21 +13,26 @@ export function recordTemperatureSnapshots(
     const recent = (previous[node.id] ?? []).filter(sample => {
       const gpuAt = Date.parse(sample.gpu_collected_at ?? "");
       const thermalAt = Date.parse(sample.temperatures?.collected_at ?? "");
+      const cpuAt=Date.parse(sample.fast_collected_at??sample.collected_at);
       return (Number.isFinite(gpuAt) && gpuAt >= now - SNAPSHOT_WINDOW_MS && gpuAt <= now)
-        || (Number.isFinite(thermalAt) && thermalAt >= now - SNAPSHOT_WINDOW_MS && thermalAt <= now);
+        || (Number.isFinite(thermalAt) && thermalAt >= now - SNAPSHOT_WINDOW_MS && thermalAt <= now)
+        || ((sample.cpu_sockets?.length??0)>1&&Number.isFinite(cpuAt)&&cpuAt>=now-SNAPSHOT_WINDOW_MS&&cpuAt<=now);
     });
     const metrics = node.online ? node.metrics : null;
     if (metrics) {
       const gpuAt = Date.parse(metrics.gpu_collected_at ?? "");
       const thermalAt = Date.parse(metrics.temperatures?.collected_at ?? "");
+      const cpuAt=Date.parse(metrics.fast_collected_at??metrics.collected_at);
+      const hasCpu=(metrics.cpu_sockets?.length??0)>1&&Number.isFinite(cpuAt)&&cpuAt>=now-SNAPSHOT_WINDOW_MS&&cpuAt<=now;
       const hasGpu = Number.isFinite(gpuAt) && gpuAt >= now - SNAPSHOT_WINDOW_MS && gpuAt <= now
         && hottest(metrics.gpus.map(gpu => gpu.temperature_celsius)) !== null;
       const hasThermal = Number.isFinite(thermalAt) && thermalAt >= now - SNAPSHOT_WINDOW_MS && thermalAt <= now
         && (validTemperature(metrics.temperatures?.cpu_celsius) || ssdTemperature(metrics.temperatures) !== null);
-      if (hasGpu || hasThermal) {
+      if (hasGpu || hasThermal || hasCpu) {
         const last = recent.at(-1);
         if (last?.gpu_collected_at !== metrics.gpu_collected_at
-          || last?.temperatures?.collected_at !== metrics.temperatures?.collected_at)
+          || last?.temperatures?.collected_at !== metrics.temperatures?.collected_at
+          || (hasCpu&&(last?.fast_collected_at??last?.collected_at)!==(metrics.fast_collected_at??metrics.collected_at)))
           recent.push(metrics);
       }
     }
@@ -41,6 +46,8 @@ export function validTemperature(value: unknown): value is number {
 }
 
 export const HOT_TEMPERATURE_C = 70;
+export const TEMPERATURE_AXIS_MIN_C = 30;
+export const TEMPERATURE_AXIS_MAX_C = 95;
 
 export function isHotTemperature(value: unknown): boolean {
   return validTemperature(value) && value > HOT_TEMPERATURE_C;
@@ -71,20 +78,11 @@ export function formatTemperature(value: unknown): string {
   return validTemperature(value) ? `${value.toFixed(1)}°C` : "温度 —";
 }
 
-// Scale only actual readings in the visible window, with 2 C padding and a
-// minimum 10 C span. Rounded steps reduce axis jitter for nearly steady sensors.
+// A fixed temperature axis; unavailable/out-of-window readings remain absent.
 export function temperatureRange(points: { at: string; value: number }[], start: number, end: number): { min: number; max: number } | null {
-  const values = points.filter(point => {
+  const present = points.some(point => {
     const time = Date.parse(point.at);
     return Number.isFinite(time) && time >= start && time <= end && validTemperature(point.value);
-  }).map(point => point.value);
-  if (!values.length) return null;
-  const low = Math.min(...values);
-  const high = Math.max(...values);
-  const targetStep = Math.max(10, high - low + 4) / 4;
-  const power = 10 ** Math.floor(Math.log10(targetStep));
-  const step = ([1, 2, 5, 10].find(factor => factor * power >= targetStep) ?? 10) * power;
-  const min = Math.max(0, Math.floor((low - 2) / step) * step);
-  const max = Math.max(min + 10, Math.ceil((high + 2) / step) * step);
-  return { min, max };
+  });
+  return present ? { min: TEMPERATURE_AXIS_MIN_C, max: TEMPERATURE_AXIS_MAX_C } : null;
 }

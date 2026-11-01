@@ -32,19 +32,19 @@ test("cached temperatures use real sample times, not heartbeat/live timestamps",
   assert.deepEqual(temperaturePoints([], legacy, "gpu"), []);
 });
 
-test("temperature range follows visible data with rounded bounds and nonzero span", () => {
+test("temperature axis stays at 30–95 degrees, with missing and out-of-window data left absent", () => {
   const start = Date.parse("2026-09-29T08:00:00Z");
   const end = start + 600_000;
   const point = (value: number, time = start + 1000) => ({ at: new Date(time).toISOString(), value });
-  assert.deepEqual(temperatureRange([point(60)], start, end), { min: 55, max: 65 });
-  assert.deepEqual(temperatureRange([point(42)], start, end), { min: 40, max: 50 });
-  assert.deepEqual(temperatureRange([point(0)], start, end), { min: 0, max: 10 });
+  assert.deepEqual(temperatureRange([point(60)], start, end), { min: 30, max: 95 });
+  assert.deepEqual(temperatureRange([point(42)], start, end), { min: 30, max: 95 });
+  assert.deepEqual(temperatureRange([point(0)], start, end), { min: 30, max: 95 });
   assert.equal(temperatureRange([], start, end), null);
   assert.equal(temperatureRange([point(NaN), point(151), point(50, end + 1)], start, end), null);
   const visible = [point(51), point(58)];
   assert.deepEqual(temperatureRange([...visible, point(120, start - 1)], start, end), temperatureRange(visible, start, end));
   const range = temperatureRange([point(5), point(149.9)], start, end)!;
-  assert.ok(range.min >= 0 && range.min <= 5 && range.max >= 149.9 && range.max > range.min);
+  assert.deepEqual(range,{min:30,max:95});
 });
 
 test("existing overview snapshots form real GPU history while legacy API omits temperatures", () => {

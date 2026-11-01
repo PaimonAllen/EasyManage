@@ -14,6 +14,7 @@
   --chart-cyan: #4de2c5;
   --chart-blue: #60a5fa;
   --chart-hot: #ff5b64;
+  --chart-critical: #ff1515;
   --chart-violet: #9b86f9;
   --chart-amber: #f3ba63;
   --storage-green: #47d58c;
@@ -35,6 +36,7 @@
   --chart-cyan: #087d6c;
   --chart-blue: #1d4ed8;
   --chart-hot: #ce2438;
+  --chart-critical: #b80000;
   --chart-violet: #674ab2;
   --chart-amber: #a16208;
   --storage-green: #15834b;
@@ -427,6 +429,11 @@ summary:focus-visible {
   padding: 5px 5px 5px;
 }
 .overview-metrics > .history-chart:not(:last-child) { border-right: 1px solid #2b3742; }
+.node-gpu-details, .node-cpu-details { border-top: 1px solid var(--line); }
+.node-gpu-details__heading { display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px; }
+.node-gpu-details__heading h3 { margin:0;font-size:13px;color:var(--cyan); }
+.node-gpu-details__heading > span { font-size:11px;color:var(--muted); }
+.node-gpu-details__grid { display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:1px;background:var(--line); }
 .history-chart__heading {
   display: grid;
   grid-template-rows: 16px minmax(0, 1fr);
@@ -452,6 +459,7 @@ summary:focus-visible {
   white-space: nowrap;
 }
 .history-chart__headline > .history-chart__temperature--hot { color: var(--chart-hot); }
+.history-chart__headline > .history-chart__temperature--critical { color: var(--chart-critical); font-weight: 900; }
 .history-chart__heading strong {
   display: flex;
   flex-wrap: wrap;
@@ -1884,6 +1892,7 @@ select:disabled {
 }
 :root[data-theme="light"] .history-chart__headline > .history-chart__temperature { color: var(--chart-blue); }
 :root[data-theme="light"] .history-chart__headline > .history-chart__temperature--hot { color: var(--chart-hot); }
+:root[data-theme="light"] .history-chart__headline > .history-chart__temperature--critical { color: var(--chart-critical); font-weight: 900; }
 :root[data-theme="light"] .history-chart__thermal-max,
 :root[data-theme="light"] .history-chart__thermal-min { background: #eef5f8cf; }
 :root[data-theme="light"] .history-warning,

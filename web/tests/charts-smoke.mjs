@@ -125,13 +125,20 @@ try {
   const props = { node: { metrics, online: true, cpu_logical_cores: 4 }, liveSamples: [], checkedAt: end };
   const html = renderToStaticMarkup(React.createElement(NodeCharts, props));
   assert.equal((html.match(/class="history-chart"/g) ?? []).length, 5);
+  assert.ok(html.includes('均频 — · 4 线程 · Load 0.20')&&!html.includes('均频 0.00 GHz'));
+  const frequencyMetrics={...metrics,cpu_frequency:{collected_at:at,average_mhz:2800,minimum_mhz:800,maximum_mhz:4200,logical_cpus:4}};
+  const withFrequency=renderToStaticMarkup(React.createElement(NodeCharts,{...props,node:{...props.node,metrics:frequencyMetrics}}));
+  assert.ok(withFrequency.includes('均频 2.80 GHz · 4 线程 · Load 0.20')&&withFrequency.includes('0.80–4.20 GHz')&&withFrequency.includes('30 秒缓存'));
+  const staleFrequency=renderToStaticMarkup(React.createElement(NodeCharts,{...props,node:{...props.node,metrics:{...frequencyMetrics,cpu_frequency:{...frequencyMetrics.cpu_frequency,collected_at:new Date(end-91_000).toISOString()}}}}));
+  assert.ok(staleFrequency.includes('均频 — · 4 线程')&&!staleFrequency.includes('均频 2.80 GHz'));
+  console.log('PASS cached CPU frequency appears before threads/load, with range tooltip and unknown/stale data left empty');
   assert.equal((html.match(/stroke="var\(--chart-blue\)"/g) ?? []).length, 3);
   assert.equal((html.match(/class="history-chart__thermal-max"/g) ?? []).length, 3);
   assert.equal((html.match(/class="history-chart__thermal-min"/g) ?? []).length, 3);
-  assert.ok(html.includes('class="history-chart__thermal-max">65°C'));
-  assert.ok(html.includes('class="history-chart__thermal-min">55°C'));
+  assert.ok(html.includes('class="history-chart__thermal-max">95°C'));
+  assert.ok(html.includes('class="history-chart__thermal-min">30°C'));
   assert.ok(!html.includes('>150°C</span>'));
-  assert.ok(html.includes('d="M599.0,80.0" fill="none" stroke="var(--chart-blue)"'));
+  assert.ok(html.includes('d="M599.0,86.2" fill="none" stroke="var(--chart-blue)"'));
   const earlier = new Date(end - 11_000).toISOString();
   const legacyHistory = { points: [{ ...metrics, collected_at: earlier, gpu_collected_at: earlier,
     temperatures: null, gpus: [{ ...metrics.gpus[0], temperature_celsius: null }] }] };
@@ -140,7 +147,7 @@ try {
     temperatureSnapshots: [{ ...metrics, collected_at: earlier, gpu_collected_at: earlier,
       gpus: [{ ...metrics.gpus[0], temperature_celsius: 59 }] }],
   }));
-  assert.ok(withSnapshots.includes('d="M589.0,96.0 L599.0,80.0" fill="none" stroke="var(--chart-blue)"'),
+  assert.ok(withSnapshots.includes('d="M589.0,88.6 L599.0,86.2" fill="none" stroke="var(--chart-blue)"'),
     "two actual overview sensor samples should draw the GPU temperature curve even with legacy history API");
   const hotMetrics = { ...metrics,
     temperatures: { ...metrics.temperatures, cpu_celsius: 71, ssds: [{ device: "nvme0", temperature_celsius: 70 }] },
@@ -162,12 +169,25 @@ try {
   }));
   assert.equal((hotCurve.match(/stroke="var\(--chart-hot\)"/g) ?? []).length, 2,
     "only CPU and GPU series cross the threshold");
-  assert.ok(hotCurve.includes('d="M589.0,120.0 L599.0,40.0" fill="none" stroke="var(--chart-blue)"'));
-  assert.match(hotCurve, /d="M589\.0,120\.0 L599\.0,40\.0"[^>]*stroke="var\(--chart-hot\)"[^>]*clip-path="url\(#[^)]+\)"/);
-  assert.equal((hotCurve.match(/clipPathUnits="userSpaceOnUse"><rect x="0" y="0" width="600" height="80"/g) ?? []).length, 2,
+  assert.ok(hotCurve.includes('d="M589.0,86.2 L594.0,61.5 L599.0,36.9" fill="none" stroke="var(--chart-blue)"'));
+  assert.match(hotCurve, /d="M589\.0,86\.2 L594\.0,61\.5 L599\.0,36\.9"[^>]*stroke="var\(--chart-hot\)"[^>]*clip-path="url\(#[^)]+\)"/);
+  assert.equal((hotCurve.match(/clipPathUnits="userSpaceOnUse"><rect x="0" y="0" width="600" height="61\.538/g) ?? []).length, 2,
     "red is clipped at the interpolated 70°C crossing, not applied to the whole line");
   const hotClipIds = [...hotCurve.matchAll(/<clipPath id="([^"]+)"/g)].map(match => match[1]);
   assert.equal(new Set(hotClipIds).size, hotClipIds.length, "multiple charts must have independent clip paths");
+  const {HistoryChart}=await server.ssrLoadModule('/src/components/HistoryChart.tsx');
+  const extremeTemperature=renderToStaticMarkup(React.createElement(HistoryChart,{
+    title:'GPU',headline:'fixture',detail:'fixture',series:[],maxValue:100,maxLabel:'100%',windowEnd:new Date(end).toISOString(),
+    temperature:{value:110,detail:'fixture',gapSeconds:35,points:[
+      {at:new Date(end-20_000).toISOString(),value:60},{at:new Date(end-10_000).toISOString(),value:110},{at:new Date(end-1_000).toISOString(),value:90},
+    ]},
+  }));
+  assert.match(extremeTemperature,/class="history-chart__temperature-above-range" d="M587\.0,0\.0 L590\.0,0\.0 L596\.8,0\.0"[^>]*stroke="var\(--chart-critical\)"[^>]*stroke-width="12"/);
+  assert.ok(extremeTemperature.includes('110.0°C')&&extremeTemperature.includes('95°C')&&extremeTemperature.includes('30°C'));
+  assert.ok(extremeTemperature.includes('history-chart__temperature--critical')&&extremeTemperature.includes('温度 &gt;95°C'));
+  assert.ok(!hotCurve.includes('history-chart__temperature-above-range'),'70–95°C remains the normal red width');
+  const exactly95=renderToStaticMarkup(React.createElement(HistoryChart,{title:'GPU',headline:'fixture',detail:'fixture',series:[],maxValue:100,maxLabel:'100%',windowEnd:new Date(end).toISOString(),temperature:{value:95,detail:'fixture',gapSeconds:35,points:[{at,value:95}]}}));
+  assert.ok(!exactly95.includes('history-chart__temperature-above-range'),'exactly 95°C does not trigger the extra thick line');
   assert.ok(html.includes("51.5°C") && html.includes("42.0°C") && html.includes("60.0°C"));
   assert.ok(html.includes("SSD 温度") && html.includes("nvme0: 42.0°C"));
   assert.ok(html.includes("history-chart__max--primary"));
@@ -193,9 +213,78 @@ try {
     ...props, node: { ...props.node, metrics: legacy },
   }));
   assert.equal((missing.match(/stroke="var\(--chart-blue\)"/g) ?? []).length, 0);
+  const {NodeCard}=await server.ssrLoadModule('/src/components/NodeCard.tsx');
+  const multiGpus=[0,1,2,3].map(index=>({...metrics.gpus[0],index,name:`Fixture GPU ${index}`,utilization_percent:index*20,
+    memory_used_bytes:(index+1)*1024**3,memory_total_bytes:24*1024**3,temperature_celsius:45+index*12}));
+  const multiNode={...props.node,id:'multi-fixture',hostname:'Multi GPU fixture',metrics:{...metrics,gpus:[multiGpus[2],multiGpus[0],multiGpus[3],multiGpus[1]]}};
+  const cardProps={node:multiNode,liveSamples:[],temperatureSnapshots:[],checkedAt:end,onElevate:()=>{},elevationAvailable:false};
+  const defaultGpuCard=renderToStaticMarkup(React.createElement(NodeCard,cardProps));
+  assert.ok(defaultGpuCard.includes('收起 GPU')&&defaultGpuCard.includes('aria-expanded="true"'));
+  assert.ok(defaultGpuCard.includes('href="/usage-history?node=multi-fixture" target="_blank" rel="noopener noreferrer"'));
+  assert.ok(!/class="node-gpu-details" hidden=""/.test(defaultGpuCard));
+  assert.equal((defaultGpuCard.match(/class="history-chart"/g)??[]).length,9,'multiple GPUs expand by default');
+  const collapsedDetails=renderToStaticMarkup(React.createElement(NodeCharts,{...props,node:multiNode,gpuExpanded:false}));
+  assert.ok(/class="node-gpu-details" hidden=""/.test(collapsedDetails));
+  assert.equal((collapsedDetails.match(/class="history-chart"/g)??[]).length,5,'explicitly collapsed details do not render extra charts');
+  const singleCard=renderToStaticMarkup(React.createElement(NodeCard,{...cardProps,node:{...multiNode,metrics}}));
+  assert.ok(!singleCard.includes('展开所有 GPU'));
+  assert.ok(!singleCard.includes('展开所有 CPU'));
+  assert.ok(!singleCard.includes('收起 GPU')&&!singleCard.includes('收起 CPU'));
+  const sockets=[0,1].map(id=>({id,model:`Socket ${id}`,logical_cpus:96,physical_cores:48,usage_percent:20+id*50,frequency:{collected_at:at,average_mhz:2800,minimum_mhz:800,maximum_mhz:4200,logical_cpus:96},temperature_celsius:null}));
+  const multiCpuNode={...multiNode,cpu_logical_cores:192,metrics:{...multiNode.metrics,cpu_sockets:sockets}};
+  const multiCpuCard=renderToStaticMarkup(React.createElement(NodeCard,{...cardProps,node:multiCpuNode}));
+  assert.ok(multiCpuCard.includes('收起 CPU')&&multiCpuCard.includes('收起 GPU'));
+  assert.ok(!/class="node-cpu-details" hidden=""/.test(multiCpuCard));
+  assert.ok(multiCpuCard.includes('Socket 0'),'multiple CPUs expand by default');
+  assert.equal((multiCpuCard.match(/class="history-chart"/g)??[]).length,11);
+  const collapsedCpus=renderToStaticMarkup(React.createElement(NodeCharts,{...props,node:multiCpuNode,cpuExpanded:false,gpuExpanded:false}));
+  assert.ok(/class="node-cpu-details" hidden=""/.test(collapsedCpus));
+  assert.equal((collapsedCpus.match(/class="history-chart"/g)??[]).length,5);
+  const cpuExpanded=renderToStaticMarkup(React.createElement(NodeCharts,{...props,node:multiCpuNode,cpuExpanded:true,gpuExpanded:false}));
+  assert.equal((cpuExpanded.match(/class="history-chart"/g)??[]).length,7);
+  assert.ok(cpuExpanded.includes('CPU 0')&&cpuExpanded.includes('CPU 1')&&cpuExpanded.includes('Socket 0')&&cpuExpanded.includes('96 线程 / 48 核'));
+  const bothExpanded=renderToStaticMarkup(React.createElement(NodeCharts,{...props,node:multiCpuNode,cpuExpanded:true,gpuExpanded:true}));
+  assert.equal((bothExpanded.match(/class="history-chart"/g)??[]).length,11);
+  const singleSocket=renderToStaticMarkup(React.createElement(NodeCard,{...cardProps,node:{...multiCpuNode,metrics:{...multiCpuNode.metrics,cpu_sockets:[sockets[0]]}}}));
+  assert.ok(!singleSocket.includes('展开所有 CPU'),'one 96-thread CPU must not be mistaken for multiple sockets');
+  assert.ok(!singleSocket.includes('收起 CPU'));
+  console.log('PASS multi-CPU/GPU default expansion, independent explicit collapse, physical device counts and single-device omission');
+  const expandedGpus=renderToStaticMarkup(React.createElement(NodeCharts,{...props,node:multiNode,gpuExpanded:true,gpuDetailsId:'fixture-expanded-gpus'}));
+  const gpuDetails=expandedGpus.slice(expandedGpus.indexOf('id="fixture-expanded-gpus"'));
+  assert.equal((expandedGpus.match(/class="history-chart"/g)??[]).length,9);
+  assert.ok(gpuDetails.indexOf('GPU 0')<gpuDetails.indexOf('GPU 1')&&gpuDetails.indexOf('GPU 1')<gpuDetails.indexOf('GPU 2'));
+  assert.ok(gpuDetails.includes('1.0/24.0 GiB')&&gpuDetails.includes('4.0/24.0 GiB')&&gpuDetails.includes('81.0°C'));
+  assert.equal((gpuDetails.match(/stroke="var\(--chart-blue\)"/g)??[]).length,4);
+  assert.equal((gpuDetails.match(/history-chart__temperature--hot/g)??[]).length,1);
+  console.log('PASS multi-GPU disclosure, lazy per-device charts, individual VRAM/temperature readings and single-GPU compatibility');
+  const {UsageHistoryCharts,UsageOverheatingNotice}=await server.ssrLoadModule('/src/pages/UsageHistory.tsx');
+  const historyStat=value=>({average:value,maximum:value,minimum:value,samples:value===null?0:1});
+  const gpuStat={core:historyStat(30),memory:historyStat(1024**3),memory_percent:historyStat(20),temperature:historyStat(60),thermal_throttling:{samples:5,detected_samples:1}};
+  const usageStats={cpu:historyStat(25),memory:historyStat(4*1024**3),network_rx:historyStat(100),network_tx:historyStat(200),disk_read:historyStat(null),disk_write:historyStat(null),cpu_temperature:historyStat(55),ssd_temperature:historyStat(null),gpu_count:{...historyStat(4),maximum:8},gpu:gpuStat,gpus:{'7':gpuStat}};
+  const usageStart=new Date(end-86400*7*1000).toISOString();
+  const usageData={node_id:'fixture',hostname:'History fixture',start:usageStart,end:new Date(end).toISOString(),utc_offset_minutes:480,bucket_seconds:600,summary:usageStats,
+    days:[{date:'2026-11-01',start:usageStart,end:new Date(end).toISOString(),summary:usageStats}],gpus:[{index:7,name:'Historic GPU 7'}],points:[{at,stats:usageStats}]};
+  const usageHtml=renderToStaticMarkup(React.createElement(UsageHistoryCharts,{data:usageData,gpu:'7'}));
+  assert.equal((usageHtml.match(/class="history-chart"/g)??[]).length,6);
+  assert.ok(usageHtml.includes('GPU 7')&&usageHtml.includes('Historic GPU 7')&&usageHtml.includes('近 7 天')&&usageHtml.includes('4–8 张'));
+  assert.ok(usageHtml.includes('本时段没有有效采样')&&!usageHtml.includes('10080 分钟'));
+  assert.ok(usageHtml.includes('Overheating')&&usageHtml.includes('本时段硬件曾报告热降频')&&usageHtml.includes('GPU 7 · 1 个热降频采样'));
+  const coolGpu={...gpuStat,temperature:historyStat(95),thermal_throttling:{samples:5,detected_samples:0}};
+  const coolStats={...usageStats,cpu_temperature:historyStat(null),gpu:coolGpu,gpus:{'7':coolGpu}};
+  const dayData={...usageData,days:[{...usageData.days[0],summary:coolStats}]};
+  const coolDay=renderToStaticMarkup(React.createElement(UsageHistoryCharts,{data:dayData,period:'2026-11-01',gpu:'7'}));
+  assert.ok(!coolDay.includes('Overheating'),'a non-throttled day must not inherit another day’s warning, even at 95°C');
+  const dailyHeat=renderToStaticMarkup(React.createElement(UsageOverheatingNotice,{stats:usageStats,gpu:'7',compact:true}));
+  assert.ok(dailyHeat.includes('Overheating')&&dailyHeat.includes('当日硬件曾报告热降频')&&dailyHeat.includes('GPU 7 · 1 个热降频采样'));
+  assert.ok(renderToStaticMarkup(React.createElement(UsageOverheatingNotice,{stats:coolStats,compact:true})).includes('未记录热降频'));
+  const legacyStats={...coolStats,gpu:{...coolGpu,thermal_throttling:undefined}};
+  const legacyThermal=renderToStaticMarkup(React.createElement(UsageOverheatingNotice,{stats:legacyStats,compact:true}));
+  assert.ok(legacyThermal.includes('未采集降频状态')&&!legacyThermal.includes('Overheating'));
+  console.log('PASS historical overheating requires selected day/GPU hardware evidence; temperature alone and missing flags never trigger it');
+  console.log('PASS standalone seven-day charts, GPU history selection, real gaps and long-window date labels');
   assert.equal((missing.match(/>温度 —<\/span>/g) ?? []).length, 3);
   assert.ok(!missing.includes(">0.0°C<"));
-  console.log("PASS five-chart rendering, three blue temperature curves with independent dynamic bounds, compact legend and legacy/missing-sensor display");
+  console.log("PASS fixed 30–95°C axes, red above 70°C, extra thick only above 95°C at true crossings, unclipped readings and missing-sensor display");
   const { BlockDeviceMap } = await server.ssrLoadModule("/src/components/BlockDeviceMap.tsx");
   const models = ["ST2000DM005-2CW102", "ST4000NM0035-1V4107", "ST4000DM004-2U91", "Unknown HDD", "Samsung SSD 990 EVO Plus 1TB"];
   const devices = models.map((model, index) => ({ name: `fixture${index}`, path: `/dev/fixture${index}`,

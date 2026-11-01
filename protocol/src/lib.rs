@@ -296,6 +296,9 @@ pub struct GpuMetric {
     pub memory_used_bytes: u64,
     pub temperature_celsius: Option<f32>,
     pub power_watts: Option<f32>,
+    /// Driver-reported thermal clock limiting, never inferred from temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal_throttling: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -309,7 +312,39 @@ pub struct SsdTemperature {
 pub struct HostTemperatures {
     pub collected_at: DateTime<Utc>,
     pub cpu_celsius: Option<f32>,
+    /// Thermal-throttle counter increased since the previous valid reading.
+    /// First reading, unavailable counters and resets are unknown, not false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_thermal_throttling: Option<bool>,
     pub ssds: Vec<SsdTemperature>,
+}
+
+/// One cached read of kernel-reported frequencies, not a hardware throttle signal.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CpuFrequency {
+    pub collected_at: DateTime<Utc>,
+    pub average_mhz: f64,
+    pub minimum_mhz: f64,
+    pub maximum_mhz: f64,
+    pub logical_cpus: u32,
+}
+impl CpuFrequency {
+    pub fn valid(&self) -> bool {
+        (1..=4096).contains(&self.logical_cpus)
+            && [self.minimum_mhz,self.average_mhz,self.maximum_mhz].into_iter().all(|value|value.is_finite()&&value>0.0&&value<=20_000.0)
+            && self.minimum_mhz<=self.average_mhz && self.average_mhz<=self.maximum_mhz
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CpuSocketMetric {
+    pub id: u32,
+    pub model: String,
+    pub logical_cpus: u32,
+    pub physical_cores: Option<u32>,
+    pub usage_percent: Option<f32>,
+    pub frequency: Option<CpuFrequency>,
+    pub temperature_celsius: Option<f32>,
 }
 
 pub mod collection;
@@ -337,6 +372,10 @@ pub struct MetricsSnapshot {
     pub gpu_collected_at: Option<DateTime<Utc>>,
     pub collected_at: DateTime<Utc>,
     pub cpu_usage_percent: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_frequency: Option<CpuFrequency>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu_sockets: Vec<CpuSocketMetric>,
     pub load_average_one: f64,
     pub load_average_five: f64,
     pub load_average_fifteen: f64,

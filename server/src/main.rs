@@ -11,6 +11,7 @@ mod operations;
 mod performance;
 mod network;
 mod permission_reviews;
+mod usage_history;
 
 use anyhow::{Context, Result};
 use api::AppState;
@@ -83,6 +84,7 @@ async fn run() -> Result<()> {
         collection,
     )?)
     .merge(network::router(pool.clone()))
+    .merge(usage_history::router(&pool))
     .merge(performance::router(pool, performance_monitor))
     .merge(guide::router(&config.web_root)?)
     .layer(axum::middleware::from_fn_with_state(initialized, database::guard))

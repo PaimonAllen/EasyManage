@@ -1,0 +1,20 @@
+.usage-history__body{padding:24px clamp(12px,3vw,48px);max-width:1800px;margin:auto}
+.usage-history__heading{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap}
+.usage-history__heading h1{font-size:clamp(22px,3vw,32px);margin:6px 0 12px;overflow-wrap:anywhere}
+.usage-history__heading p{color:var(--muted);font-size:13px}
+.usage-history__periods{display:flex;gap:8px;flex-wrap:wrap;margin:22px 0 16px}
+.usage-history__periods [aria-pressed="true"]{border-color:var(--cyan);color:var(--cyan)}
+.usage-history__gpu-filter{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin-bottom:18px}
+.usage-history__gpu-filter select{max-width:100%}
+.usage-history__overheating{color:var(--chart-hot);font-size:12px;overflow-wrap:anywhere}
+.usage-history__overheating--notice{display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px;margin:16px 0;padding:12px 14px;border:1px solid var(--chart-hot);border-radius:8px;background:var(--surface);font-size:13px}
+.usage-history__overheating--notice strong{white-space:nowrap}
+.usage-history__summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:12px;margin:16px 0}
+.usage-history__summary>div{display:grid;gap:10px;padding:14px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+.usage-history__summary span{font-size:12px;color:var(--muted)}.usage-history__summary strong{font-size:14px;overflow-wrap:anywhere}
+.usage-history__charts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;border:1px solid var(--line);background:var(--line);border-radius:8px;overflow:hidden;margin:18px 0}
+.usage-history__charts .history-chart{padding:10px}.usage-history__charts .history-chart__plot{height:160px}
+.usage-history__daily{margin-top:24px}.usage-history__daily h2{padding:18px 23px;margin:0;font-size:17px}
+.usage-history__day{padding:0;border:0;color:var(--cyan);background:transparent;text-align:left;white-space:nowrap}
+@media(max-width:1050px){.usage-history__charts{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px){.usage-history__charts{grid-template-columns:1fr}}

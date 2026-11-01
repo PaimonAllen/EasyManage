@@ -81,3 +81,5 @@ SSH fixture 还强制遮蔽 `/var`、`/etc/easymanage`、`/etc/systemd/system` �
 平台自身更新回归：`test_platform_release.py` 为临时目录纯逻辑测试，覆盖发布不影响运行服务、逐文件摘要检查、允许组可写的 home 上级目录、拒绝平台自身目录组写入及越界/符号链接、成功安装只改变平台、就绪失败回退和版本比较。机器管理 Rust 单测同样覆盖共享 home 下私有清单目录可用，清单目录组写入和符号链接仍拒绝。`platform_update_smoke.py` 在上述隔离环境运行并接收宿主 net/mnt 命名空间 ID，通过嵌套私有 namespace 模拟 systemd/runuser，覆盖管理员固定调度、错误单元/候选拦截、重复任务拒绝和 Agent 不被触及。HTTP smoke 覆盖平台更新接口跨源拒绝与无候选禁用。所有测试均不重启生产服务；纯逻辑测试也不会真正联系 systemd 或 HTTPS。
 
 目录汇总模式回归：`disk_space_scanner_smoke.py` 验证稀疏文件与硬链接仍计入总量，但输出不含文件名；32,010 个文件只保存一个目录，无临时 SQLite。`isolated_smoke.py --disk-space` 在私有数据库中验证 26,001 个子目录的分页与排序、未被筛选影响的本层占用、目录约束拒绝文件行；另在私有 schema 重演 0013–0016，验证旧流式/JSON 快照的目录 ID 与总量保留、失败任务保留及旧表/文件名清除。
+
+七天使用历史：`isolated_smoke.py --usage-history` 使用私有 PostgreSQL/HTTPS，验证自然日边界、过期/未来数据排除、缓存采样去重、真实零值与缺失空白、消失 GPU 编号保留、序列化结果缓存和参数边界。在临时数据库短暂锁定历史表，检查历史查询限流/超时以及主监控健康接口仍然响应；不锁定或读取生产表。`web/tests/usageHistory.test.ts` 与 SSR 验证缺失/零值、GPU 选择与长时间轴日期显示。

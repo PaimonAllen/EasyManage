@@ -1,5 +1,5 @@
 use super::inventory::{ExtendedInventory, issue};
-use super::{hardware, mounts, network_capacity, permissions, temperature};
+use super::{cpu_frequency, hardware, mounts, network_capacity, permissions, temperature};
 use crate::platform::common::gpu;
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -20,10 +20,14 @@ const GPU_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const STORAGE_FOOTPRINT_INTERVAL: Duration = Duration::from_secs(3_600);
 
 pub struct Collector {
+    cpu_frequency: cpu_frequency::Sampler,
     cached_temperatures: Option<HostTemperatures>,
+    cpu_package_temperatures: std::collections::BTreeMap<u32, f32>,
+    cpu_throttle: temperature::CpuThrottleSampler,
     temperature_refreshed_at: Option<Instant>,
     policy: CollectionPolicy,
     cached_gpus: Vec<GpuMetric>,
+    gpu_sampler: gpu::Sampler,
     gpu_refreshed_at: Option<Instant>,
     gpu_collected_at: Option<DateTime<Utc>>,
     system: System,
@@ -63,7 +67,9 @@ pub struct Collector {
 impl Collector {
     pub async fn initialize(state_database: &Path, store: &Store) -> Self {
         let mut system = System::new();
-        system.refresh_cpu_all();
+        // Frequency is sampled in one bounded procfs read below, not through
+        // sysinfo's potentially expensive per-logical-CPU frequency refresh.
+        system.refresh_cpu_usage();
         system.refresh_memory();
         let disks = Disks::new();
         let networks = Networks::new_with_refreshed_list();
@@ -94,7 +100,10 @@ impl Collector {
         let network_capacity =
             network_capacity::Sampler::load(state_database, extended.privilege.uid, store).await;
         Self {
+            cpu_frequency: cpu_frequency::Sampler::default(),
             cached_temperatures: None,
+            cpu_package_temperatures: Default::default(),
+            cpu_throttle: temperature::CpuThrottleSampler::default(),
             temperature_refreshed_at: None,
             policy: CollectionPolicy {
                 users_enabled: Some(users_enabled),
@@ -103,6 +112,7 @@ impl Collector {
                 ..Default::default()
             },
             cached_gpus: Vec::new(),
+            gpu_sampler: gpu::Sampler::default(),
             gpu_refreshed_at: None,
             gpu_collected_at: None,
             system,
@@ -274,7 +284,10 @@ impl Collector {
             at.elapsed() + Duration::from_millis(250)
                 >= Duration::from_secs(self.policy.disk_seconds.max(30))
         }) {
-            self.cached_temperatures = Some(temperature::collect());
+            let (mut temperatures, packages) = temperature::collect();
+            self.cpu_package_temperatures = packages;
+            temperatures.cpu_thermal_throttling = self.cpu_throttle.sample();
+            self.cached_temperatures = Some(temperatures);
             self.temperature_refreshed_at = Some(Instant::now());
         }
 
@@ -286,7 +299,7 @@ impl Collector {
             .gpu_retry_at
             .is_none_or(|retry_at| Instant::now() >= retry_at)
         {
-            let (gpus, issue) = gpu::collect().await;
+            let (gpus, issue) = self.gpu_sampler.collect().await;
             self.gpu_retry_at = if gpus.is_empty() {
                 Some(Instant::now() + GPU_FAILURE_RETRY_INTERVAL)
             } else {
@@ -364,6 +377,10 @@ impl Collector {
             gpu_collected_at: self.gpu_collected_at,
             collected_at: Utc::now(),
             cpu_usage_percent: fast.cpu_usage_percent,
+            cpu_frequency: self.cpu_frequency.sample(),
+            cpu_sockets: self
+                .cpu_frequency
+                .socket_metrics(self.system.cpus(), &self.cpu_package_temperatures),
             load_average_one: load.one,
             load_average_five: load.five,
             load_average_fifteen: load.fifteen,

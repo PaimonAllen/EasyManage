@@ -172,6 +172,7 @@ export interface GpuMetric {
   memory_used_bytes: number;
   temperature_celsius: number | null;
   power_watts: number | null;
+  thermal_throttling?: boolean | null;
 }
 
 export interface CollectionPolicy {
@@ -204,7 +205,16 @@ export interface HardwareDetails {
   notes: string[];
 }
 
+export interface CpuFrequency {
+  collected_at:string;average_mhz:number;minimum_mhz:number;maximum_mhz:number;logical_cpus:number;
+}
+export interface CpuSocketMetric {
+  id:number;model:string;logical_cpus:number;physical_cores:number|null;
+  usage_percent:number|null;frequency:CpuFrequency|null;temperature_celsius:number|null;
+}
 export interface MetricsSnapshot {
+  cpu_frequency?: CpuFrequency | null;
+  cpu_sockets?: CpuSocketMetric[];
   agent_control?: {revision:number;paused:boolean} | null;
   network_activity?: NetworkActivity | null;
   hardware_details?: HardwareDetails | null;
@@ -315,6 +325,7 @@ export interface MetricHistoryPoint {
 export interface HostTemperatures {
   collected_at: string;
   cpu_celsius: number | null;
+  cpu_thermal_throttling?: boolean | null;
   ssds: { device: string; temperature_celsius: number }[];
 }
 

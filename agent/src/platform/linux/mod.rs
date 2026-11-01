@@ -4,6 +4,7 @@
 mod ai_tools;
 mod block_devices;
 mod collector;
+mod cpu_frequency;
 mod hardware;
 mod mounts;
 mod network_capacity;

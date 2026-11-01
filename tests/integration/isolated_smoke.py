@@ -218,6 +218,9 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     collected = datetime.now(timezone.utc)
     metrics = {
         "collected_at": collected.isoformat(), "cpu_usage_percent": 37.5,
+        "cpu_frequency": {"collected_at": (collected-timedelta(seconds=20)).isoformat(),"average_mhz":2800,"minimum_mhz":800,"maximum_mhz":4200,"logical_cpus":4},
+        "cpu_sockets": [{"id":2,"model":"Fixture package 2","logical_cpus":2,"physical_cores":1,"usage_percent":20,"frequency":None,"temperature_celsius":None},
+                        {"id":7,"model":"Fixture package 7","logical_cpus":2,"physical_cores":1,"usage_percent":70,"frequency":None,"temperature_celsius":51}],
         "temperatures": {"collected_at": (collected - timedelta(seconds=20)).isoformat(),
                          "cpu_celsius": 51.5, "ssds": [{"device": "nvme0", "temperature_celsius": 42.0}]},
         "load_average_one": 0.4, "load_average_five": 0.3, "load_average_fifteen": 0.2,
@@ -262,6 +265,13 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     invalid_temperature["metrics"]["temperatures"]["cpu_celsius"] = 999
     require(request("/api/v1/agent/report", invalid_temperature, {"x-easymanage-agent-token": agent_token})[0] == 400,
             "invalid sensor temperature rejected before database writes")
+    invalid_frequency=json.loads(json.dumps(report))
+    invalid_frequency['metrics']['cpu_frequency']['maximum_mhz']=1000
+    require(request('/api/v1/agent/report',invalid_frequency,{'x-easymanage-agent-token':agent_token})[0]==400,
+            'inconsistent CPU frequency range rejected before database writes')
+    invalid_sockets=json.loads(json.dumps(report));invalid_sockets['metrics']['cpu_sockets'][1]['id']=2
+    require(request('/api/v1/agent/report',invalid_sockets,{'x-easymanage-agent-token':agent_token})[0]==400,
+            'duplicate CPU package identities cannot inflate the detected socket count')
     invalid_storage = json.loads(json.dumps(report))
     invalid_storage["metrics"]["platform_storage"]["total_bytes"] = 5000
     require(request("/api/v1/agent/report", invalid_storage, {"x-easymanage-agent-token": agent_token})[0] == 400,
@@ -326,6 +336,12 @@ def exercise_api(base_url, context, enrollment_token, node_id):
             and parse_timestamp(history["points"][0]["temperatures"]["collected_at"]) == collected - timedelta(seconds=20)
             and history["points"][0]["gpus"][0]["temperature_celsius"] == 30.0,
             "CPU/SSD/GPU temperature round trip preserves true sampling timestamps")
+    observed_frequency=node['metrics']['cpu_frequency']
+    require(all(observed_frequency[key]==metrics['cpu_frequency'][key] for key in ('average_mhz','minimum_mhz','maximum_mhz','logical_cpus'))
+            and parse_timestamp(observed_frequency['collected_at'])==collected-timedelta(seconds=20),
+            'cached kernel CPU frequency keeps its range, logical CPU count and true sampling timestamp')
+    require(node['metrics']['cpu_sockets']==metrics['cpu_sockets'],
+            'per-socket CPU metrics retain physical IDs, independent utilization and unknown temperatures')
     metrics["collected_at"] = (collected - timedelta(minutes=5)).isoformat()
     metrics["cpu_usage_percent"] = 1.0
     metrics["platform_process"] = {"pid": 321, "cpu_percent_of_host": 0.75,
@@ -336,6 +352,8 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     metrics.pop("block_devices")
     metrics.pop("overlay_networks")
     metrics.pop("temperatures")
+    metrics.pop("cpu_frequency")
+    metrics.pop("cpu_sockets")
     metrics.pop("platform_storage")  # Older Agents do not report the storage footprint.
     metrics["users"][0].pop("session_sources")  # Older Agent payloads remain accepted.
     metrics["users"][0].pop("session_evidence")
@@ -745,6 +763,14 @@ def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollme
         agent = subprocess.Popen([str(binary.resolve())], cwd=agent_root, env=env, stdout=agent_log, stderr=subprocess.STDOUT)
         node = wait_for_heartbeat(started)
         metrics = node["metrics"]
+        cpu_blocks=[dict((k.strip(),v.strip()) for line in block.splitlines() for k,sep,v in [line.partition(':')] if sep) for block in Path('/proc/cpuinfo').read_text().split('\n\n')]
+        cpu_blocks=[block for block in cpu_blocks if 'processor' in block]
+        if cpu_blocks and all(block.get('physical id','').isdigit() for block in cpu_blocks):
+            expected=sorted({int(block['physical id']) for block in cpu_blocks})
+            sockets=metrics.get('cpu_sockets',[])
+            require([cpu['id'] for cpu in sockets]==expected and sum(cpu['logical_cpus'] for cpu in sockets)==len(cpu_blocks)
+                    and all(cpu['usage_percent'] is not None and 0<=cpu['usage_percent']<=100 for cpu in sockets),
+                    'real collector identifies physical CPU packages and aggregates existing per-core usage without counting threads as CPUs')
         require(any(p['pid']==proxy.pid and p['name']=='mihomo' and p['listen_addresses'] for p in metrics['proxy_services']),
                 'enabled proxy monitoring sees a real synthetic proxy process and its private listening socket')
         status_fields = dict(line.split(":", 1) for line in Path(f"/proc/{agent.pid}/status").read_text().splitlines() if ":" in line)
@@ -1089,6 +1115,9 @@ def smoke(args):
                         raise RuntimeError("Isolated EasyManage server did not become ready")
                     time.sleep(0.1)
                 exercise_api(base_url, context, enrollment, node_id)
+                if args.usage_history:
+                    from usage_history_smoke import exercise as exercise_usage_history
+                    exercise_usage_history(root, base_url, context, enrollment, require)
                 if args.disk_space:
                     from disk_space_api_smoke import exercise as exercise_disk_space
                     exercise_disk_space(root, base_url, context, enrollment, require)
@@ -1205,6 +1234,7 @@ if __name__ == "__main__":
     parser.add_argument("--machine-onboarding", action="store_true", help="Opt-in SSH/SCP fixture with mocked systemd and a real installed Agent; temporary Paramiko venv required")
     parser.add_argument("--machine-redeployment",action="store_true",help="Add real same-UUID uninstalled Agent redeployment coverage; skips the separate three-minute retry-exhaustion scenario")
     parser.add_argument("--machine-admin-credentials",action="store_true",help="Focused real SSH administrator password/key vault and saved-credential operations regression")
+    parser.add_argument("--usage-history",action="store_true",help="Standalone seven-day history, cache, calendar boundaries and reader isolation")
     parser.add_argument("--disk-space",action="store_true",help="Read-only disk scanner task, permission and database API regression")
     parser.add_argument("--machine-disk-space",action="store_true",help="Focused disk scanner over real persistent SSH with a real Basic Agent")
     parser.add_argument("--host-netns", required=True)
