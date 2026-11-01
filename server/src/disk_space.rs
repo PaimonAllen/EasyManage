@@ -191,8 +191,8 @@ async fn list(
 ) -> Result<Response, OperationsError> {
     let target = target(&state, node)?;
     let authorized = ssh_vault::admin_available(&state.registry, &target, &headers);
-    let rows = sqlx::query("SELECT id,mode,scope,root_path,status,started_at,finished_at,progress,message FROM disk_space_scans WHERE node_id=$1 AND ($2 OR mode='basic') ORDER BY started_at DESC LIMIT 8")
-        .bind(node).bind(authorized).fetch_all(&state.pool).await.map_err(|_| db_error())?;
+    let rows = sqlx::query("SELECT id,mode,scope,root_path,status,started_at,finished_at,progress,message FROM disk_space_scans WHERE node_id=$1 ORDER BY started_at DESC LIMIT 8")
+        .bind(node).fetch_all(&state.pool).await.map_err(|_| db_error())?;
     let jobs: Vec<Value> = rows.iter().map(summary).collect::<Result<_, _>>()?;
     Ok(response(
         json!({"scans":jobs,"username":target.default_user,
@@ -219,9 +219,8 @@ async fn record(
     state: &OperationsState,
     node: Uuid,
     id: Uuid,
-    headers: &HeaderMap,
 ) -> Result<sqlx::postgres::PgRow, OperationsError> {
-    let target = target(state, node)?;
+    let _ = target(state, node)?;
     let row = sqlx::query("SELECT * FROM disk_space_scans WHERE node_id=$1 AND id=$2")
         .bind(node)
         .bind(id)
@@ -232,25 +231,17 @@ async fn record(
             StatusCode::NOT_FOUND,
             "扫描记录不存在或已到期",
         ))?;
-    if row.try_get::<String, _>("mode").map_err(|_| db_error())? == "full" {
-        // Root filenames are privileged data, including historical snapshots.
-        if !ssh_vault::admin_available(&state.registry, &target, headers) {
-            return Err(OperationsError(
-                StatusCode::UNAUTHORIZED,
-                "请先完成此机器的管理员鉴权，再查看 root 扫描记录",
-            ));
-        }
-        let _ = ssh_vault::load_admin(&state.registry, &target, headers)?;
-    }
+    // Saved directory summaries share the platform's normal read access,
+    // regardless of the privilege used to collect them. Root execution and
+    // cancellation authorize separately before changing a task.
     Ok(row)
 }
 
 async fn detail(
     State(state): State<OperationsState>,
     Path((node, id)): Path<(Uuid, Uuid)>,
-    headers: HeaderMap,
 ) -> Result<Response, OperationsError> {
-    let row = record(&state, node, id, &headers).await?;
+    let row = record(&state, node, id).await?;
     let mut value = summary(&row)?;
     value["result"] = row
         .try_get::<Option<Value>, _>("result")
@@ -285,10 +276,9 @@ fn default_sort() -> String {
 async fn entries(
     State(state): State<OperationsState>,
     Path((node, id)): Path<(Uuid, Uuid)>,
-    headers: HeaderMap,
     Query(query): Query<EntryQuery>,
 ) -> Result<Response, OperationsError> {
-    let row = record(&state, node, id, &headers).await?;
+    let row = record(&state, node, id).await?;
     if row.try_get::<String, _>("status").map_err(|_| db_error())? == "running" {
         return Err(OperationsError(
             StatusCode::CONFLICT,
@@ -359,7 +349,16 @@ async fn cancel(
     headers: HeaderMap,
 ) -> Result<Response, OperationsError> {
     validate_origin(&headers, &uri)?;
-    let _ = record(&state, node, id, &headers).await?;
+    let row = record(&state, node, id).await?;
+    if row.try_get::<String, _>("mode").map_err(|_| db_error())? == "full" {
+        let target = target(&state, node)?;
+        if !ssh_vault::admin_available(&state.registry, &target, &headers) {
+            return Err(OperationsError(
+                StatusCode::UNAUTHORIZED,
+                "取消 root 扫描需要此机器的管理员授权",
+            ));
+        }
+    }
     if let Some((_, stop)) = state
         .disk_space
         .active

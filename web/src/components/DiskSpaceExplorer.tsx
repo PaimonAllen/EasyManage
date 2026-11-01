@@ -31,7 +31,7 @@ function RootAuthorization({node,onClose,onReady}:{node:NodeSummary;onClose:()=>
   return <dialog ref={dialog} className="credentials-dialog disk-explorer__auth" aria-label="root 磁盘扫描授权" onCancel={e=>{if(busy)e.preventDefault();else onClose();}}><form onSubmit={e=>{
     e.preventDefault();setBusy(true);setError("");void auth.prepare().then(onReady).catch(e=>setError(e.message)).finally(()=>setBusy(false));
   }}><div className="dialog-title"><h2>root 磁盘扫描 · {node.hostname}</h2><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭">×</button></div>
-    <p className="hint">使用现有管理员授权读取目录占用，root 扫描快照也仅对已授权浏览器显示。</p>
+    <p className="hint">使用管理员授权执行 root 扫描；保存的目录结果对所有平台访问者可见。</p>
     <AdminCredentialFields auth={auth} disabled={busy}/>{error&&<p className="form-error" role="alert">{error}</p>}
     <div className="dialog-actions"><button type="button" className="button button--secondary" disabled={busy} onClick={onClose}>取消</button><button className="button" disabled={busy||!auth.ready}>{busy?"验证中…":"验证并保存授权"}</button></div>
   </form></dialog>;
@@ -69,6 +69,7 @@ function MachineSpace({node,showBoot}:{node:NodeSummary;showBoot:boolean}){
     void load();return()=>{controller.abort();clearTimeout(timer);};
   },[node.id,selected,refresh]);
   const running=status?.scans.some(s=>s.status==="running");
+  const canCancel=scan?.mode!=="full"||status?.root_authorized===true;
   async function start(){
     if(scope==="disk"&&!selectedDisk){setError("请选择当前机器的已挂载本地磁盘");return;}
     setBusy(true);setError("");
@@ -104,6 +105,7 @@ function MachineSpace({node,showBoot}:{node:NodeSummary;showBoot:boolean}){
     </div>
     <p className="hint">时间与条目数量默认无限制，直到扫描完成或手动取消；文件元数据在内存中汇总，仅保存目录大小、数量和层级，不保存文件名及逐文件明细。保持低优先级、只读，每台机器 1 个任务、平台同时 2 个；每个文件系统最大 64 层，不跟随符号链接。关闭页面后任务继续。</p>
     <p className="hint">平台结果存储分区可用空间低于 2 GiB 时，会停止扫描并保存不完整快照；释放空间或迁移数据库后可重新扫描。</p>
+    <p className="hint">普通用户和 root 扫描结果均对所有平台访问者可见；启动或取消 root 扫描需要管理员授权。</p>
     <p className={scope==="all_local"?"disk-explorer__notice":"hint"}>{scope==="all_local"?"一次扫描所有已挂载且支持的本地文件系统，按磁盘分别展示并汇总；绑定挂载去重，网络盘、虚拟文件系统和未挂载分区不扫描。普通用户无权读取的部分会标为不完整。全机扫描可能持续较久，并增加 I/O 和数据库快照占用。":scope==="disk"?"指定磁盘按已挂载的分区或文件系统选择，多分区磁盘分别列出。仅扫描所选挂载点，不跨其他挂载点；网络盘、虚拟文件系统和未挂载分区不列入。启动分区跟随页面显隐设置。":"指定目录仅扫描所在文件系统，跳过其他挂载点；要一次查看各块本地磁盘，请选择「全部本地磁盘」。"}</p>
     {mode==="basic"&&<p className="hint">以 {status?.username??"原 SSH 用户"} 的实际访问权限扫描；受限目录标为未完整读取。普通用户快照遵循平台现有内网监控页面的访问范围。</p>}
     {!node.online&&<p className="disk-explorer__notice">机器离线，仍可查看已保存快照；上线后可重新扫描。</p>}
@@ -114,7 +116,7 @@ function MachineSpace({node,showBoot}:{node:NodeSummary;showBoot:boolean}){
     </select></label><span className="hint">每级别保留最近 3 次，最长 7 天</span></div>
     {scan&&<div className="disk-explorer__scan-state" data-status={scan.status} role="status"><strong>{statusText[scan.status]??scan.status}</strong>
       <span>{scan.result?.visited??scan.progress.visited??0} 个条目 · {scan.result?.elapsed_seconds??scan.progress.elapsed_seconds??0} 秒</span>
-      {scan.status==="running"&&<><progress aria-label="扫描进行中"/><button className="button button--secondary button--small" disabled={busy} onClick={()=>void cancel()}>取消扫描</button></>}
+      {scan.status==="running"&&<><progress aria-label="扫描进行中"/><button className="button button--secondary button--small" disabled={busy||!canCancel} title={canCancel?undefined:"取消 root 扫描需要管理员授权"} onClick={()=>void cancel()}>取消扫描</button></>}
       {scan.message&&<span className="form-error">{scan.message}</span>}
     </div>}
     {scan?.result?(scan.result.paged?<PagedSpaceVisualization key={scan.id} nodeId={node.id} scanId={scan.id} result={scan.result} onChoosePath={choosePath}/>:<SpaceVisualization key={scan.id} result={scan.result} onChoosePath={choosePath}/>):scan?.status!=="running"&&<p className="table-empty">{scan&&["failed","interrupted"].includes(scan.status)?"本次未生成完整汇总；已写入的条目保留，无法作为完整扫描结果展示。请解决提示的问题后重新扫描。":"选择目录并开始扫描，即可按层级查看空间占用。"}</p>}

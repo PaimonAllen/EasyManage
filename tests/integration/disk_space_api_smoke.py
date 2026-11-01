@@ -135,13 +135,38 @@ def exercise(root, base_url, context, enrollment, require):
     metrics['collected_at']=datetime.now(timezone.utc).isoformat();metrics['privilege']={'mode':'full','username':'root','uid':0}
     require(request('/api/v1/agent/report',report,{'x-easymanage-agent-token':identity['agent_token']})[0]==200,'Full fixture authorization boundary heartbeat')
     require(request(base,body|{'mode':'full'})[0] in (401,403),'Full Agent root scan still requires browser administrator authorization')
-    require(request(base)[1]['root_authorized'] is False,'root credentials and root trees are not returned to unauthenticated browser')
-    private_id=str(uuid.uuid4())
-    subprocess.run(['/usr/lib/postgresql/18/bin/psql','-h','127.0.0.1','-p','55432','-U','smoke','-d','easymanage_smoke','-v','ON_ERROR_STOP=1','-c',
-        f"INSERT INTO disk_space_scans(id,node_id,mode,root_path,status) VALUES('{private_id}','{node}','full','/root/PRIVATE_SCAN_FIXTURE','complete')"],
-        check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    require(request(base+'/'+private_id)[0]==401 and request(base+'/'+private_id+'/entries')[0]==401 and 'PRIVATE_SCAN_FIXTURE' not in json.dumps(request(base)[1]),
-            'root historical filenames remain protected on both list and detail endpoints')
+    require(request(base)[1]['root_authorized'] is False,'ordinary browser has no root execution authorization')
+    shared_id=str(uuid.uuid4())
+    shared_root={'id':0,'parent':None,'name':'/root/SHARED_SCAN_FIXTURE','kind':'directory','allocated':1000,'apparent':2000,'files':3,'directories':1,'issue':None,'incomplete':False,'mtime':0,'scan_path':None}
+    shared_child=shared_root|{'id':1,'parent':0,'name':'nested','allocated':600,'apparent':900,'files':2,'directories':0}
+    shared_result={'root':shared_root['name'],'uid':0,'username':'root','status':'complete','reason':'','elapsed_seconds':1,
+                   'filesystem':'ext4','visited':5,'errors':0,'skipped_mounts':0,'symlinks':0,'hardlinks':0,
+                   'nodes':[shared_root],'paged':True,'detail_level':'directories','saved_directories':2}
+    encoded=json.dumps(shared_result).replace("'","''")
+    directories=json.dumps([shared_root,shared_child]).replace("'","''")
+    seed=f"INSERT INTO disk_space_scans(id,node_id,mode,root_path,status,result) VALUES('{shared_id}','{node}','full','/root/SHARED_SCAN_FIXTURE','complete','{encoded}'::jsonb);"
+    seed+=f"INSERT INTO disk_space_directories SELECT '{shared_id}',n.* FROM jsonb_to_recordset('{directories}'::jsonb) AS n(id BIGINT,parent BIGINT,name TEXT,kind TEXT,allocated BIGINT,apparent BIGINT,files BIGINT,directories BIGINT,issue TEXT,incomplete BOOLEAN,mtime BIGINT,scan_path TEXT);"
+    subprocess.run(psql+[seed],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    code,history=request(base)
+    require(code==200 and any(s['id']==shared_id and s['mode']=='full' for s in history['scans'])
+            and history['root_authorized'] is False,'ordinary browser lists root snapshots without receiving root execution authorization')
+    code,shared=request(base+'/'+shared_id)
+    require(code==200 and shared['result']==shared_result,'ordinary browser reads existing root scan totals without credentials')
+    code,shared_page=request(base+'/'+shared_id+'/entries')
+    require(code==200 and shared_page['directory']==shared_root and shared_page['entries']==[shared_child]
+            and shared_page['direct']=={'allocated':400,'apparent':1100,'files':1},'ordinary browser reads root directory hierarchy and direct file totals')
+    code,nested=request(base+'/'+shared_id+'/entries?parent=1')
+    require(code==200 and [d['id'] for d in nested['ancestors']]==[0,1], 'ordinary browser drills into root snapshot directories')
+    require(request(f'/api/v1/nodes/{uuid.uuid4()}/disk-space/{shared_id}')[0]==404,'shared results remain scoped to the original machine')
+    require(request(base+'/'+shared_id+'/cancel',{})[0]==401,'reading root results does not authorize cancellation')
+    require(request(base+'/'+shared_id+'/cancel',{}, {'Origin':'https://foreign.invalid'})[0]==403,'root cancellation retains origin validation')
+    subprocess.run(psql+[f"UPDATE disk_space_scans SET status='running' WHERE id='{shared_id}'"],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try:
+        require(request(base+'/'+shared_id)[1]['status']=='running','ordinary browser can monitor root scan progress')
+        require(request(base+'/'+shared_id+'/cancel',{})[0]==401
+                and request(base+'/'+shared_id)[1]['status']=='running','ordinary read access cannot stop an active root scan')
+    finally:
+        subprocess.run(psql+[f"UPDATE disk_space_scans SET status='complete' WHERE id='{shared_id}'"],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     exercise_summary_migration(node,require)
     print('PASS isolated disk-space HTTPS, PostgreSQL persistence, actual fixed scanner, permissions, input/origin checks, filesystem refusal and small history responses',flush=True)
 
