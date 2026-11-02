@@ -63,15 +63,27 @@ pub fn start_sampler(
             let binary_bytes = executable_bytes();
             let root = web_root.clone();
             let web_bytes = tokio::task::spawn_blocking(move || bounded_tree_bytes(&root))
-                .await.ok().flatten();
-            let database_bytes = sqlx::query_scalar::<_, i64>("SELECT pg_database_size(current_database())")
-                .fetch_one(&storage_pool).await.ok().and_then(|value| u64::try_from(value).ok());
-            let total_bytes = binary_bytes.zip(web_bytes)
+                .await
+                .ok()
+                .flatten();
+            let database_bytes =
+                sqlx::query_scalar::<_, i64>("SELECT pg_database_size(current_database())")
+                    .fetch_one(&storage_pool)
+                    .await
+                    .ok()
+                    .and_then(|value| u64::try_from(value).ok());
+            let total_bytes = binary_bytes
+                .zip(web_bytes)
                 .and_then(|(binary, web)| binary.checked_add(web))
-                .zip(database_bytes).and_then(|(subtotal, database)| subtotal.checked_add(database));
+                .zip(database_bytes)
+                .and_then(|(subtotal, database)| subtotal.checked_add(database));
             let metric = PlatformStorageMetric {
-                collected_at: Utc::now(), binary_bytes, state_bytes: None,
-                web_bytes, database_bytes, total_bytes,
+                collected_at: Utc::now(),
+                binary_bytes,
+                state_bytes: None,
+                web_bytes,
+                database_bytes,
+                total_bytes,
             };
             *storage_current.write().await = Some(metric.clone());
             if let Err(error) = sqlx::query(
@@ -118,8 +130,9 @@ pub fn start_sampler(
             });
             let result = sqlx::query(
                 "INSERT INTO platform_process_samples (sampled_at, pid, cpu_percent_of_host, \
-                 resident_memory_bytes, disk_read_bytes_per_second, disk_written_bytes_per_second) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                 resident_memory_bytes, disk_read_bytes_per_second, disk_written_bytes_per_second, \
+                 sample_interval_seconds,cpu_percent_of_one_core,service_cpu_percent_of_one_core,service_memory_current_bytes) \
+                 VALUES ($1, $2, $3, $4, $5, $6,$7,$8,$9,$10)",
             )
             .bind(sampled_at)
             .bind(i64::from(metric.pid))
@@ -131,6 +144,10 @@ pub fn start_sampler(
             )
             .bind(metric.disk_read_bytes_per_second)
             .bind(metric.disk_written_bytes_per_second)
+            .bind(metric.sample_interval_seconds)
+            .bind(metric.cpu_percent_of_one_core)
+            .bind(metric.service.as_ref().and_then(|service|service.cpu_percent_of_one_core))
+            .bind(metric.service.as_ref().and_then(|service|service.memory_current_bytes).and_then(|value|i64::try_from(value).ok()))
             .execute(&pool)
             .await;
             if let Err(error) = result {
@@ -170,6 +187,9 @@ struct MetricStats {
     average: Option<f64>,
     maximum: Option<f64>,
     samples: i64,
+    time_weighted_average: Option<f64>,
+    observed_seconds: Option<f64>,
+    total: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -178,6 +198,9 @@ struct ProcessWindow {
     first_sample_at: Option<DateTime<Utc>>,
     last_sample_at: Option<DateTime<Utc>>,
     cpu_percent_of_host: MetricStats,
+    cpu_percent_of_one_core: MetricStats,
+    service_cpu_percent_of_one_core: MetricStats,
+    service_memory_current_bytes: MetricStats,
     resident_memory_bytes: MetricStats,
     disk_read_bytes_per_second: MetricStats,
     disk_written_bytes_per_second: MetricStats,
@@ -190,7 +213,10 @@ struct StorageWindow {
     latest: Option<PlatformStorageMetric>,
 }
 
-fn storage_window(row: &PgRow, latest: Option<PlatformStorageMetric>) -> Result<StorageWindow, sqlx::Error> {
+fn storage_window(
+    row: &PgRow,
+    latest: Option<PlatformStorageMetric>,
+) -> Result<StorageWindow, sqlx::Error> {
     Ok(StorageWindow {
         total_bytes: metric_stats(row, "storage")?,
         last_sample_at: row.try_get("storage_last_sample_at")?,
@@ -206,6 +232,15 @@ fn metric_stats(row: &PgRow, name: &str) -> Result<MetricStats, sqlx::Error> {
         average: row.try_get(average.as_str())?,
         maximum: row.try_get(maximum.as_str())?,
         samples: row.try_get(samples.as_str())?,
+        time_weighted_average: row
+            .try_get(format!("{name}_weighted").as_str())
+            .ok()
+            .flatten(),
+        observed_seconds: row
+            .try_get(format!("{name}_seconds").as_str())
+            .ok()
+            .flatten(),
+        total: row.try_get(format!("{name}_total").as_str()).ok().flatten(),
     })
 }
 
@@ -215,6 +250,9 @@ fn process_window(row: &PgRow) -> Result<ProcessWindow, sqlx::Error> {
         first_sample_at: row.try_get("first_sample_at")?,
         last_sample_at: row.try_get("last_sample_at")?,
         cpu_percent_of_host: metric_stats(row, "cpu")?,
+        cpu_percent_of_one_core: metric_stats(row, "core_cpu")?,
+        service_cpu_percent_of_one_core: metric_stats(row, "service_cpu")?,
+        service_memory_current_bytes: metric_stats(row, "service_memory")?,
         resident_memory_bytes: metric_stats(row, "memory")?,
         disk_read_bytes_per_second: metric_stats(row, "disk_read")?,
         disk_written_bytes_per_second: metric_stats(row, "disk_write")?,
@@ -222,6 +260,7 @@ fn process_window(row: &PgRow) -> Result<ProcessWindow, sqlx::Error> {
 }
 
 const SERVER_SUMMARY: &str = r"
+    WITH scoped AS (SELECT *,CASE WHEN sample_interval_seconds IS NOT NULL THEN LEAST(sample_interval_seconds,EXTRACT(EPOCH FROM sampled_at-$1::timestamptz)) END AS observed_interval FROM platform_process_samples WHERE sampled_at >= $1 AND sampled_at <= $2)
     SELECT COUNT(*) AS sample_count,
            MIN(sampled_at) AS first_sample_at, MAX(sampled_at) AS last_sample_at,
            COUNT(cpu_percent_of_host) AS cpu_samples,
@@ -236,10 +275,33 @@ const SERVER_SUMMARY: &str = r"
            COUNT(disk_written_bytes_per_second) AS disk_write_samples,
            AVG(disk_written_bytes_per_second) AS disk_write_average,
            MAX(disk_written_bytes_per_second) AS disk_write_maximum
-    FROM platform_process_samples WHERE sampled_at >= $1 AND sampled_at <= $2
+,
+           SUM(cpu_percent_of_host*observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND cpu_percent_of_host IS NOT NULL) / NULLIF(SUM(observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND cpu_percent_of_host IS NOT NULL),0) AS cpu_weighted,
+           SUM(observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND cpu_percent_of_host IS NOT NULL) AS cpu_seconds,
+           SUM(disk_read_bytes_per_second*observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND disk_read_bytes_per_second IS NOT NULL) / NULLIF(SUM(observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND disk_read_bytes_per_second IS NOT NULL),0) AS disk_read_weighted,
+           SUM(observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND disk_read_bytes_per_second IS NOT NULL) AS disk_read_seconds,
+           SUM(disk_read_bytes_per_second*observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND disk_read_bytes_per_second IS NOT NULL) AS disk_read_total,
+           SUM(disk_written_bytes_per_second*observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND disk_written_bytes_per_second IS NOT NULL) / NULLIF(SUM(observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND disk_written_bytes_per_second IS NOT NULL),0) AS disk_write_weighted,
+           SUM(observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND disk_written_bytes_per_second IS NOT NULL) AS disk_write_seconds,
+           SUM(disk_written_bytes_per_second*observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND disk_written_bytes_per_second IS NOT NULL) AS disk_write_total,
+           COUNT(cpu_percent_of_one_core) AS core_cpu_samples,
+           AVG(cpu_percent_of_one_core::DOUBLE PRECISION) AS core_cpu_average,
+           MAX(cpu_percent_of_one_core::DOUBLE PRECISION) AS core_cpu_maximum,
+           SUM(cpu_percent_of_one_core*observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND cpu_percent_of_one_core IS NOT NULL) / NULLIF(SUM(observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND cpu_percent_of_one_core IS NOT NULL),0) AS core_cpu_weighted,
+           SUM(observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND cpu_percent_of_one_core IS NOT NULL) AS core_cpu_seconds,
+           COUNT(service_cpu_percent_of_one_core) AS service_cpu_samples,
+           AVG(service_cpu_percent_of_one_core::DOUBLE PRECISION) AS service_cpu_average,
+           MAX(service_cpu_percent_of_one_core::DOUBLE PRECISION) AS service_cpu_maximum,
+           SUM(service_cpu_percent_of_one_core*observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND service_cpu_percent_of_one_core IS NOT NULL) / NULLIF(SUM(observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND service_cpu_percent_of_one_core IS NOT NULL),0) AS service_cpu_weighted,
+           SUM(observed_interval) FILTER (WHERE observed_interval>0 AND observed_interval<=86400 AND service_cpu_percent_of_one_core IS NOT NULL) AS service_cpu_seconds,
+           COUNT(service_memory_current_bytes) AS service_memory_samples,
+           AVG(service_memory_current_bytes::DOUBLE PRECISION) AS service_memory_average,
+           MAX(service_memory_current_bytes::DOUBLE PRECISION) AS service_memory_maximum
+    FROM scoped
 ";
 
 const AGENT_SUMMARY: &str = r"
+    WITH scoped AS (SELECT *,CASE WHEN agent_sample_interval_seconds IS NOT NULL THEN LEAST(agent_sample_interval_seconds,EXTRACT(EPOCH FROM collected_at-$1::timestamptz)) END AS observed_interval FROM metrics_samples WHERE collected_at >= $1 AND collected_at <= $2)
     SELECT n.id, n.hostname, n.last_seen,
            COUNT(s.agent_pid) AS sample_count,
            MIN(s.collected_at) FILTER (WHERE s.agent_pid IS NOT NULL) AS first_sample_at,
@@ -256,7 +318,29 @@ const AGENT_SUMMARY: &str = r"
            COUNT(s.agent_disk_written_bytes_per_second) AS disk_write_samples,
            AVG(s.agent_disk_written_bytes_per_second) AS disk_write_average,
            MAX(s.agent_disk_written_bytes_per_second) AS disk_write_maximum
-    FROM nodes n LEFT JOIN metrics_samples s
+,
+           SUM(s.agent_cpu_percent_of_host*s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_cpu_percent_of_host IS NOT NULL) / NULLIF(SUM(s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_cpu_percent_of_host IS NOT NULL),0) AS cpu_weighted,
+           SUM(s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_cpu_percent_of_host IS NOT NULL) AS cpu_seconds,
+           SUM(s.agent_disk_read_bytes_per_second*s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_disk_read_bytes_per_second IS NOT NULL) / NULLIF(SUM(s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_disk_read_bytes_per_second IS NOT NULL),0) AS disk_read_weighted,
+           SUM(s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_disk_read_bytes_per_second IS NOT NULL) AS disk_read_seconds,
+           SUM(s.agent_disk_read_bytes_per_second*s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_disk_read_bytes_per_second IS NOT NULL) AS disk_read_total,
+           SUM(s.agent_disk_written_bytes_per_second*s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_disk_written_bytes_per_second IS NOT NULL) / NULLIF(SUM(s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_disk_written_bytes_per_second IS NOT NULL),0) AS disk_write_weighted,
+           SUM(s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_disk_written_bytes_per_second IS NOT NULL) AS disk_write_seconds,
+           SUM(s.agent_disk_written_bytes_per_second*s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_disk_written_bytes_per_second IS NOT NULL) AS disk_write_total,
+           COUNT(s.agent_cpu_percent_of_one_core) AS core_cpu_samples,
+           AVG(s.agent_cpu_percent_of_one_core::DOUBLE PRECISION) AS core_cpu_average,
+           MAX(s.agent_cpu_percent_of_one_core::DOUBLE PRECISION) AS core_cpu_maximum,
+           SUM(s.agent_cpu_percent_of_one_core*s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_cpu_percent_of_one_core IS NOT NULL) / NULLIF(SUM(s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_cpu_percent_of_one_core IS NOT NULL),0) AS core_cpu_weighted,
+           SUM(s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_cpu_percent_of_one_core IS NOT NULL) AS core_cpu_seconds,
+           COUNT(s.agent_service_cpu_percent_of_one_core) AS service_cpu_samples,
+           AVG(s.agent_service_cpu_percent_of_one_core::DOUBLE PRECISION) AS service_cpu_average,
+           MAX(s.agent_service_cpu_percent_of_one_core::DOUBLE PRECISION) AS service_cpu_maximum,
+           SUM(s.agent_service_cpu_percent_of_one_core*s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_service_cpu_percent_of_one_core IS NOT NULL) / NULLIF(SUM(s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_service_cpu_percent_of_one_core IS NOT NULL),0) AS service_cpu_weighted,
+           SUM(s.observed_interval) FILTER (WHERE s.observed_interval>0 AND s.observed_interval<=86400 AND s.agent_service_cpu_percent_of_one_core IS NOT NULL) AS service_cpu_seconds,
+           COUNT(s.agent_service_memory_current_bytes) AS service_memory_samples,
+           AVG(s.agent_service_memory_current_bytes::DOUBLE PRECISION) AS service_memory_average,
+           MAX(s.agent_service_memory_current_bytes::DOUBLE PRECISION) AS service_memory_maximum
+    FROM nodes n LEFT JOIN scoped s
       ON s.node_id = n.id AND s.collected_at >= $1 AND s.collected_at <= $2
     WHERE n.deleted_at IS NULL
     GROUP BY n.id, n.hostname, n.last_seen ORDER BY n.hostname
@@ -317,13 +401,14 @@ async fn performance_24h(
             .bind(generated_at)
             .fetch_all(&state.pool),
     );
-    let (server_row, agent_rows, server_storage_row, agent_storage_rows) = rows.map_err(|error| {
-        tracing::warn!(%error, "platform performance history query failed");
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "message": "24 小时进程历史暂不可读取" })),
-        )
-    })?;
+    let (server_row, agent_rows, server_storage_row, agent_storage_rows) =
+        rows.map_err(|error| {
+            tracing::warn!(%error, "platform performance history query failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "message": "24 小时进程历史暂不可读取" })),
+            )
+        })?;
     let server = process_window(&server_row).map_err(|error| {
         tracing::warn!(%error, "invalid controller process summary");
         (
@@ -333,7 +418,8 @@ async fn performance_24h(
     })?;
     let server_storage = storage_window(&server_storage_row, state.monitor.current_storage().await)
         .map_err(summary_error)?;
-    let mut storage_by_node: HashMap<Uuid, PgRow> = HashMap::with_capacity(agent_storage_rows.len());
+    let mut storage_by_node: HashMap<Uuid, PgRow> =
+        HashMap::with_capacity(agent_storage_rows.len());
     for row in agent_storage_rows {
         let id: Uuid = row.try_get("id").map_err(summary_error)?;
         storage_by_node.insert(id, row);
@@ -344,13 +430,16 @@ async fn performance_24h(
         let hostname: String = row.try_get("hostname").map_err(summary_error)?;
         let last_seen: DateTime<Utc> = row.try_get("last_seen").map_err(summary_error)?;
         let stats = process_window(&row).map_err(summary_error)?;
-        let storage = storage_by_node.remove(&id)
+        let storage = storage_by_node
+            .remove(&id)
             .map(|storage_row| {
-                let latest = storage_row.try_get::<Option<Value>, _>("latest_storage")?
+                let latest = storage_row
+                    .try_get::<Option<Value>, _>("latest_storage")?
                     .and_then(|value| serde_json::from_value(value).ok());
                 storage_window(&storage_row, latest)
             })
-            .transpose().map_err(summary_error)?;
+            .transpose()
+            .map_err(summary_error)?;
         agents.push(json!({
             "node_id": id, "hostname": hostname,
             "online": (generated_at - last_seen).num_seconds() <= 45,

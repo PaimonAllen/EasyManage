@@ -68,3 +68,14 @@ test("existing overview snapshots form real GPU history while legacy API omits t
   saved = recordTemperatureSnapshots(saved, [node(sample(1, 61), false)], now + 601_000);
   assert.equal(saved.fixture, undefined, "past ten minutes are pruned");
 });
+
+test("sensor history retains readings without retaining full account or software inventories", () => {
+  const now = Date.now();
+  const metrics = {collected_at:new Date(now).toISOString(),gpu_collected_at:new Date(now).toISOString(),
+    gpus:[{index:0,temperature_celsius:50}],software_packages:Array.from({length:1000},(_,i)=>({name:`large-package-${i}`,version:"1"})),
+    users:[{username:"inventory-must-not-be-retained"}]} as MetricsSnapshot;
+  const saved=recordTemperatureSnapshots({},[{id:"small",online:true,metrics} as NodeSummary],now).small[0];
+  assert.equal(saved.gpus[0].temperature_celsius,50);
+  assert.equal("software_packages" in saved,false);assert.equal("users" in saved,false);
+  assert.ok(JSON.stringify(saved).length<JSON.stringify(metrics).length/100);
+});

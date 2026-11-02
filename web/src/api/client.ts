@@ -197,19 +197,26 @@ export interface PlatformHealthStatus {
   platform_process: PlatformProcessMetric | null;
   platform_process_collected_at?: string | null;
   platform_hostname: string;
-  nodes: { node_id: string; hostname: string; agent_version: string; last_seen: string; agent_to_platform_healthy: boolean; agent_process: PlatformProcessMetric | null; agent_process_collected_at: string | null }[];
+  sample_policy?: { server_process_seconds: number; report_seconds: number };
+  nodes: { node_id: string; hostname: string; agent_version: string; last_seen: string; monitoring_paused?: boolean; agent_to_platform_healthy: boolean; agent_process: PlatformProcessMetric | null; agent_process_collected_at: string | null }[];
   platform_to_nodes: { node_id: string; hostname: string; host: string; port: number; ssh_tcp_reachable: boolean }[];
   target_error: string | null;
   check_meaning: string;
 }
 
 export interface ProcessMetricSummary {
+  time_weighted_average?: number | null;
+  observed_seconds?: number | null;
+  total?: number | null;
   average: number | null;
   maximum: number | null;
   samples: number;
 }
 
 export interface ProcessWindowSummary {
+  cpu_percent_of_one_core?: ProcessMetricSummary;
+  service_cpu_percent_of_one_core?: ProcessMetricSummary;
+  service_memory_current_bytes?: ProcessMetricSummary;
   sample_count: number;
   first_sample_at: string | null;
   last_sample_at: string | null;
@@ -301,15 +308,24 @@ async function readResponse<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+const nodeViews = new Map<boolean, {etag:string;data:NodeListResponse}>();
 export async function fetchNodes(
   signal?: AbortSignal,
+  includeSoftware = true,
 ): Promise<NodeListResponse> {
-  const response = await fetch("/api/v1/nodes", {
+  const lastNodes = nodeViews.get(includeSoftware);
+  const response = await fetch(`/api/v1/nodes?include_software=${includeSoftware}`, {
     cache: "no-store",
+    headers: lastNodes ? { "If-None-Match": lastNodes.etag } : {},
     signal,
   });
 
-  return readResponse<NodeListResponse>(response);
+  if (response.status === 304 && lastNodes) return lastNodes.data;
+  const data = await readResponse<NodeListResponse>(response);
+  const etag = response.headers.get("etag");
+  if (etag) nodeViews.set(includeSoftware, { etag, data });
+  else nodeViews.delete(includeSoftware);
+  return data;
 }
 
 export async function fetchLiveNodes(signal?: AbortSignal): Promise<LiveNodeListResponse> {

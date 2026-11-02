@@ -1,9 +1,10 @@
+import type { SensorSnapshot } from "../lib/temperature";
 import { HistoryChart } from "./HistoryChart";
 import { formatBytes, formatRate, formatUptime, percent } from "../lib/format";
 import { hottest, ssdTemperature, temperaturePoints } from "../lib/temperature";
 import { gpuReading, gpuHistoryPoints, gpuDevices } from "../lib/gpu";
 import {cpuSockets,cpuSocketPoints} from "../lib/cpu";
-import type { DiskMetric, GpuMetric, LiveNode, MetricHistoryPoint, MetricsSnapshot, NodeMetricHistory, NodeSummary } from "../types/monitoring";
+import type { DiskMetric, GpuMetric, LiveNode, MetricHistoryPoint, NodeMetricHistory, NodeSummary } from "../types/monitoring";
 
 const CYAN = "var(--chart-cyan)";
 const VIOLET = "var(--chart-violet)";
@@ -52,7 +53,7 @@ function diskRates(disks: DiskMetric[]) {
   return { read, written, devices: seen.size };
 }
 
-export function NodeCharts({ node, history, historyError, liveSamples, temperatureSnapshots = [], checkedAt, gpuExpanded=false, gpuDetailsId, cpuExpanded=false, cpuDetailsId }: { node: NodeSummary; history?: NodeMetricHistory; historyError?: string; liveSamples: LiveNode[]; temperatureSnapshots?: MetricsSnapshot[]; checkedAt: number; gpuExpanded?:boolean; gpuDetailsId?:string;cpuExpanded?:boolean;cpuDetailsId?:string }) {
+export function NodeCharts({ node, history, historyError, liveSamples, temperatureSnapshots = [], checkedAt, gpuExpanded=false, gpuDetailsId, cpuExpanded=false, cpuDetailsId }: { node: NodeSummary; history?: NodeMetricHistory; historyError?: string; liveSamples: LiveNode[]; temperatureSnapshots?: SensorSnapshot[]; checkedAt: number; gpuExpanded?:boolean; gpuDetailsId?:string;cpuExpanded?:boolean;cpuDetailsId?:string }) {
   const metrics = node.metrics;
   if (!metrics) return null;
   const cpus=cpuSockets(metrics.cpu_sockets);

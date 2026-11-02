@@ -60,7 +60,8 @@ function currentPage() {
 export function App() {
   const [page, setPage] = useState(currentPage);
   const [theme, setTheme] = useState<Theme>(savedTheme);
-  const fleet = useFleet(page === "overview" ? 5_000 : 30_000);
+  const needsFleet = page !== "platform-health" && page !== "gitea";
+  const fleet = useFleet(page === "overview" ? 5_000 : 30_000, needsFleet, page === "software");
   const [config, setConfig] = useState<PlatformConfig>({
     documentation_url: "/guide/easymanage.html",
     operations_enabled: false,
@@ -112,7 +113,7 @@ export function App() {
       });
     let pending = false;
     async function refreshTargets() {
-      if (pending) return;
+      if (pending || document.hidden) return;
       pending = true;
       try {
         setTargets(await fetchTargets(controller.signal));
@@ -128,9 +129,11 @@ export function App() {
     }
     void refreshTargets();
     const timer = window.setInterval(() => void refreshTargets(), 15_000);
+    document.addEventListener("visibilitychange", refreshTargets);
     return () => {
       controller.abort();
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshTargets);
     };
   }, []);
 
@@ -188,7 +191,7 @@ export function App() {
         </div>
       </nav>
       <main>
-        {page !== "docs" && fleet.error && (
+        {needsFleet && fleet.error && (
           <div className="alert global-alert" role="alert">
             {fleet.error}
             {fleet.data && " · 当前保留上一次数据"}
@@ -235,7 +238,7 @@ export function App() {
             />
           </Suspense>
         )}
-        {page !== "docs" &&
+        {needsFleet &&
           page !== "operations" &&
           page !== "agent-management" &&
           fleet.loading &&
@@ -245,7 +248,7 @@ export function App() {
               <p>正在读取节点指标…</p>
             </div>
           )}
-        {page !== "docs" &&
+        {needsFleet &&
           page !== "operations" &&
           page !== "agent-management" &&
           fleet.data &&

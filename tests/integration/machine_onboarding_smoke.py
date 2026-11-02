@@ -26,7 +26,7 @@ import urllib.request
 import uuid
 
 
-def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False, admin_only=False, disk_only=False):
+def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False, admin_only=False, disk_only=False, update_only=False):
     import paramiko
     logging.getLogger("paramiko").setLevel(logging.CRITICAL)
     mounts = Path("/proc/self/mountinfo").read_text().splitlines()
@@ -262,6 +262,14 @@ sys.exit(0)
                 return
             elif "/bin/bash" in command and "install-user-agent.sh" in command:
                 log=(runtime/"installer.log").open("ab")
+                if "EASYMANAGE_UPDATE_" in command:
+                    completed=subprocess.run(["/bin/sh","-c",command],env=ssh_env,capture_output=True,timeout=100)
+                    log.write(completed.stdout);log.write(completed.stderr);log.close()
+                    channel.sendall(completed.stdout+completed.stderr)
+                    # Simulate a detached descendant retaining stdout: a verified
+                    # receipt must complete the update without waiting for EOF.
+                    while alive.is_set() and not channel.closed:time.sleep(.1)
+                    return
                 result=subprocess.run(shlex.split(command),env=ssh_env,stdout=log,stderr=subprocess.STDOUT,timeout=100).returncode
                 log.close()
                 channel.sendall(b"fixture installer finished\n")
@@ -602,9 +610,14 @@ sys.exit(0)
         for target in overlay["targets"]:
             if target["node_id"]==node_id: target["release_sha256"]=hashlib.sha256(candidate.read_bytes()).hexdigest()
         registry_path.write_text(json.dumps(overlay));registry_path.chmod(0o600)
+        update_started=time.monotonic()
         update_status,update_result=request(f"/api/v1/nodes/{node_id}/agent/update",{})
         if update_status!=200: print("DIAGNOSTIC pooled update:",update_status,update_result,errors,flush=True)
         require(update_status==200 and len(transports)==dial_count,"real binary update/SCP and Basic restart reuse control without a new SSH handshake")
+        require(time.monotonic()-update_started<20,"hash-verified update receipt completes even when the remote output stream stays open")
+        if update_only:
+            require(max_connections[0]<=3,"framed update keeps the established SSH connection budget")
+            return
         require(max_connections[0]<=3,"all observed SSH handshakes including probes stay within the connection cap")
         saved_auth={"username":current.pw_name,"use_saved":True}
         require(request(f"/api/v1/machines/{node_id}/ssh",saved_auth|{"action":"disconnect"})[0]==200,"authorized browser disconnects without resending its private key and pauses automatic restore")

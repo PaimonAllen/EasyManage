@@ -7,6 +7,12 @@ pub struct ProcessSampler;
 impl ProcessSampler {
     pub fn sample(&mut self) -> PlatformProcessMetric {
         PlatformProcessMetric {
+            sample_interval_seconds: None,
+            cpu_percent_of_one_core: None,
+            children_cpu_percent_of_one_core: None,
+            logical_read_bytes_per_second: None,
+            logical_written_bytes_per_second: None,
+            service: None,
             pid: std::process::id(),
             cpu_percent_of_host: None,
             resident_memory_bytes: None,

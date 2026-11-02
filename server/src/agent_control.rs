@@ -33,7 +33,7 @@ pub async fn desired(
     let control = from_row(&row)?;
     if applied == Some(&control) {
         sqlx::query(
-            "UPDATE nodes SET monitoring_applied_revision=$2,control_seen_at=NOW() WHERE id=$1",
+            "UPDATE nodes SET monitoring_applied_revision=$2,control_seen_at=NOW() WHERE id=$1 AND (monitoring_applied_revision IS DISTINCT FROM $2 OR control_seen_at IS NULL OR control_seen_at<NOW()-INTERVAL '30 seconds')",
         )
         .bind(id)
         .bind(control.revision as i64)
@@ -92,6 +92,7 @@ pub(crate) async fn change(
     sqlx::query("INSERT INTO audit_logs(actor_type,actor_id,action,target_type,target_id,details) VALUES('browser','unverified-intranet-operator','machine.monitoring.update','node',$1,$2)")
         .bind(id.to_string()).bind(json!({"before":before,"after":AgentControl{revision,paused:change.paused}})).execute(&mut *tx).await.map_err(db)?;
     tx.commit().await.map_err(db)?;
+    crate::read_cache::invalidate();
     Ok(Json(
         json!({"control":AgentControl{revision,paused:change.paused},"message":"设置已保存；等待 Agent 确认，不删除身份、历史或更改运行权限。暂停时每分钟只保留轻量控制检查。"}),
     ))

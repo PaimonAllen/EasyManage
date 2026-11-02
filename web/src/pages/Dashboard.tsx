@@ -1,3 +1,4 @@
+import type { SensorSnapshot } from "../lib/temperature";
 import { useEffect, useState } from "react";
 import { NodeCard } from "../components/NodeCard";
 import { MachineManagement } from "../components/MachineManagement";
@@ -6,7 +7,7 @@ import { useMetricHistory } from "../hooks/useMetricHistory";
 import { useLiveMetrics } from "../hooks/useLiveMetrics";
 import { recordTemperatureSnapshots } from "../lib/temperature";
 import type { OperationTarget } from "../api/client";
-import type { MetricsSnapshot, NodeListResponse, NodeSummary } from "../types/monitoring";
+import type { NodeListResponse, NodeSummary } from "../types/monitoring";
 
 export function Dashboard({
   data,
@@ -23,7 +24,7 @@ export function Dashboard({
   const paused = data?.nodes.filter((node) => node.monitoring_paused).length ?? 0;
   const { history, errors } = useMetricHistory(data?.nodes.map((node) => node.id) ?? []);
   const live = useLiveMetrics();
-  const [temperatureSnapshots, setTemperatureSnapshots] = useState<Record<string, MetricsSnapshot[]>>({});
+  const [temperatureSnapshots, setTemperatureSnapshots] = useState<Record<string, SensorSnapshot[]>>({});
   useEffect(() => {
     if (data) setTemperatureSnapshots(previous => recordTemperatureSnapshots(previous, data.nodes, Date.parse(data.generated_at)));
   }, [data]);

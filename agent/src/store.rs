@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use easymanage_protocol::{AgentReport, HardwareDetails, HostSecurity};
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::path::Path;
@@ -164,6 +165,9 @@ impl Store {
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS outbox_software (
+                digest TEXT PRIMARY KEY, payload TEXT NOT NULL
+            );
             ",
         )
         .execute(&pool)
@@ -200,9 +204,20 @@ impl Store {
     }
 
     pub async fn enqueue(&self, report: &AgentReport) -> Result<i64> {
-        let payload =
-            serde_json::to_string(report).context("failed to serialize metrics report")?;
+        let mut value =
+            serde_json::to_value(report).context("failed to serialize metrics report")?;
+        let software = value["metrics"]
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("software_packages")
+            .unwrap_or_else(|| serde_json::json!([]));
+        let software = serde_json::to_string(&software)?;
+        let key = hex::encode(Sha256::digest(software.as_bytes()));
+        value["_software_key"] = serde_json::Value::String(key.clone());
+        let payload = serde_json::to_string(&value)?;
         let mut transaction = self.pool.begin().await?;
+        let inserted=sqlx::query("INSERT INTO outbox_software(digest,payload) VALUES(?1,?2) ON CONFLICT(digest) DO NOTHING")
+            .bind(&key).bind(software).execute(&mut *transaction).await?.rows_affected()>0;
         let id = sqlx::query("INSERT INTO outbox (payload, created_at) VALUES (?1, ?2)")
             .bind(payload)
             .bind(chrono::Utc::now().to_rfc3339())
@@ -210,11 +225,15 @@ impl Store {
             .await?
             .last_insert_rowid();
         sqlx::query(
-            "DELETE FROM outbox WHERE id NOT IN (SELECT id FROM outbox ORDER BY id DESC LIMIT ?1)",
+            "DELETE FROM outbox WHERE id <= (SELECT id FROM outbox ORDER BY id DESC LIMIT 1 OFFSET ?1)",
         )
         .bind(OUTBOX_LIMIT)
         .execute(&mut *transaction)
         .await?;
+        if inserted {
+            sqlx::query("DELETE FROM outbox_software WHERE digest NOT IN (SELECT json_extract(payload,'$._software_key') FROM outbox WHERE json_type(payload,'$._software_key')='text')")
+                .execute(&mut *transaction).await?;
+        }
         transaction.commit().await?;
         Ok(id)
     }
@@ -223,14 +242,29 @@ impl Store {
         let row = sqlx::query("SELECT id, payload FROM outbox ORDER BY id LIMIT 1")
             .fetch_optional(&self.pool)
             .await?;
-        row.map(|row| {
+        if let Some(row) = row {
             let id = row.try_get::<i64, _>("id")?;
             let payload = row.try_get::<String, _>("payload")?;
-            let report =
+            let mut value: serde_json::Value =
                 serde_json::from_str(&payload).context("stored metrics report is invalid")?;
-            Ok((id, report))
-        })
-        .transpose()
+            if let Some(key) = value
+                .get("_software_key")
+                .and_then(serde_json::Value::as_str)
+            {
+                let software: String =
+                    sqlx::query_scalar("SELECT payload FROM outbox_software WHERE digest=?1")
+                        .bind(key)
+                        .fetch_one(&self.pool)
+                        .await
+                        .context("stored software inventory is missing")?;
+                value["metrics"]["software_packages"] = serde_json::from_str(&software)?;
+            }
+            let report =
+                serde_json::from_value(value).context("stored metrics report is invalid")?;
+            Ok(Some((id, report)))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn acknowledge(&self, id: i64) -> Result<()> {
@@ -357,6 +391,94 @@ mod tests {
         reopened.save_proxy_enabled(true).await.unwrap();
         assert!(reopened.proxy_enabled().await.unwrap());
         assert!(reopened.permissions_enabled().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn durable_reports_share_software_without_losing_versions_or_legacy_outboxes() {
+        let state = TemporaryState::new();
+        let store = Store::open(&state.database()).await.unwrap();
+        let mut report = report(Uuid::new_v4(), 1);
+        report.metrics.software_packages = (0..100)
+            .map(|index| easymanage_protocol::SoftwarePackage {
+                name: format!("shared-software-marker-{index}"),
+                version: "1".into(),
+            })
+            .collect();
+        let first = store.enqueue(&report).await.unwrap();
+        let second = store.enqueue(&report).await.unwrap();
+        let cached: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox_software")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(cached, 1);
+        let payload: String = sqlx::query_scalar("SELECT payload FROM outbox WHERE id=?1")
+            .bind(first)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert!(!payload.contains("shared-software-marker"));
+        report.metrics.software_packages[0].version = "2".into();
+        store.enqueue(&report).await.unwrap();
+        assert_eq!(
+            store
+                .oldest()
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .metrics
+                .software_packages[0]
+                .version,
+            "1"
+        );
+        store.acknowledge(first).await.unwrap();
+        store.acknowledge(second).await.unwrap();
+        store.pool.close().await;
+        let reopened = Store::open(&state.database()).await.unwrap();
+        assert_eq!(
+            reopened
+                .oldest()
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .metrics
+                .software_packages[0]
+                .version,
+            "2"
+        );
+        report.metrics.software_packages[0].version = "3".into();
+        reopened.enqueue(&report).await.unwrap();
+        let cached: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox_software")
+            .fetch_one(&reopened.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cached, 2,
+            "unused old inventory is collected while active queued versions survive"
+        );
+        sqlx::query("DELETE FROM outbox")
+            .execute(&reopened.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO outbox(payload,created_at) VALUES(?1,'legacy')")
+            .bind(serde_json::to_string(&report).unwrap())
+            .execute(&reopened.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .oldest()
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .metrics
+                .software_packages[0]
+                .version,
+            "3",
+            "pre-upgrade report format remains readable"
+        );
     }
 
     #[tokio::test]

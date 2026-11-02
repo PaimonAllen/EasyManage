@@ -136,7 +136,7 @@ async fn cached(
 async fn platform_health_uncached(state: InsightState) -> Json<Value> {
     let started = Instant::now();
     let database = sqlx::query(
-        "SELECT n.id, n.hostname, n.agent_version, n.last_seen, \
+        "SELECT n.id, n.hostname, n.agent_version, n.last_seen, n.monitoring_paused, \
                 m.collected_at AS agent_process_collected_at, \
                 m.metrics->'platform_process' AS agent_process \
          FROM nodes n LEFT JOIN metrics_latest m ON m.node_id = n.id \
@@ -185,6 +185,7 @@ async fn platform_health_uncached(state: InsightState) -> Json<Value> {
                 "hostname": row.try_get::<String, _>("hostname").ok()?,
                 "agent_version": row.try_get::<String, _>("agent_version").ok()?,
                 "last_seen": last_seen,
+                "monitoring_paused": row.try_get::<bool, _>("monitoring_paused").ok()?,
                 "agent_to_platform_healthy": (now - last_seen).num_seconds() <= 45,
                 "agent_process": row.try_get::<Option<Value>, _>("agent_process").ok().flatten(),
                 "agent_process_collected_at": row.try_get::<Option<DateTime<Utc>>, _>("agent_process_collected_at").ok().flatten(),
@@ -199,6 +200,10 @@ async fn platform_health_uncached(state: InsightState) -> Json<Value> {
         "platform_process": platform_process.as_ref().map(|sample| &sample.metric),
         "platform_process_collected_at": platform_process.as_ref().map(|sample| sample.sampled_at),
         "platform_hostname": state.hostname,
+        "sample_policy": {
+            "server_process_seconds": state.collection.current().server_process_seconds,
+            "report_seconds": state.collection.current().report_seconds,
+        },
         "nodes": nodes,
         "platform_to_nodes": links,
         "target_error": target_error,

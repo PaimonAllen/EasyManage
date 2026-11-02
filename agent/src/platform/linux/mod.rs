@@ -6,14 +6,16 @@ mod block_devices;
 mod collector;
 mod cpu_frequency;
 mod hardware;
+pub(super) mod inventory;
 mod mounts;
 mod network_capacity;
-pub(super) mod inventory;
+mod network_counters;
 mod overlay_networks;
 pub(crate) mod paths;
 mod permissions;
 mod programming_tools;
 mod security;
+mod software;
 mod temperature;
 
 pub(crate) use collector::Collector as NativeCollector;

@@ -2,13 +2,14 @@ import type { HostTemperatures, MetricHistoryPoint, MetricsSnapshot, NodeSummary
 
 const SNAPSHOT_WINDOW_MS = 10 * 60_000;
 const MAX_SNAPSHOTS_PER_NODE = 128;
+export type SensorSnapshot = Pick<MetricsSnapshot, "collected_at" | "fast_collected_at" | "gpu_collected_at" | "gpus" | "temperatures" | "cpu_sockets">;
 
-// The controller may still serve an older history schema. Retain real full
-// snapshots already fetched for the overview; never invent/interpolate readings.
+// Retain only real sensor fields from already-fetched snapshots; full account,
+// package and device inventories must not remain in every history sample.
 export function recordTemperatureSnapshots(
-  previous: Record<string, MetricsSnapshot[]>, nodes: NodeSummary[], now: number,
-): Record<string, MetricsSnapshot[]> {
-  const next: Record<string, MetricsSnapshot[]> = {};
+  previous: Record<string, SensorSnapshot[]>, nodes: NodeSummary[], now: number,
+): Record<string, SensorSnapshot[]> {
+  const next: Record<string, SensorSnapshot[]> = {};
   for (const node of nodes) {
     const recent = (previous[node.id] ?? []).filter(sample => {
       const gpuAt = Date.parse(sample.gpu_collected_at ?? "");
@@ -33,7 +34,9 @@ export function recordTemperatureSnapshots(
         if (last?.gpu_collected_at !== metrics.gpu_collected_at
           || last?.temperatures?.collected_at !== metrics.temperatures?.collected_at
           || (hasCpu&&(last?.fast_collected_at??last?.collected_at)!==(metrics.fast_collected_at??metrics.collected_at)))
-          recent.push(metrics);
+          recent.push({ collected_at: metrics.collected_at, fast_collected_at: metrics.fast_collected_at,
+            gpu_collected_at: metrics.gpu_collected_at, gpus: metrics.gpus,
+            temperatures: metrics.temperatures, cpu_sockets: metrics.cpu_sockets });
       }
     }
     if (recent.length) next[node.id] = recent.slice(-MAX_SNAPSHOTS_PER_NODE);
@@ -58,7 +61,7 @@ export function hottest(values: (number | null | undefined)[]): number | null {
   return valid.length ? Math.max(...valid) : null;
 }
 
-export function temperaturePoints(history: (MetricHistoryPoint | MetricsSnapshot)[], metrics: MetricsSnapshot, kind: "cpu" | "gpu" | "ssd") {
+export function temperaturePoints(history: (MetricHistoryPoint | SensorSnapshot)[], metrics: MetricsSnapshot, kind: "cpu" | "gpu" | "ssd") {
   const samples = [...history, metrics];
   const points = new Map<string, { at: string; value: number }>();
   for (const sample of samples) {

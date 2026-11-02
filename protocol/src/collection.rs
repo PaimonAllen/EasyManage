@@ -61,7 +61,7 @@ pub const COLLECTION_ITEMS: &[(&str, &str, &str, u64, u64, u64)] = &[
     (
         "extended_seconds",
         "扩展清单",
-        "用户与会话、块设备与分区、网卡/路由、Tailscale/ZeroTier、代理、软件/服务、AI 与编程工具；安全配置独立每小时采集",
+        "用户与会话、块设备与分区、网卡/路由、Tailscale/ZeroTier、代理、运行服务、AI 与编程工具；软件包小时缓存，安全配置每小时采集",
         30,
         3600,
         60,

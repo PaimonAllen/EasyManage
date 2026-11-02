@@ -83,11 +83,7 @@ impl ExtendedInventory {
                 &["-j", "-6", "route", "show", "table", "all"],
                 INVENTORY_LIMIT
             ),
-            read_command(
-                "dpkg-query",
-                &["-W", "-f=${Package}\\t${Version}\\n"],
-                INVENTORY_LIMIT
-            ),
+            super::software::collect(),
             read_command(
                 "systemctl",
                 &[
@@ -578,13 +574,14 @@ fn process_inventory(
         if users_enabled {
             *counts.entry(uid).or_default() += 1;
         }
-        let name = match read_small(entry.path().join("comm"), 256) {
-            Ok(name) => name.trim().to_owned(),
-            Err(error) => {
-                ai_partial |= error.kind() != io::ErrorKind::NotFound;
-                String::new()
-            }
-        };
+        // Name and UID already share the status read. Avoid opening comm for
+        // every process on every extended scan (up to 8192 extra opens).
+        let name = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Name:"))
+            .unwrap_or("")
+            .trim()
+            .to_owned();
         if users_enabled && uid != 0 && matches!(name.as_str(), "sshd" | "sshd-session") {
             *ssh_sessions.entry(uid).or_default() += 1;
         }

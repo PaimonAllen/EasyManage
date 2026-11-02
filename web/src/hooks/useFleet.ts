@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchNodes } from "../api/client";
 import type { NodeListResponse } from "../types/monitoring";
 
-export function useFleet(refreshIntervalMs = 5_000) {
+export function useFleet(refreshIntervalMs = 5_000, enabled = true, includeSoftware = false) {
   const [data, setData] = useState<NodeListResponse | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -13,7 +13,7 @@ export function useFleet(refreshIntervalMs = 5_000) {
     const controller = new AbortController();
     request.current = controller;
     try {
-      setData(await fetchNodes(controller.signal));
+      setData(await fetchNodes(controller.signal, includeSoftware));
       setError("");
     } catch (caught) {
       if (!controller.signal.aborted)
@@ -22,9 +22,10 @@ export function useFleet(refreshIntervalMs = 5_000) {
       if (!controller.signal.aborted) setLoading(false);
       if (request.current === controller) request.current = null;
     }
-  }, []);
+  }, [includeSoftware]);
 
   useEffect(() => {
+    if (!enabled) return;
     const refreshIfVisible = () => {
       if (!document.hidden) void refresh();
     };
@@ -37,7 +38,7 @@ export function useFleet(refreshIntervalMs = 5_000) {
       request.current = null;
       window.clearInterval(timer);
     };
-  }, [refresh, refreshIntervalMs]);
+  }, [refresh, refreshIntervalMs, enabled]);
 
   return { data, error, loading, refresh };
 }

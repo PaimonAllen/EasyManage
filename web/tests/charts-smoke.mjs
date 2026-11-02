@@ -433,7 +433,32 @@ try {
   const invalidRow = storagePage.match(/<tr><td><strong>\/data\/invalid<\/strong>[\s\S]*?<\/tr>/)?.[0];
   assert.ok(invalidRow && invalidRow.includes('容量未采集') && !invalidRow.includes('meter__warning'));
   console.log("PASS mounted filesystem usage: low green, 20–90 graded orange, >90 red with warning, invalid unknown, duplicate mount points consistent");
-  const { StorageCell } = await server.ssrLoadModule("/src/pages/PlatformHealth.tsx");
+  const { StorageCell, SummaryCell, ResourceAccounting } = await server.ssrLoadModule("/src/pages/PlatformHealth.tsx");
+  const resourceRow=renderToStaticMarkup(React.createElement(ResourceAccounting,{name:"Measured service",usage:{pid:7,cpu_percent_of_host:.001,cpu_percent_of_one_core:1.25,sample_interval_seconds:10.5,children_cpu_percent_of_one_core:.5,
+    logical_read_bytes_per_second:1024,logical_written_bytes_per_second:512,
+    service:{unit:"easymanage-server.service",cpu_percent_of_one_core:2.5,memory_current_bytes:8192,disk_read_bytes_per_second:0,disk_written_bytes_per_second:128}}}));
+  assert.ok(resourceRow.includes("1.25%")&&resourceRow.includes("2.50%")&&resourceRow.includes("10.5 秒")&&resourceRow.includes("8 KiB")&&resourceRow.includes("已退出子进程"));
+  const unscoped=renderToStaticMarkup(React.createElement(ResourceAccounting,{name:"SSH daemon",usage:{pid:8}}));
+  assert.ok(unscoped.includes("无独立服务口径")&&!unscoped.includes("0.00%"));
+  const offlineResource=renderToStaticMarkup(React.createElement(ResourceAccounting,{name:"Offline Agent",usage:{pid:8,cpu_percent_of_one_core:1.25},online:false,collectedAt:"2026-01-01T00:00:00Z"}));
+  assert.ok(offlineResource.includes("节点离线 · 历史采样")&&offlineResource.includes("1.25%"));
+  const pausedResource=renderToStaticMarkup(React.createElement(ResourceAccounting,{name:"Paused Agent",usage:{pid:8},paused:true}));
+  assert.ok(pausedResource.includes("监控已暂停 · 历史采样"));
+  const weighted=renderToStaticMarkup(React.createElement(SummaryCell,{metric:{samples:2,average:2,maximum:3,time_weighted_average:2.5,observed_seconds:40,total:10000},format:String}));
+  assert.ok(weighted.includes("区间均值 2.5")&&weighted.includes("精确区间 40 秒")&&weighted.includes("区间累计"));
+  const client=await server.ssrLoadModule("/src/api/client.ts");
+  const originalFetch=globalThis.fetch;const seen=[];
+  try {
+    const replies=[new Response(JSON.stringify({nodes:[],generated_at:"fixture"}),{headers:{ETag:'W/"light"'}}),new Response(null,{status:304}),new Response(JSON.stringify({nodes:[],generated_at:"full"}),{headers:{ETag:'W/"full"'}})];
+    globalThis.fetch=async(url,options)=>{seen.push({url,headers:options.headers});return replies.shift();};
+    const first=await client.fetchNodes(undefined,false);const same=await client.fetchNodes(undefined,false);
+    assert.equal(first,same,"304 must retain data identity and avoid a redundant React tree update");
+    await client.fetchNodes(undefined,true);
+    assert.equal(seen[1].headers['If-None-Match'],'W/"light"');
+    assert.equal(seen[2].headers['If-None-Match'],undefined,"full and lightweight inventories need separate validators");
+    assert.ok(seen[0].url.endsWith('include_software=false')&&seen[2].url.endsWith('include_software=true'));
+  } finally {globalThis.fetch=originalFetch;}
+  console.log("PASS resource scopes, real interval weighting, missing measurements and stable conditional fleet views");
   const storageWindow = { total_bytes: { average: 4096, maximum: 8192, samples: 2 },
     last_sample_at: at, latest: { collected_at: at, binary_bytes: 1024, web_bytes: 1024,
       database_bytes: 2048, state_bytes: null, total_bytes: 4096 } };

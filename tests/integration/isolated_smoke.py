@@ -218,6 +218,7 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     collected = datetime.now(timezone.utc)
     metrics = {
         "collected_at": collected.isoformat(), "cpu_usage_percent": 37.5,
+        "software_packages": [{"name":f"fixture-package-{i}","version":"1.0.0"} for i in range(400)],
         "host_security": {"collected_at": (collected-timedelta(minutes=30)).isoformat(), "interval_seconds": 3600,
                           "apparmor_enabled": True, "aslr_mode": 2, "ptrace_scope": 1, "kernel_lockdown": "integrity"},
         "cpu_frequency": {"collected_at": (collected-timedelta(seconds=20)).isoformat(),"average_mhz":2800,"minimum_mhz":800,"maximum_mhz":4200,"logical_cpus":4},
@@ -263,6 +264,25 @@ def exercise_api(base_url, context, enrollment_token, node_id):
             "reporting with a wrong Agent token is rejected")
     require(request("/api/v1/agent/report", report, {"x-easymanage-agent-token": agent_token})[0] == 200,
             "authenticated metrics reporting")
+    compact=json.loads(json.dumps(report));compact['reuse_software_inventory']=True;compact['protocol_version']=2
+    compact['metrics'].pop('software_packages')
+    status,accepted=request('/api/v1/agent/report',compact,{'x-easymanage-agent-token':agent_token})
+    require(status==200 and accepted['software_inventory_cached'] is True
+            and len(json.dumps(compact))<len(json.dumps(report))*.6,
+            'negotiated inventory reuse removes repeated package payloads and accepts retry without duplicate history')
+    with opener.open(base_url+'/api/v1/nodes?include_software=false',timeout=5) as response:
+        etag=response.headers['ETag'];light=json.load(response)
+    require(not light['nodes'][0]['metrics']['software_packages'],
+            'overview reads omit software packages without altering the full inventory API')
+    require(request('/api/v1/nodes?include_software=false')[1]==light,
+            'adjacent public fleet reads reuse the same serialized snapshot without mixing full/light views')
+    try:
+        opener.open(urllib.request.Request(base_url+'/api/v1/nodes?include_software=false',headers={'If-None-Match':etag}),timeout=5)
+    except urllib.error.HTTPError as error:
+        require(error.code==304 and error.read()==b'', 'unchanged fleet view returns a body-free conditional response')
+    else:raise AssertionError('Unchanged overview response should be 304')
+    require(request('/api/v1/nodes')[1]['nodes'][0]['metrics']['software_packages']==metrics['software_packages'],
+            'full software list survives compact heartbeats and remains available to existing clients')
     invalid_temperature = json.loads(json.dumps(report))
     invalid_temperature["metrics"]["temperatures"]["cpu_celsius"] = 999
     require(request("/api/v1/agent/report", invalid_temperature, {"x-easymanage-agent-token": agent_token})[0] == 400,
@@ -348,6 +368,8 @@ def exercise_api(base_url, context, enrollment_token, node_id):
             'cached kernel CPU frequency keeps its range, logical CPU count and true sampling timestamp')
     require(node['metrics']['cpu_sockets']==metrics['cpu_sockets'],
             'per-socket CPU metrics retain physical IDs, independent utilization and unknown temperatures')
+    original_packages=metrics['software_packages']
+    metrics['software_packages']=[{'name':'obsolete-software','version':'old'}]
     metrics["collected_at"] = (collected - timedelta(minutes=5)).isoformat()
     metrics["cpu_usage_percent"] = 1.0
     metrics["platform_process"] = {"pid": 321, "cpu_percent_of_host": 0.75,
@@ -371,7 +393,8 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     _, listing = request("/api/v1/nodes")
     node = next(item for item in listing["nodes"] if item["id"] == node_id)
     require(node["metrics"]["cpu_usage_percent"] == 37.5
-            and parse_timestamp(node["metrics"]["collected_at"]) == collected,
+            and parse_timestamp(node["metrics"]["collected_at"]) == collected
+            and node['metrics']['software_packages']==original_packages,
             "delayed report never overwrites newer latest metrics")
     _, history = request(f"/api/v1/nodes/{node_id}/history")
     require(len(history["points"]) == 2 and history["points"][0]["cpu_usage_percent"] == 1.0
@@ -380,17 +403,29 @@ def exercise_api(base_url, context, enrollment_token, node_id):
             "history remains chronological when delayed samples arrive")
     require(node["hostname"] == inventory["hostname"] and node["os_version"] == inventory["os_version"]
             and node["agent_version"] == "0.1.0", "delayed report never rolls back node inventory or Agent version")
+    for offset,seconds,cpu,io in [(4,10,.25,100),(3,30,.75,300)]:
+        precise=json.loads(json.dumps(report));precise['metrics']['collected_at']=(collected-timedelta(minutes=offset)).isoformat()
+        precise['metrics']['platform_process']|={'sample_interval_seconds':seconds,'cpu_percent_of_host':cpu,'cpu_percent_of_one_core':cpu*4,
+            'disk_read_bytes_per_second':io,'service':{'unit':'easymanage-agent.service','cpu_percent_of_one_core':cpu*8,'memory_current_bytes':4194304,
+            'disk_read_bytes_per_second':io,'disk_written_bytes_per_second':0}}
+        require(request('/api/v1/agent/report',precise,{'x-easymanage-agent-token':agent_token})[0]==200,'unequal-duration process report accepted')
     status, performance = request("/api/v1/platform-performance")
     agent_history = next(item for item in performance["agents"] if item["node_id"] == node_id)["stats"]
     agent_storage = next(item for item in performance["agents"] if item["node_id"] == node_id)["storage"]
     require(status == 200 and performance["period_seconds"] == 86400
             and performance["server"]["stats"]["sample_count"] >= 1
-            and agent_history["sample_count"] == 2
-            and agent_history["cpu_percent_of_host"]["samples"] == 2
+            and agent_history["sample_count"] == 4
+            and agent_history["cpu_percent_of_host"]["samples"] == 4
             and abs(agent_history["cpu_percent_of_host"]["average"] - 0.5) < 0.000001
             and agent_history["cpu_percent_of_host"]["maximum"] == 0.75
             and agent_history["resident_memory_bytes"]["maximum"] == 2097152.0,
             "24-hour process statistics include controller and all real Agent report samples")
+    require(abs(agent_history['cpu_percent_of_host']['time_weighted_average']-.625)<1e-9
+            and agent_history['cpu_percent_of_host']['observed_seconds']==40
+            and agent_history['cpu_percent_of_one_core']['time_weighted_average']==2.5
+            and agent_history['service_cpu_percent_of_one_core']['time_weighted_average']==5
+            and agent_history['disk_read_bytes_per_second']['total']==10000,
+            'resource statistics weight real durations, preserve service scope and integrate observed I/O without filling gaps')
     require(performance["server"]["storage"]["total_bytes"]["samples"] >= 1
             and performance["server"]["storage"]["latest"]["database_bytes"] > 0
             and performance["server"]["storage"]["latest"]["web_bytes"] > 0
@@ -407,6 +442,8 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     status, platform_health = request("/api/v1/platform-health")
     require(status == 200 and platform_health["platform"]["database_healthy"]
             and platform_health["nodes"][0]["node_id"] == node_id
+            and not platform_health["nodes"][0]["monitoring_paused"]
+            and platform_health["sample_policy"]["server_process_seconds"] > 0
             and platform_health["platform_to_nodes"][0]["node_id"] == node_id,
             "platform health has its own endpoint with database and trusted topology")
     status, gitea = request("/api/v1/gitea")
@@ -834,6 +871,19 @@ def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollme
                 "real Agent reports bounded host security observations without inferring unknowns")
         require(updated['metrics']['host_security']==metrics['host_security'],
                 'hourly security snapshots retain their actual sample timestamp across heartbeats')
+        # Simulate a restored database losing just the negotiated inventory cache.
+        # The real Agent must resend its full durable report, not re-enroll or
+        # silently turn a missing list into an empty one. Private DB only.
+        psql=['/usr/lib/postgresql/18/bin/psql','-X','-A','-t','-h','127.0.0.1','-p','55432','-U','smoke','-d','easymanage_smoke','-v','ON_ERROR_STOP=1','-c']
+        deleted=subprocess.run(psql+[f"DELETE FROM node_software_inventory WHERE node_id='{node_id}'"],env=environment,capture_output=True,text=True,timeout=5)
+        require(deleted.returncode==0,'private software-cache loss fixture created')
+        deadline=time.monotonic()+30
+        while time.monotonic()<deadline:
+            exists=subprocess.run(psql+[f"SELECT COUNT(*) FROM node_software_inventory WHERE node_id='{node_id}'"],env=environment,capture_output=True,text=True,timeout=5)
+            if exists.returncode==0 and exists.stdout.strip()=='1':break
+            time.sleep(.3)
+        else:raise AssertionError('Real Agent did not restore missing software inventory')
+        require(True,'real Agent restores a lost software cache with a full retry while preserving its identity and buffered history')
         tools = metrics.get("ai_tools")
         require(isinstance(tools, list) and {"codex", "claude", "gemini", "opencode", "aider"} == {item["name"] for item in tools}
                 and all(item["category"] == "assistant" and set(item) == {"name", "category", "executable_paths", "processes", "service_units"} for item in tools),
@@ -1111,6 +1161,10 @@ def smoke(args):
                                 str(Path(__file__).parent / "fixtures/ssh_loopback_redirect.c"), "-ldl", env=env, log=log)
                     server_env |= {"HOME": str(controller_home), "USER": "smoke", "LD_PRELOAD": str(shim),
                                    "EASYMANAGE_AGENT_CA_CERTIFICATE": str(ca_certificate),"EASYMANAGE_DATABASE_MAX_CONNECTIONS":"1"}
+                if args.previous_server_binary is not None:
+                    from resource_upgrade_smoke import exercise as exercise_upgrade
+                    exercise_upgrade(args.previous_server_binary,args.server_binary,root,server_env,base_url,
+                        ssl.create_default_context(cafile=str(ca_certificate)),enrollment,log,require)
                 server = subprocess.Popen([str(args.server_binary.resolve())], cwd=root, env=server_env, stdout=log, stderr=subprocess.STDOUT)
                 context = ssl.create_default_context(cafile=str(ca_certificate))
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
@@ -1147,7 +1201,7 @@ def smoke(args):
                                     if response.status==200:return
                             except OSError:time.sleep(0.1)
                         raise RuntimeError('Isolated controller restart failed')
-                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment, args.machine_admin_credentials, args.machine_disk_space)
+                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment, args.machine_admin_credentials, args.machine_disk_space, args.machine_update)
                 with opener.open(base_url + "/api/v1/operations/targets", timeout=2) as response:
                     expected_target_count = len(json.load(response)["targets"])
                 # Reproduce PostgreSQL outage and restart the Server with DB down.
@@ -1241,8 +1295,10 @@ def smoke(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-binary", type=Path, required=True)
+    parser.add_argument("--previous-server-binary",type=Path,help="Optional schema-16 binary to test private forward migration and emergency rollback")
     parser.add_argument("--agent-binary", type=Path)
     parser.add_argument("--machine-onboarding", action="store_true", help="Opt-in SSH/SCP fixture with mocked systemd and a real installed Agent; temporary Paramiko venv required")
+    parser.add_argument("--machine-update",action="store_true",help="Focused real SSH update and nonce/hash receipt while remote output stays open")
     parser.add_argument("--machine-redeployment",action="store_true",help="Add real same-UUID uninstalled Agent redeployment coverage; skips the separate three-minute retry-exhaustion scenario")
     parser.add_argument("--machine-admin-credentials",action="store_true",help="Focused real SSH administrator password/key vault and saved-credential operations regression")
     parser.add_argument("--usage-history",action="store_true",help="Standalone seven-day history, cache, calendar boundaries and reader isolation")
@@ -1251,5 +1307,5 @@ if __name__ == "__main__":
     parser.add_argument("--host-netns", required=True)
     parser.add_argument("--host-mntns", required=True)
     args=parser.parse_args()
-    if args.machine_redeployment or args.machine_admin_credentials or args.machine_disk_space:args.machine_onboarding=True
+    if args.machine_redeployment or args.machine_admin_credentials or args.machine_disk_space or args.machine_update:args.machine_onboarding=True
     smoke(args)

@@ -1,6 +1,6 @@
 use crate::config::ServerConfig;
-use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use easymanage_protocol::{
     AGENT_TOKEN_HEADER, AgentLiveReport, AgentReport, AgentReportResponse, ENROLLMENT_TOKEN_HEADER,
     EnrollmentRequest, EnrollmentResponse, ErrorResponse, GpuMetric, HealthResponse, LiveNode,
-    LiveNodeListResponse, MetricsSnapshot, NodeListResponse, NodeSummary, PROTOCOL_VERSION,
+    LiveNodeListResponse, MetricsSnapshot, NodeSummary, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -33,6 +33,9 @@ pub struct AppState {
     pub live: Arc<RwLock<HashMap<Uuid, LiveNode>>>,
     pub collection: crate::collection_settings::CollectionSettings,
 }
+
+static LIVE_ACCESS: crate::read_cache::SnapshotCache<Arc<HashSet<Uuid>>> =
+    crate::read_cache::SnapshotCache::new();
 
 pub fn router(state: AppState) -> Router {
     let index = state.config.web_root.join("index.html");
@@ -92,12 +95,13 @@ async fn list_live_nodes(
         - Duration::seconds(
             i64::try_from(state.collection.current().live_seconds + 3).unwrap_or(63),
         );
-    let active: HashSet<Uuid> = sqlx::query_scalar("SELECT n.id FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.deleted_at IS NULL AND NOT n.monitoring_paused AND (n.monitoring_revision=0 OR (n.monitoring_applied_revision IS NULL AND m.metrics IS NOT NULL AND COALESCE(m.metrics->'agent_control','null'::jsonb)='null'::jsonb) OR m.metrics->'agent_control'=jsonb_build_object('revision',n.monitoring_revision,'paused',false))")
+    let active = LIVE_ACCESS.get(async {
+        sqlx::query_scalar("SELECT n.id FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.deleted_at IS NULL AND NOT n.monitoring_paused AND (n.monitoring_revision=0 OR (n.monitoring_applied_revision IS NULL AND m.metrics IS NOT NULL AND COALESCE(m.agent_control,'null'::jsonb)='null'::jsonb) OR m.agent_control=jsonb_build_object('revision',n.monitoring_revision,'paused',false))")
         .fetch_all(&state.pool)
         .await
-        .map_err(ApiError::database)?
-        .into_iter()
-        .collect();
+        .map(|ids| Arc::new(ids.into_iter().collect::<HashSet<Uuid>>()))
+        .map_err(ApiError::database)
+    }, |ids| ids.capacity().saturating_mul(32)).await?;
     let nodes = state
         .live
         .read()
@@ -119,7 +123,7 @@ async fn report_live_metrics(
 ) -> Result<StatusCode, ApiError> {
     verify_protocol(report.protocol_version)?;
     let provided_token = header_value(&headers, AGENT_TOKEN_HEADER)?;
-    authenticate_agent(&state.pool, report.node_id, provided_token).await?;
+    authenticate_agent(&state.pool, report.node_id, provided_token, true).await?;
 
     let metrics = &report.metrics;
     if !metrics.cpu_usage_percent.is_finite()
@@ -264,6 +268,7 @@ async fn enroll_agent(
     .map_err(ApiError::database)?;
 
     transaction.commit().await.map_err(ApiError::database)?;
+    crate::agent_auth::invalidate();
     info!(%node_id, hostname = %request.inventory.hostname, "agent enrolled");
 
     Ok(Json(EnrollmentResponse {
@@ -282,15 +287,68 @@ async fn report_metrics(
     headers: HeaderMap,
     Json(report): Json<AgentReport>,
 ) -> Result<Json<AgentReportResponse>, ApiError> {
-    verify_protocol(report.protocol_version)?;
+    if report.reuse_software_inventory {
+        if report.protocol_version != easymanage_protocol::SOFTWARE_CACHE_PROTOCOL_VERSION {
+            return Err(ApiError::bad_request("unsupported compact report protocol"));
+        }
+    } else { verify_protocol(report.protocol_version)?; }
     let provided_token = header_value(&headers, AGENT_TOKEN_HEADER)?;
-    authenticate_agent(&state.pool, report.node_id, provided_token).await?;
+    authenticate_agent(&state.pool, report.node_id, provided_token, false).await?;
 
-    if let Some(activity)=&report.metrics.network_activity {
-        let mut seen=std::collections::HashSet::new();
-        if activity.process_id==0 || !(3..=4).contains(&activity.groups.len()) || activity.started_at>activity.collected_at
-            || activity.collected_at>report.metrics.collected_at+chrono::Duration::seconds(5)
-            || activity.groups.iter().any(|item|!item.group.is_agent() || !seen.insert(item.group as usize)) {
+    if report.reuse_software_inventory && !report.metrics.software_packages.is_empty() {
+        return Err(ApiError::bad_request(
+            "conflicting software inventory representation",
+        ));
+    }
+    if let Some(process) = &report.metrics.platform_process {
+        let rates = [
+            process.cpu_percent_of_one_core,
+            process.children_cpu_percent_of_one_core,
+            process.logical_read_bytes_per_second,
+            process.logical_written_bytes_per_second,
+            process.disk_read_bytes_per_second,
+            process.disk_written_bytes_per_second,
+        ];
+        if process.pid == 0
+            || rates
+                .into_iter()
+                .flatten()
+                .any(|value| !value.is_finite() || value < 0.0)
+            || process
+                .sample_interval_seconds
+                .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 86400.0)
+            || process
+                .cpu_percent_of_host
+                .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
+            || process.service.as_ref().is_some_and(|service| {
+                service.unit.len() > 128
+                    || !service.unit.starts_with("easymanage-")
+                    || !service.unit.ends_with(".service")
+                    || [
+                        service.cpu_percent_of_one_core,
+                        service.disk_read_bytes_per_second,
+                        service.disk_written_bytes_per_second,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|value| !value.is_finite() || value < 0.0)
+            })
+        {
+            return Err(ApiError::bad_request("invalid resource accounting"));
+        }
+    }
+
+    if let Some(activity) = &report.metrics.network_activity {
+        let mut seen = std::collections::HashSet::new();
+        if activity.process_id == 0
+            || !(3..=4).contains(&activity.groups.len())
+            || activity.started_at > activity.collected_at
+            || activity.collected_at > report.metrics.collected_at + chrono::Duration::seconds(5)
+            || activity
+                .groups
+                .iter()
+                .any(|item| !item.group.is_agent() || !seen.insert(item.group as usize))
+        {
             return Err(ApiError::bad_request("invalid Agent network accounting"));
         }
     }
@@ -343,7 +401,12 @@ async fn report_metrics(
     if let Some(policy) = &report.metrics.collection_policy {
         policy.validate().map_err(ApiError::bad_request)?;
     }
-    if report.metrics.agent_control.as_ref().is_some_and(|control|control.revision>i64::MAX as u64) {
+    if report
+        .metrics
+        .agent_control
+        .as_ref()
+        .is_some_and(|control| control.revision > i64::MAX as u64)
+    {
         return Err(ApiError::bad_request("invalid monitoring control revision"));
     }
     if let Some(frequency) = &report.metrics.cpu_frequency {
@@ -351,14 +414,29 @@ async fn report_metrics(
             return Err(ApiError::bad_request("invalid CPU frequency metrics"));
         }
     }
-    let mut socket_ids=std::collections::HashSet::new();
-    if report.metrics.cpu_sockets.len()>64||report.metrics.cpu_sockets.iter().any(|cpu|{
-        !socket_ids.insert(cpu.id)||cpu.model.len()>1024||!(1..=4096).contains(&cpu.logical_cpus)
-            ||cpu.physical_cores.is_some_and(|cores|cores==0||cores>cpu.logical_cpus)
-            ||cpu.usage_percent.is_some_and(|value|!value.is_finite()||!(0.0..=100.0).contains(&value))
-            ||cpu.frequency.as_ref().is_some_and(|frequency|!frequency.valid())
-            ||cpu.temperature_celsius.is_some_and(|value|!value.is_finite()||!(0.0..=150.0).contains(&value))
-    }) {return Err(ApiError::bad_request("invalid CPU socket metrics"));}
+    let mut socket_ids = std::collections::HashSet::new();
+    if report.metrics.cpu_sockets.len() > 64
+        || report.metrics.cpu_sockets.iter().any(|cpu| {
+            !socket_ids.insert(cpu.id)
+                || cpu.model.len() > 1024
+                || !(1..=4096).contains(&cpu.logical_cpus)
+                || cpu
+                    .physical_cores
+                    .is_some_and(|cores| cores == 0 || cores > cpu.logical_cpus)
+                || cpu
+                    .usage_percent
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
+                || cpu
+                    .frequency
+                    .as_ref()
+                    .is_some_and(|frequency| !frequency.valid())
+                || cpu
+                    .temperature_celsius
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=150.0).contains(&value))
+        })
+    {
+        return Err(ApiError::bad_request("invalid CPU socket metrics"));
+    }
     if let Some(temperatures) = &report.metrics.temperatures {
         let valid = |value: f32| value.is_finite() && (0.0..=150.0).contains(&value);
         if temperatures.cpu_celsius.is_some_and(|value| !valid(value))
@@ -371,8 +449,12 @@ async fn report_metrics(
         }
     }
 
-    let metrics_json = serde_json::to_value(&report.metrics)
+    let mut metrics_json = serde_json::to_value(&report.metrics)
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    metrics_json
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("software_packages");
     let network_received = report
         .metrics
         .networks
@@ -397,7 +479,28 @@ async fn report_metrics(
     let now = Utc::now();
     let mut transaction = state.pool.begin().await.map_err(ApiError::database)?;
 
-    sqlx::query(
+    if report.reuse_software_inventory {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM node_software_inventory WHERE node_id=$1)",
+        )
+        .bind(report.node_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
+        if !exists {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "software inventory required".into(),
+            });
+        }
+    } else {
+        sqlx::query("INSERT INTO node_software_inventory(node_id,collected_at,packages) VALUES($1,$2,$3) ON CONFLICT(node_id) DO UPDATE SET collected_at=EXCLUDED.collected_at,packages=CASE WHEN node_software_inventory.packages IS DISTINCT FROM EXCLUDED.packages THEN EXCLUDED.packages ELSE node_software_inventory.packages END WHERE EXCLUDED.collected_at>node_software_inventory.collected_at OR (EXCLUDED.collected_at=node_software_inventory.collected_at AND node_software_inventory.packages IS DISTINCT FROM EXCLUDED.packages)")
+            .bind(report.node_id).bind(report.metrics.collected_at)
+            .bind(serde_json::to_value(&report.metrics.software_packages).map_err(|error|ApiError::internal(error.to_string()))?)
+            .execute(&mut *transaction).await.map_err(ApiError::database)?;
+    }
+
+    let updated_node = sqlx::query(
         r"
         UPDATE nodes SET
             hostname = $2, os_name = $3, os_version = $4, kernel_version = $5,
@@ -427,20 +530,23 @@ async fn report_metrics(
     .map_err(ApiError::database)?;
 
     // Historical catch-up still proves connectivity, but must not roll back inventory/version.
-    sqlx::query("UPDATE nodes SET last_seen = $2 WHERE id = $1")
-        .bind(report.node_id)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(ApiError::database)?;
+    if updated_node.rows_affected() == 0 {
+        sqlx::query("UPDATE nodes SET last_seen = $2 WHERE id = $1")
+            .bind(report.node_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(ApiError::database)?;
+    }
 
     sqlx::query(
         r"
-        INSERT INTO metrics_latest (node_id, collected_at, metrics, updated_at)
-        VALUES ($1, $2, $3, NOW())
+        INSERT INTO metrics_latest (node_id, collected_at, metrics, updated_at,agent_control)
+        VALUES ($1, $2, $3, NOW(),$4)
         ON CONFLICT (node_id) DO UPDATE SET
             collected_at = EXCLUDED.collected_at,
             metrics = EXCLUDED.metrics,
+            agent_control = EXCLUDED.agent_control,
             updated_at = NOW()
         WHERE EXCLUDED.collected_at >= metrics_latest.collected_at
         ",
@@ -448,6 +554,7 @@ async fn report_metrics(
     .bind(report.node_id)
     .bind(report.metrics.collected_at)
     .bind(metrics_json)
+    .bind(report.metrics.agent_control.as_ref().map(serde_json::to_value).transpose().map_err(|error|ApiError::internal(error.to_string()))?)
     .execute(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
@@ -463,8 +570,10 @@ async fn report_metrics(
             network_received_bytes_per_second, network_transmitted_bytes_per_second, gpu_metrics,
             disk_collected_at, disk_read_bytes_per_second, disk_written_bytes_per_second,
             agent_pid, agent_cpu_percent_of_host, agent_resident_memory_bytes,
-            agent_disk_read_bytes_per_second, agent_disk_written_bytes_per_second, gpu_collected_at, fast_collected_at, temperatures
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            agent_disk_read_bytes_per_second, agent_disk_written_bytes_per_second, gpu_collected_at, fast_collected_at, temperatures,
+            agent_sample_interval_seconds,agent_cpu_percent_of_one_core,agent_service_cpu_percent_of_one_core,agent_service_memory_current_bytes
+        ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,$19,$20,$21,$22
+          WHERE NOT EXISTS(SELECT 1 FROM metrics_samples WHERE node_id=$1 AND collected_at=$2)
         ",
     )
     .bind(report.node_id)
@@ -517,6 +626,10 @@ async fn report_metrics(
     .bind(report.metrics.fast_collected_at)
     .bind(report.metrics.temperatures.as_ref().map(serde_json::to_value).transpose()
         .map_err(|error| ApiError::internal(error.to_string()))?)
+    .bind(report.metrics.platform_process.as_ref().and_then(|metric|metric.sample_interval_seconds))
+    .bind(report.metrics.platform_process.as_ref().and_then(|metric|metric.cpu_percent_of_one_core))
+    .bind(report.metrics.platform_process.as_ref().and_then(|metric|metric.service.as_ref()).and_then(|service|service.cpu_percent_of_one_core))
+    .bind(report.metrics.platform_process.as_ref().and_then(|metric|metric.service.as_ref()).and_then(|service|service.memory_current_bytes).and_then(|value|i64::try_from(value).ok()))
     .execute(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
@@ -546,11 +659,23 @@ async fn report_metrics(
         .await
         .map_err(ApiError::database)?;
 
-    let agent_control=if report.metrics.agent_control.is_some() {
-        Some(crate::agent_control::desired(&mut transaction,report.node_id,report.metrics.agent_control.as_ref()).await.map_err(ApiError::database)?)
-    }else{None};
+    let agent_control = if report.metrics.agent_control.is_some() {
+        Some(
+            crate::agent_control::desired(
+                &mut transaction,
+                report.node_id,
+                report.metrics.agent_control.as_ref(),
+            )
+            .await
+            .map_err(ApiError::database)?,
+        )
+    } else {
+        None
+    };
     transaction.commit().await.map_err(ApiError::database)?;
+    crate::read_cache::invalidate();
     Ok(Json(AgentReportResponse {
+        software_inventory_cached: Some(true),
         agent_control,
         accepted_at: now,
         collection_policy: Some(
@@ -566,24 +691,73 @@ async fn report_metrics(
                     .collection_policy
                     .as_ref()
                     .is_some_and(|p| p.permissions_enabled.is_some()),
-                report.metrics.collection_policy.as_ref().is_some_and(|p|p.proxy_enabled.is_some()),
+                report
+                    .metrics
+                    .collection_policy
+                    .as_ref()
+                    .is_some_and(|p| p.proxy_enabled.is_some()),
             ),
         ),
     }))
 }
 
-async fn list_nodes(State(state): State<AppState>) -> Result<Json<NodeListResponse>, ApiError> {
+#[derive(serde::Deserialize)]
+struct NodeView {
+    include_software: Option<bool>,
+}
+
+#[derive(Clone)]
+struct NodeViewBody {
+    etag: HeaderValue,
+    body: Bytes,
+}
+static NODE_VIEWS: [crate::read_cache::SnapshotCache<NodeViewBody>; 2] = [
+    crate::read_cache::SnapshotCache::new(),
+    crate::read_cache::SnapshotCache::new(),
+];
+
+async fn list_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(view): Query<NodeView>,
+) -> Result<Response, ApiError> {
+    let software = view.include_software.unwrap_or(true);
+    let cached = NODE_VIEWS[usize::from(software)].get(
+        load_node_view(&state, software), |view| view.body.len()
+    ).await?;
+    let unchanged = headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|value| value.trim().as_bytes() == cached.etag.as_bytes()));
+    let mut response = if unchanged {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        Response::new(Body::from(cached.body))
+    };
+    response.headers_mut().insert("etag", cached.etag);
+    response.headers_mut().insert(
+        "cache-control", HeaderValue::from_static("private, no-cache"),
+    );
+    response.headers_mut().insert(
+        "content-type", HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
+
+async fn load_node_view(state: &AppState, software: bool) -> Result<NodeViewBody, ApiError> {
     let rows = sqlx::query(
         r"
         SELECT n.id, n.monitoring_paused, n.monitoring_revision, n.monitoring_applied_revision, COALESCE(NULLIF(n.display_name,''),n.hostname) AS hostname, n.os_name, n.os_version, n.kernel_version, n.architecture,
                n.cpu_model, n.cpu_logical_cores, n.cpu_physical_cores, n.agent_version,
-               n.last_seen, m.metrics
+               n.last_seen, CASE WHEN $1 AND m.metrics IS NOT NULL THEN m.metrics || jsonb_build_object('software_packages',COALESCE(p.packages,'[]'::jsonb)) ELSE m.metrics END AS metrics
         FROM nodes n
         LEFT JOIN metrics_latest m ON m.node_id = n.id
+        LEFT JOIN node_software_inventory p ON p.node_id = n.id
         WHERE n.deleted_at IS NULL
         ORDER BY n.hostname, n.id
         ",
     )
+    .bind(software)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::database)?;
@@ -593,10 +767,19 @@ async fn list_nodes(State(state): State<AppState>) -> Result<Json<NodeListRespon
         .iter()
         .map(|row| map_node(row, online_cutoff))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(NodeListResponse {
-        generated_at: Utc::now(),
-        nodes,
-    }))
+    let bytes =
+        serde_json::to_vec(&nodes).map_err(|error| ApiError::internal(error.to_string()))?;
+    let etag = format!("W/\"{}\"", hex::encode(Sha256::digest(&bytes)));
+    let mut body = b"{\"generated_at\":".to_vec();
+    serde_json::to_writer(&mut body, &Utc::now())
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    body.extend_from_slice(b",\"nodes\":");
+    body.extend_from_slice(&bytes);
+    body.push(b'}');
+    Ok(NodeViewBody {
+        etag: HeaderValue::from_str(&etag).map_err(|error| ApiError::internal(error.to_string()))?,
+        body: Bytes::from(body),
+    })
 }
 
 async fn agent_control(
@@ -606,14 +789,21 @@ async fn agent_control(
 ) -> Result<Json<easymanage_protocol::AgentControlResponse>, ApiError> {
     verify_control_revision(&request.applied)?;
     let token = header_value(&headers, AGENT_TOKEN_HEADER)?;
-    authenticate_agent(&state.pool, request.node_id, token).await?;
+    authenticate_agent(&state.pool, request.node_id, token, false).await?;
     let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
     let control = crate::agent_control::desired(&mut tx, request.node_id, Some(&request.applied))
-        .await.map_err(ApiError::database)?;
+        .await
+        .map_err(ApiError::database)?;
     tx.commit().await.map_err(ApiError::database)?;
+    crate::read_cache::invalidate();
     Ok(Json(easymanage_protocol::AgentControlResponse {
         control,
-        collection_policy: state.collection.for_node_with_proxy(request.node_id, true, true, request.supports_proxy_collection),
+        collection_policy: state.collection.for_node_with_proxy(
+            request.node_id,
+            true,
+            true,
+            request.supports_proxy_collection,
+        ),
     }))
 }
 fn verify_control_revision(control: &easymanage_protocol::AgentControl) -> Result<(), ApiError> {
@@ -771,7 +961,11 @@ fn aggregate_disk_io(disks: &[easymanage_protocol::DiskMetric]) -> (Option<f64>,
     (read, written)
 }
 
-fn monitoring_report_current(revision: u64, applied: Option<u64>, control: Option<&easymanage_protocol::AgentControl>) -> bool {
+fn monitoring_report_current(
+    revision: u64,
+    applied: Option<u64>,
+    control: Option<&easymanage_protocol::AgentControl>,
+) -> bool {
     match control {
         Some(control) => control.revision == revision && !control.paused,
         // Legacy collectors cannot acknowledge pause/resume. Their real, fresh
@@ -782,9 +976,16 @@ fn monitoring_report_current(revision: u64, applied: Option<u64>, control: Optio
 }
 
 fn map_node(row: &PgRow, online_cutoff: chrono::DateTime<Utc>) -> Result<NodeSummary, ApiError> {
-    let monitoring_paused:bool=row.try_get("monitoring_paused").map_err(ApiError::database)?;
-    let monitoring_revision=row.try_get::<i64,_>("monitoring_revision").map_err(ApiError::database)? as u64;
-    let monitoring_applied_revision=row.try_get::<Option<i64>,_>("monitoring_applied_revision").map_err(ApiError::database)?.map(|revision|revision as u64);
+    let monitoring_paused: bool = row
+        .try_get("monitoring_paused")
+        .map_err(ApiError::database)?;
+    let monitoring_revision = row
+        .try_get::<i64, _>("monitoring_revision")
+        .map_err(ApiError::database)? as u64;
+    let monitoring_applied_revision = row
+        .try_get::<Option<i64>, _>("monitoring_applied_revision")
+        .map_err(ApiError::database)?
+        .map(|revision| revision as u64);
     let last_seen = row.try_get("last_seen").map_err(ApiError::database)?;
     let metrics = row
         .try_get::<Option<Value>, _>("metrics")
@@ -817,7 +1018,16 @@ fn map_node(row: &PgRow, online_cutoff: chrono::DateTime<Utc>) -> Result<NodeSum
             .map_err(|_| ApiError::internal("invalid cpu_physical_cores"))?,
         agent_version: row.try_get("agent_version").map_err(ApiError::database)?,
         last_seen,
-        online: !monitoring_paused && last_seen >= online_cutoff && (monitoring_revision==0 || metrics.as_ref().is_some_and(|snapshot|monitoring_report_current(monitoring_revision,monitoring_applied_revision,snapshot.agent_control.as_ref()))),
+        online: !monitoring_paused
+            && last_seen >= online_cutoff
+            && (monitoring_revision == 0
+                || metrics.as_ref().is_some_and(|snapshot| {
+                    monitoring_report_current(
+                        monitoring_revision,
+                        monitoring_applied_revision,
+                        snapshot.agent_control.as_ref(),
+                    )
+                })),
         metrics,
     })
 }
@@ -832,13 +1042,44 @@ mod monitoring_compatibility_tests {
         assert!(monitoring_report_current(2, None, None));
         assert!(!monitoring_report_current(2, Some(1), None));
         assert!(!monitoring_report_current(2, Some(2), None));
-        assert!(!monitoring_report_current(2, None, Some(&AgentControl { revision: 0, paused: false })));
-        assert!(!monitoring_report_current(2, Some(2), Some(&AgentControl { revision: 1, paused: true })));
-        assert!(monitoring_report_current(2, Some(2), Some(&AgentControl { revision: 2, paused: false })));
+        assert!(!monitoring_report_current(
+            2,
+            None,
+            Some(&AgentControl {
+                revision: 0,
+                paused: false
+            })
+        ));
+        assert!(!monitoring_report_current(
+            2,
+            Some(2),
+            Some(&AgentControl {
+                revision: 1,
+                paused: true
+            })
+        ));
+        assert!(monitoring_report_current(
+            2,
+            Some(2),
+            Some(&AgentControl {
+                revision: 2,
+                paused: false
+            })
+        ));
     }
 }
 
-async fn authenticate_agent(pool: &PgPool, node_id: Uuid, token: &str) -> Result<(), ApiError> {
+async fn authenticate_agent(
+    pool: &PgPool,
+    node_id: Uuid,
+    token: &str,
+    live_lane: bool,
+) -> Result<(), ApiError> {
+    let provided_hash = hash_token(token);
+    if live_lane && crate::agent_auth::accepts(node_id, &provided_hash) {
+        return Ok(());
+    }
+    let epoch = crate::agent_auth::generation();
     let expected_hash = sqlx::query_scalar::<_, String>(
         "SELECT a.token_hash FROM agents a JOIN nodes n ON n.id=a.node_id WHERE a.node_id = $1 AND a.enabled = TRUE AND n.deleted_at IS NULL",
     )
@@ -847,8 +1088,8 @@ async fn authenticate_agent(pool: &PgPool, node_id: Uuid, token: &str) -> Result
     .await
     .map_err(ApiError::database)?
     .ok_or_else(ApiError::unauthorized)?;
-    let provided_hash = hash_token(token);
     if constant_time_equal(expected_hash.trim(), &provided_hash) {
+        crate::agent_auth::remember(node_id, provided_hash, epoch);
         Ok(())
     } else {
         warn!(%node_id, "agent authentication failed");

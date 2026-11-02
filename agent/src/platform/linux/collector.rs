@@ -1,6 +1,7 @@
 use super::inventory::{ExtendedInventory, issue};
 use super::{
-    cpu_frequency, hardware, mounts, network_capacity, permissions, security, temperature,
+    cpu_frequency, hardware, mounts, network_capacity, network_counters, permissions, security,
+    temperature,
 };
 use crate::platform::common::gpu;
 use crate::store::Store;
@@ -16,7 +17,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use sysinfo::{DiskRefreshKind, Disks, Networks, System};
+use sysinfo::{DiskRefreshKind, Disks, System};
 
 const GPU_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const STORAGE_FOOTPRINT_INTERVAL: Duration = Duration::from_secs(3_600);
@@ -35,9 +36,7 @@ pub struct Collector {
     gpu_collected_at: Option<DateTime<Utc>>,
     system: System,
     disks: Disks,
-    networks: Networks,
-    network_refreshed_at: Instant,
-    network_list_refreshed_at: Instant,
+    networks: network_counters::Sampler,
     cached_networks: Vec<NetworkMetric>,
     last_fast: Option<LiveMetrics>,
     fast_refreshed_at: Instant,
@@ -75,8 +74,7 @@ impl Collector {
         system.refresh_cpu_usage();
         system.refresh_memory();
         let disks = Disks::new();
-        let networks = Networks::new_with_refreshed_list();
-        let network_refreshed_at = Instant::now();
+        let networks = network_counters::Sampler::default();
         tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
         system.refresh_cpu_usage();
         // Read the persisted switch before any session/group probes, including startup.
@@ -123,8 +121,6 @@ impl Collector {
             system,
             disks,
             networks,
-            network_refreshed_at,
-            network_list_refreshed_at: network_refreshed_at,
             cached_networks: Vec::new(),
             last_fast: None,
             fast_refreshed_at: Instant::now(),
@@ -432,28 +428,8 @@ impl Collector {
         }
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
-        let elapsed = self.network_refreshed_at.elapsed().as_secs_f64().max(0.001);
-        // Rates remain real-time; discovering added/removed NICs belongs to the
-        // slower inventory cadence instead of traversing the list every second.
-        let refresh_list = self.network_list_refreshed_at.elapsed()
-            >= Duration::from_secs(self.policy.extended_seconds);
-        self.networks.refresh(refresh_list);
-        if refresh_list {
-            self.network_list_refreshed_at = Instant::now();
-        }
+        self.cached_networks = self.networks.sample().unwrap_or_default();
         let refreshed_at = Instant::now();
-        self.cached_networks = self
-            .networks
-            .iter()
-            .map(|(name, network)| NetworkMetric {
-                interface: name.clone(),
-                received_bytes_per_second: bytes_per_second(network.received(), elapsed),
-                transmitted_bytes_per_second: bytes_per_second(network.transmitted(), elapsed),
-                total_received_bytes: network.total_received(),
-                total_transmitted_bytes: network.total_transmitted(),
-            })
-            .collect();
-        self.network_refreshed_at = refreshed_at;
         self.fast_refreshed_at = refreshed_at;
         let sample = LiveMetrics {
             collected_at: Utc::now(),

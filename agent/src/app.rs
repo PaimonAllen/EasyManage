@@ -129,7 +129,7 @@ pub(crate) async fn run() -> Result<()> {
             live_interval.reset_after(Duration::from_secs(policy.live_seconds));
         }
         tokio::select! {
-            _ = control_interval.tick(), if token.is_some() => {
+            _ = control_interval.tick(), if token.is_some() && control.paused => {
                 if let Some(token) = token.as_deref() {
                     tokio::select! {
                         () = &mut shutdown => break,
@@ -209,6 +209,7 @@ async fn collect_and_send(
     metrics.network_activity = Some(easymanage_runtime::network::snapshot(true));
     metrics.agent_control = Some(control.clone());
     let report = AgentReport {
+        reuse_software_inventory: false,
         protocol_version: PROTOCOL_VERSION,
         node_id,
         agent_version: AGENT_VERSION.to_owned(),

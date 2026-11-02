@@ -74,17 +74,26 @@ impl Auth {
                 },
             )
         };
-        result.map_err(|_| {
-            OperationsError(
-                StatusCode::UNAUTHORIZED,
-                "SSH 长连接认证失败，请重新提交有效凭据",
-            )
+        result.map_err(|error| {
+            // Never log credential values or libssh2's free-form message.
+            tracing::warn!(code=?error.code(),"SSH authentication operation failed");
+            authentication_failure(&error)
         })?;
         if !session.authenticated() {
             return Err(OperationsError::ssh("SSH 认证未完成"));
         }
         session.set_keepalive(true, 30);
         Ok(())
+    }
+}
+
+fn authentication_failure(error:&ssh2::Error)->OperationsError {
+    match error.code() {
+        // libssh2: password expired, rejected authentication/public key,
+        // or an unreadable/encrypted key with an invalid passphrase.
+        ssh2::ErrorCode::Session(-15|-18|-19|-48)=>OperationsError(StatusCode::UNAUTHORIZED,
+            "SSH 长连接认证失败，请重新提交有效凭据"),
+        _=>OperationsError::ssh("SSH 鉴权阶段连接超时或中断；将按既定策略重试"),
     }
 }
 
@@ -944,6 +953,17 @@ impl Pipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn network_failures_during_authentication_keep_the_bounded_reconnect_policy(){
+        for code in [-7,-9,-13,-30,-37,-43] {
+            let error=ssh2::Error::new(ssh2::ErrorCode::Session(code),"synthetic transport failure");
+            assert_eq!(authentication_failure(&error).0,StatusCode::BAD_GATEWAY);
+        }
+        for code in [-15,-18,-19,-48] {
+            let error=ssh2::Error::new(ssh2::ErrorCode::Session(code),"synthetic credential rejection");
+            assert_eq!(authentication_failure(&error).0,StatusCode::UNAUTHORIZED);
+        }
+    }
     #[test]
     fn budget_includes_inflight_handshakes_and_releases_on_drop() {
         let host = Host::default();

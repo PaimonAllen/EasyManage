@@ -55,6 +55,7 @@ export function CollectionSettings() {
           <td className="number">{data.policy[item.key]} 秒</td>
           <td><input aria-label={`${item.title}修改为（秒）`} type="number" required min={item.minimum} max={item.maximum} step={1} disabled={busy} value={Number.isNaN(draft[item.key]) ? "" : draft[item.key]} onChange={(event) => { setDraft({ ...draft, [item.key]: event.target.valueAsNumber }); setDirty(true); setMessage(""); }} /></td>
         </tr>)}
+        <tr><td><strong>软件包清单</strong></td><td>独立缓存；包数据库变化时在下一轮扩展采集中刷新，需新版 Agent</td><td>每小时或安装变更时</td><td className="number">3600 秒</td><td>固定小时缓存</td></tr>
         <tr><td><strong>服务器安全配置</strong></td><td>AppArmor、ASLR、ptrace、Kernel Lockdown；独立缓存，需新版 Agent</td><td>每小时一次</td><td className="number">3600 秒</td><td>固定小时采集</td></tr>
         <tr><td><strong>设备详情</strong></td><td>处理器、主板、内存条、显卡、显示器、磁盘、声卡、物理网卡</td><td>每天一次</td><td className="number">86400 秒</td><td>固定日采集</td></tr>
       </tbody></table></div>

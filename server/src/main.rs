@@ -1,16 +1,18 @@
 #![forbid(unsafe_code)]
 
-mod api;
+mod agent_auth;
 mod agent_control;
+mod api;
 mod collection_settings;
 mod config;
 mod database;
 mod guide;
 mod insights;
+mod network;
 mod operations;
 mod performance;
-mod network;
 mod permission_reviews;
+mod read_cache;
 mod usage_history;
 
 use anyhow::{Context, Result};
@@ -30,15 +32,59 @@ use tokio::sync::RwLock;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     initialize_crypto_provider();
     initialize_tracing();
-    if let Err(error) = run().await {
+    let configured = std::env::var("EASYMANAGE_SERVER_WORKERS").ok();
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2);
+    let workers = match runtime_workers(configured.as_deref(), available) {
+        Ok(workers) => workers,
+        Err(error) => {
+            tracing::error!(%error,"invalid runtime configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error,"runtime initialization failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = runtime.block_on(run()) {
         tracing::error!(error = %error, "server stopped with an error");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+fn runtime_workers(configured: Option<&str>, available: usize) -> Result<usize> {
+    match configured {
+        None => Ok(available.clamp(1, 4)),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| (1..=32).contains(value))
+            .ok_or_else(|| anyhow::anyhow!("EASYMANAGE_SERVER_WORKERS must be between 1 and 32")),
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    #[test]
+    fn large_hosts_do_not_create_one_idle_runtime_worker_per_cpu() {
+        assert_eq!(super::runtime_workers(None, 192).unwrap(), 4);
+        assert_eq!(super::runtime_workers(None, 1).unwrap(), 1);
+        assert_eq!(super::runtime_workers(Some("8"), 192).unwrap(), 8);
+        assert!(super::runtime_workers(Some("0"), 192).is_err());
+        assert!(super::runtime_workers(Some("many"), 192).is_err());
+    }
 }
 
 fn initialize_crypto_provider() {
@@ -54,18 +100,35 @@ async fn run() -> Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(config.database_max_connections)
         .acquire_timeout(Duration::from_secs(3))
-        .connect_lazy_with(config.database_url.parse::<PgConnectOptions>()?
-            .application_name("easymanage-server")
-            .options([("statement_timeout", "30000"), ("idle_in_transaction_session_timeout", "30000")]));
+        .connect_lazy_with(
+            config
+                .database_url
+                .parse::<PgConnectOptions>()?
+                .application_name("easymanage-server")
+                .options([
+                    ("statement_timeout", "30000"),
+                    ("idle_in_transaction_session_timeout", "30000"),
+                ]),
+        );
 
     let tls = RustlsConfig::from_pem_file(&config.tls_certificate, &config.tls_private_key)
         .await
         .context("failed to load TLS certificate or private key")?;
     let bind_address = config.bind_address;
-    let collection = collection_settings::CollectionSettings::defaults(config.report_interval_seconds);
+    let collection =
+        collection_settings::CollectionSettings::defaults(config.report_interval_seconds);
     let initialized = database::initialize(pool.clone(), collection.clone());
-    spawn_metrics_retention(pool.clone(), config.metrics_retention_days, initialized.clone());
-    let performance_monitor = performance::start_sampler(pool.clone(), collection.clone(), config.web_root.clone(), initialized.clone());
+    spawn_metrics_retention(
+        pool.clone(),
+        config.metrics_retention_days,
+        initialized.clone(),
+    );
+    let performance_monitor = performance::start_sampler(
+        pool.clone(),
+        collection.clone(),
+        config.web_root.clone(),
+        initialized.clone(),
+    );
     let app = api::router(AppState {
         pool: pool.clone(),
         config: Arc::clone(&config),
@@ -76,7 +139,11 @@ async fn run() -> Result<()> {
         pool.clone(),
         collection.clone(),
     ))
-    .merge(operations::router(pool.clone(), initialized.clone(), config.clone()))
+    .merge(operations::router(
+        pool.clone(),
+        initialized.clone(),
+        config.clone(),
+    ))
     .merge(permission_reviews::router(pool.clone(), collection.clone()))
     .merge(insights::router(
         pool.clone(),
@@ -87,7 +154,10 @@ async fn run() -> Result<()> {
     .merge(usage_history::router(&pool))
     .merge(performance::router(pool, performance_monitor))
     .merge(guide::router(&config.web_root)?)
-    .layer(axum::middleware::from_fn_with_state(initialized, database::guard))
+    .layer(axum::middleware::from_fn_with_state(
+        initialized,
+        database::guard,
+    ))
     .layer(axum::middleware::from_fn(api::attach_request_id))
     .layer(axum::middleware::from_fn(network::account));
 

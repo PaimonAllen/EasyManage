@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Negotiated compact report lane. Legacy servers must reject, not mistake a
+/// missing software list for an intentionally empty inventory during rollback.
+pub const SOFTWARE_CACHE_PROTOCOL_VERSION: u16 = 2;
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const ENROLLMENT_TOKEN_HEADER: &str = "x-easymanage-enrollment-token";
 pub const AGENT_TOKEN_HEADER: &str = "x-easymanage-agent-token";
@@ -141,10 +144,32 @@ pub struct OverlayNetworkStatus {
 /// Resource usage of this EasyManage process only; unavailable counters stay null.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlatformProcessMetric {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_interval_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_percent_of_one_core: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_cpu_percent_of_one_core: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_read_bytes_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_written_bytes_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServiceResourceMetric>,
     pub pid: u32,
     /// CPU time divided by all host CPU time in the sampling interval (0..100).
     pub cpu_percent_of_host: Option<f64>,
     pub resident_memory_bytes: Option<u64>,
+    pub disk_read_bytes_per_second: Option<f64>,
+    pub disk_written_bytes_per_second: Option<f64>,
+}
+
+/// Dedicated EasyManage cgroup v2 only; never an entire login/user session.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ServiceResourceMetric {
+    pub unit: String,
+    pub cpu_percent_of_one_core: Option<f64>,
+    pub memory_current_bytes: Option<u64>,
     pub disk_read_bytes_per_second: Option<f64>,
     pub disk_written_bytes_per_second: Option<f64>,
 }
@@ -335,8 +360,11 @@ pub struct CpuFrequency {
 impl CpuFrequency {
     pub fn valid(&self) -> bool {
         (1..=4096).contains(&self.logical_cpus)
-            && [self.minimum_mhz,self.average_mhz,self.maximum_mhz].into_iter().all(|value|value.is_finite()&&value>0.0&&value<=20_000.0)
-            && self.minimum_mhz<=self.average_mhz && self.average_mhz<=self.maximum_mhz
+            && [self.minimum_mhz, self.average_mhz, self.maximum_mhz]
+                .into_iter()
+                .all(|value| value.is_finite() && value > 0.0 && value <= 20_000.0)
+            && self.minimum_mhz <= self.average_mhz
+            && self.average_mhz <= self.maximum_mhz
     }
 }
 
@@ -446,6 +474,8 @@ pub struct EnrollmentResponse {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AgentReport {
+    #[serde(default)]
+    pub reuse_software_inventory: bool,
     pub protocol_version: u16,
     pub node_id: Uuid,
     pub agent_version: String,
@@ -455,6 +485,8 @@ pub struct AgentReport {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AgentReportResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_inventory_cached: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_control: Option<AgentControl>,
     pub accepted_at: DateTime<Utc>,

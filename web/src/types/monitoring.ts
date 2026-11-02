@@ -77,6 +77,12 @@ export interface OverlayNetworkStatus {
   networks: OverlayMembership[];
 }
 export interface PlatformProcessMetric {
+  sample_interval_seconds?: number | null;
+  cpu_percent_of_one_core?: number | null;
+  children_cpu_percent_of_one_core?: number | null;
+  logical_read_bytes_per_second?: number | null;
+  logical_written_bytes_per_second?: number | null;
+  service?: {unit:string;cpu_percent_of_one_core:number|null;memory_current_bytes:number|null;disk_read_bytes_per_second:number|null;disk_written_bytes_per_second:number|null} | null;
   pid: number;
   cpu_percent_of_host: number | null;
   resident_memory_bytes: number | null;

@@ -157,6 +157,11 @@ pub struct MeasuredChannel {
     attempt: Attempt<'static>,
     failed: bool,
 }
+impl MeasuredChannel {
+    // A nonce-tagged, hash-verified application receipt proves command completion
+    // even if a detached helper keeps the SSH output stream open.
+    pub(crate) fn confirm_completion(&mut self) { self.attempt.finish(true); }
+}
 impl Deref for MeasuredChannel {
     type Target = ssh2::Channel;
     fn deref(&self) -> &Self::Target {

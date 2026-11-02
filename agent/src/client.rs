@@ -18,6 +18,7 @@ pub struct ServerClient {
     enrollment_token: String,
     policy: std::sync::Mutex<Option<CollectionPolicy>>,
     control: std::sync::Mutex<Option<AgentControl>>,
+    software: std::sync::Mutex<Option<(uuid::Uuid, chrono::DateTime<chrono::Utc>)>>,
 }
 
 impl ServerClient {
@@ -46,6 +47,7 @@ impl ServerClient {
             .context("failed to build HTTPS client")?;
 
         Ok(Self {
+            software: std::sync::Mutex::new(None),
             http,
             base_url: config.server_url.clone(),
             enrollment_token: config.enrollment_token.clone(),
@@ -72,16 +74,54 @@ impl ServerClient {
     }
 
     pub async fn report(&self, token: &str, report: &AgentReport) -> Result<ReportOutcome> {
-        let (status, body) = self
+        let key = report
+            .metrics
+            .inventory_collected_at
+            .map(|at| (report.node_id, at));
+        let reuse = key.is_some()
+            && self
+                .software
+                .lock()
+                .ok()
+                .is_some_and(|cached| *cached == key);
+        let mut compact;
+        let outgoing = if reuse {
+            compact = report.clone();
+            compact.metrics.software_packages.clear();
+            compact.reuse_software_inventory = true;
+            compact.protocol_version = easymanage_protocol::SOFTWARE_CACHE_PROTOCOL_VERSION;
+            &compact
+        } else {
+            report
+        };
+        let (mut status, mut body) = self
             .post_bytes(
                 "report",
                 AGENT_TOKEN_HEADER,
                 token,
-                serde_json::to_vec(report)?,
+                serde_json::to_vec(outgoing)?,
                 NetworkGroup::AgentReport,
             )
             .await
             .context("failed to reach metrics endpoint")?;
+
+        // A restored/moved database can lose its cache. Retry the durable full
+        // report once, without re-enrolling, discarding history or new SSH.
+        if reuse && matches!(status,reqwest::StatusCode::CONFLICT | reqwest::StatusCode::BAD_REQUEST) {
+            if let Ok(mut cached) = self.software.lock() {
+                *cached = None;
+            }
+            (status, body) = self
+                .post_bytes(
+                    "report",
+                    AGENT_TOKEN_HEADER,
+                    token,
+                    serde_json::to_vec(report)?,
+                    NetworkGroup::AgentReport,
+                )
+                .await
+                .context("failed to restore software inventory")?;
+        }
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Ok(ReportOutcome::Unauthorized);
@@ -91,6 +131,13 @@ impl ServerClient {
         }
         let accepted: AgentReportResponse =
             serde_json::from_slice(&body).context("invalid metrics response from server")?;
+        if let Ok(mut cached) = self.software.lock() {
+            *cached = if accepted.software_inventory_cached == Some(true) {
+                key
+            } else {
+                None
+            };
+        }
         if let Some(control) = accepted.agent_control {
             self.observe_control(control);
         }
@@ -227,6 +274,7 @@ mod tests {
     #[test]
     fn monitoring_control_never_rolls_back_or_changes_at_the_same_revision() {
         let client = ServerClient {
+            software: std::sync::Mutex::new(None),
             http: reqwest::Client::new(),
             base_url: String::new(),
             enrollment_token: String::new(),

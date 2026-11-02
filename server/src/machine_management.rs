@@ -1078,10 +1078,59 @@ pub(super) fn update_over_ssh(target: &Target, binary: &FsPath, full: bool) -> R
         // Agent registration tokens are pulled back into command output.
         let script = format!("set -eu; cd {}; cp -- {} agent.env; cp -- {} ca.crt; sha256sum agent.env ca.crt >> SHA256SUMS; /bin/bash ./install-user-agent.sh",
             shell_quote(&stage),shell_quote(&format!("{base}/config/agent.env")),shell_quote(&format!("{base}/config/ca.crt")));
-        command(&session,&format!("/bin/bash --noprofile --norc -c {}",shell_quote(&script)))?;
+        let marker=format!("EASYMANAGE_UPDATE_{}:",Uuid::new_v4().simple());
+        let invocation=format!("/bin/bash --noprofile --norc -c {}; result=$?; if test \"$result\" -ne 0; then printf '\\n{}FAIL\\n'; exit \"$result\"; fi; digest=$(sha256sum -- {}); digest=${{digest%% *}}; printf '\\n{}%s\\n' \"$digest\"",
+            shell_quote(&script),marker,shell_quote(&format!("{base}/bin/easymanage-agent")),marker);
+        command_with_receipt(&session,&invocation,&marker,&observed_hash)?;
     }
     // Keep the exact staged bundle for diagnostics/recovery. No recursive cleanup.
     Ok(full.then_some(stage))
+}
+
+fn update_receipt(output:&[u8],marker:&str,expected:&str)->Option<Result<(),OperationsError>>{
+    for line in output.split_inclusive(|byte|*byte==b'\n') {
+        if line.last()!=Some(&b'\n') {continue;}
+        if let Some(digest)=line.strip_suffix(b"\n").and_then(|line|line.strip_prefix(marker.as_bytes())) {
+            return Some(if crate::api::constant_time_equal(std::str::from_utf8(digest).unwrap_or(""),expected) {Ok(())}
+                else {Err(OperationsError::ssh("更新完成回执的摘要不匹配或安装失败；保留原身份及恢复文件"))});
+        }
+    }
+    None
+}
+
+fn command_with_receipt(session:&Session,invocation:&str,marker:&str,expected:&str)->Result<(),OperationsError>{
+    let mut channel=crate::network::ssh_channel(session).map_err(|_|OperationsError::ssh("SSH 更新通道不可用"))?;
+    channel.handle_extended_data(ExtendedData::Merge).map_err(|_|OperationsError::ssh("SSH 更新通道初始化失败"))?;
+    channel.exec(invocation).map_err(|_|OperationsError::ssh("SSH 更新启动失败"))?;
+    let mut output=Vec::new();let mut buffer=[0_u8;1024];
+    loop {
+        let length=channel.read(&mut buffer).map_err(|_|OperationsError::ssh("更新回执超时或中断；请核对节点心跳及保留的恢复文件"))?;
+        if length==0 {return Err(OperationsError::ssh("更新未返回已校验的完成回执；请核对节点心跳"));}
+        output.extend_from_slice(&buffer[..length]);
+        if output.len()>8192 {return Err(OperationsError::ssh("更新回执超过输出上限"));}
+        if let Some(result)=update_receipt(&output,marker,expected) {
+            result?;
+            channel.confirm_completion();
+            // Do not wait for EOF held by an unrelated detached descendant.
+            // The lease restores the ordinary timeout on return.
+            session.set_timeout(1000);let _=channel.close();return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod update_receipt_tests {
+    use super::*;
+    #[test]
+    fn only_complete_nonce_and_hash_verified_receipts_finish_an_update(){
+        let marker="EASYMANAGE_UPDATE_nonce:";let digest="a".repeat(64);
+        assert!(update_receipt(b"installation output\n",marker,&digest).is_none());
+        assert!(update_receipt(format!("{marker}{digest}").as_bytes(),marker,&digest).is_none());
+        assert!(update_receipt(format!("other:{digest}\n").as_bytes(),marker,&digest).is_none());
+        assert!(update_receipt(format!("status\n{marker}{digest}\n").as_bytes(),marker,&digest).unwrap().is_ok());
+        assert!(update_receipt(format!("{marker}FAIL\n").as_bytes(),marker,&digest).unwrap().is_err());
+        assert!(update_receipt(format!("{marker}{}\n","b".repeat(64)).as_bytes(),marker,&digest).unwrap().is_err());
+    }
 }
 
 pub(super) fn finish_full_ssh_update(target: &Target, credentials: Credentials, stage: &str, hash: &str, cancellation: &Cancellation) -> Result<(), OperationsError> {
@@ -1377,6 +1426,7 @@ fn deploy(
             .bind(&request.username).bind(id.to_string()).bind(if existing.is_some(){"machine.redeploy"}else{"machine.add"}).execute(&mut *tx).await.map_err(|_|OperationsError::busy())?;
         tx.commit().await.map_err(|_|OperationsError::busy())
     })?;
+    crate::read_cache::invalidate();
     save_target(state, &target)?;
     ssh_vault::save_with_token(&state.registry,&target,&ssh_auth,&request.sudo_password,false,browser_token)?;
     state.machines.event(
@@ -1673,6 +1723,7 @@ async fn change(
         save_target(&state, target)?;
     }
     tx.commit().await.map_err(|_| OperationsError::busy())?;
+    crate::agent_auth::invalidate();
     if request.action == "delete" && let Some(target) = target.as_ref() {
         ssh_transport::stop(target)?;
         if ssh_vault::exists(&state.registry,target) { ssh_vault::set_enabled(&state.registry,target,false)?; }

@@ -1,3 +1,4 @@
+import type { SensorSnapshot } from "../lib/temperature";
 import { useId, useState } from "react";
 import { NodeCharts } from "./NodeCharts";
 import { HardwareDetailsDialog } from "./HardwareDetailsDialog";
@@ -9,7 +10,7 @@ import {
   PrivilegeBadge,
   SnapshotAge,
 } from "./NodeStatus";
-import type { LiveNode, MetricsSnapshot, NodeMetricHistory, NodeSummary } from "../types/monitoring";
+import type { LiveNode, NodeMetricHistory, NodeSummary } from "../types/monitoring";
 
 export function NodeCard({
   node,
@@ -25,7 +26,7 @@ export function NodeCard({
   history?: NodeMetricHistory;
   historyError?: string;
   liveSamples: LiveNode[];
-  temperatureSnapshots: MetricsSnapshot[];
+  temperatureSnapshots: SensorSnapshot[];
   checkedAt: number;
   onElevate: () => void;
   elevationAvailable: boolean;
