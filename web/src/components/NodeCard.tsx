@@ -1,6 +1,7 @@
 import type { SensorSnapshot } from "../lib/temperature";
 import { useId, useState } from "react";
 import { NodeCharts } from "./NodeCharts";
+import { NodePanel } from "./NodePanel";
 import { HardwareDetailsDialog } from "./HardwareDetailsDialog";
 import {cpuSockets} from "../lib/cpu";
 import {gpuDevices} from "../lib/gpu";
@@ -41,7 +42,8 @@ export function NodeCard({
   const gpuDetailsId = `gpu-details-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
 
   return (
-    <article className={`node-card ${node.online ? "" : "node-card--offline"}`}>
+    <>
+    <NodePanel node={node} className={`node-card ${node.online ? "" : "node-card--offline"}`} header={(expanded) =>
       <header className="node-card__header">
         <div className="node-card__identity">
           <div className="node-card__title-row">
@@ -57,8 +59,8 @@ export function NodeCard({
         <div className="node-card__actions">
           <a className="button button--small button--secondary" href={`/usage-history?node=${encodeURIComponent(node.id)}`} target="_blank" rel="noopener noreferrer">历史使用记录 ↗</a>
           <button type="button" className="button button--small button--secondary" onClick={() => setShowDetails(true)}>设备详情</button>
-          {cpus.length>1&&<button type="button" className="button button--small button--secondary" aria-expanded={showCpus} aria-controls={cpuDetailsId} onClick={()=>setShowCpus(value=>!value)}>{showCpus?"收起 CPU":`展开所有 CPU（${cpus.length}）`}</button>}
-          {gpus.length>1&&<button type="button" className="button button--small button--secondary" aria-expanded={showGpus} aria-controls={gpuDetailsId} onClick={()=>setShowGpus(value=>!value)}>{showGpus?"收起 GPU":`展开所有 GPU（${gpus.length}）`}</button>}
+          {expanded&&cpus.length>1&&<button type="button" className="button button--small button--secondary" aria-expanded={showCpus} aria-controls={cpuDetailsId} onClick={()=>setShowCpus(value=>!value)}>{showCpus?"收起 CPU":`展开所有 CPU（${cpus.length}）`}</button>}
+          {expanded&&gpus.length>1&&<button type="button" className="button button--small button--secondary" aria-expanded={showGpus} aria-controls={gpuDetailsId} onClick={()=>setShowGpus(value=>!value)}>{showGpus?"收起 GPU":`展开所有 GPU（${gpus.length}）`}</button>}
           <PrivilegeBadge node={node} />
           <button
             className="button button--small button--secondary"
@@ -78,6 +80,7 @@ export function NodeCard({
           </button>
         </div>
       </header>
+    }>{() => <>
       {!node.online && (
         <p className="stale-note">{node.monitoring_paused ? "已请求暂停监控；确认状态见机器管理。下方仅保留历史采集结果，恢复请点“恢复监控”。" : "节点离线，下方保留最后一次采集结果。"}</p>
       )}
@@ -91,7 +94,8 @@ export function NodeCard({
       <footer>
         {node.cpu_model} · Kernel {node.kernel_version}
       </footer>
+    </>}</NodePanel>
       {showDetails && <HardwareDetailsDialog node={node} onClose={() => setShowDetails(false)} />}
-    </article>
+    </>
   );
 }

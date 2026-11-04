@@ -1,3 +1,4 @@
+import { NodePanel } from "../components/NodePanel";
 import { useState } from "react";
 import { CollectionNotes, NodeStatus, SnapshotAge } from "../components/NodeStatus";
 import { PageHeading } from "../components/PageHeading";
@@ -40,8 +41,9 @@ export function AiTools({ nodes }: { nodes: NodeSummary[] }) {
         const tools = node.metrics?.ai_tools?.filter(isAgentTool);
         const visible = (tools ?? []).filter((tool) => showAll || detected(tool));
         const incomplete = node.metrics?.collection_issues?.some((issue) => issue.component === "ai_tools" || issue.component === "inventory");
-        return <article className="data-panel" key={node.id}>
+        return <NodePanel node={node} key={node.id} header={
           <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p><SnapshotAge node={node} inventory /></p>{incomplete && <p className="ai-scan-warning">扫描不完整 · 展开下方采集限制查看原因{!isFresh(node) && " · 历史"}</p>}</div><span className={isFresh(node) ? "positive" : "muted"}>{isFresh(node) ? "当前观测" : "历史或未知"}</span></header>
+          }>{() => <>
           {node.metrics?.ai_tools?.length ? <>
             <div className="table-scroll"><table><thead><tr><th>工具</th><th>类型</th><th>状态</th><th>可执行文件</th><th>运行进程 / 用户</th><th>运行服务</th></tr></thead><tbody>
               {visible.map((tool) => <tr key={tool.name}>
@@ -55,7 +57,7 @@ export function AiTools({ nodes }: { nodes: NodeSummary[] }) {
             {!visible.length && <p className="table-empty">当前权限和固定检测范围内，未发现可识别的 Agent 工具。</p>}
           </> : <p className="table-empty">尚未收到新版 Agent 的 AI 工具清单。</p>}
           <CollectionNotes node={node} components={["ai_tools", "processes", "privilege", "inventory"]} />
-        </article>;
+        </>}</NodePanel>;
       })}
       {!nodes.length && <p className="table-empty">尚无受管节点。</p>}
       <p className="hint">“观测到运行”不代表模型/API 可用、账号已登录或请求成功。页面不读取命令行参数、环境变量、模型配置、会话、API Key，也不调用外部 AI 服务。Basic Agent 对其他用户安装目录和部分进程可能不可见。</p>

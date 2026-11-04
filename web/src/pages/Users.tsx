@@ -1,3 +1,4 @@
+import { NodePanel } from "../components/NodePanel";
 import { useState } from "react";
 import {
   CollectionNotes,
@@ -94,7 +95,7 @@ export function Users({ nodes, targets }: { nodes: NodeSummary[]; targets: Opera
               .includes(query.toLowerCase()),
           );
           return (
-            <article className="data-panel" key={node.id}>
+            <NodePanel node={node} key={node.id} header={
               <header className="panel-header">
                 <div>
                   <h2>
@@ -110,7 +111,7 @@ export function Users({ nodes, targets }: { nodes: NodeSummary[]; targets: Opera
                     busy={!!busy[node.id]} onChange={()=>{if(enabled!==undefined)void toggle(node.id,enabled);}}/>
                 </div>
               </header>
-              {errors[node.id]&&<p className="form-error" role="alert">{errors[node.id]}</p>}
+          } notice={errors[node.id]&&<p className="form-error" role="alert">{errors[node.id]}</p>}>{() => <>
               {enabled===false?<p className="table-empty">用户状态采集已关闭，不展示旧快照。{node.metrics?.collection_policy?.users_enabled===false?"Agent 已确认停止采集。":"等待 Agent 应用；离线或旧版节点暂不能确认。"}</p>:<>
               <div className="table-scroll">
                 <table>
@@ -187,7 +188,7 @@ export function Users({ nodes, targets }: { nodes: NodeSummary[]; targets: Opera
                 components={["user", "session", "process"]}
               />
               </>}
-            </article>
+            </>}</NodePanel>
           );
         })}
       </section>

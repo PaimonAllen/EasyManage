@@ -18,7 +18,7 @@ const server = await createServer({
   server: { middlewareMode: true, watch: null },
 });
 try {
-  const { Network } = await server.ssrLoadModule("/src/pages/Network.tsx");
+  const { Network, OverlayHealthCard, OverlayLocalDetails } = await server.ssrLoadModule("/src/pages/Network.tsx");
   const networkFixture = { id: "route-one", hostname: "Route machine", online: true, metrics: {
     inventory_collected_at: new Date().toISOString(), routes: [{ destination: "198.51.100.0/24", gateway: "198.51.100.1", interface: "fixture0", metric: 100 }],
   } };
@@ -26,6 +26,22 @@ try {
   assert.equal((routesPage.match(/<details class="network-route-details"/g) ?? []).length, 2);
   assert.ok(routesPage.includes("路由 · 1 条") && routesPage.includes("路由 · 0 条") && routesPage.includes("198.51.100.0/24") && routesPage.includes("fixture0"));
   assert.ok(!/<details class="network-route-details"[^>]*\bopen(?:=|\s|>)/.test(routesPage));
+  const overlayFixture={...networkFixture,metrics:{...networkFixture.metrics,
+    overlay_networks:[{provider:"zerotier",state:"healthy",detail:"Fixture online",networks:[
+      {network_id:"0123456789abcdef",name:"Team <script>fixture</script>",state:"OK",interface:"zt-one"},
+      {network_id:"fedcba9876543210",name:"Second network",state:"ACCESS_DENIED",interface:"zt-two"}]}],
+    interfaces:[{name:"zt-one",kind:"zerotier",state:"up",addresses:["192.0.2.1/24","2001:db8::1/64"],mtu:2800,vlan_id:null,master:null},
+      {name:"zt-two",kind:"zerotier",state:"down",addresses:[],mtu:2800,vlan_id:null,master:null}]} };
+  const overlayCard=renderToStaticMarkup(React.createElement(OverlayHealthCard,{node:overlayFixture,provider:"zerotier"}));
+  assert.ok(overlayCard.includes('aria-expanded="false"')&&overlayCard.includes('aria-controls=')&&overlayCard.includes('>展开</button>')&&!overlayCard.includes('192.0.2.1/24'));
+  const localOverlay=renderToStaticMarkup(React.createElement(OverlayLocalDetails,{node:overlayFixture,provider:"zerotier"}));
+  assert.ok(localOverlay.includes("0123456789abcdef")&&localOverlay.includes("192.0.2.1/24")&&localOverlay.includes("2001:db8::1/64")&&localOverlay.includes("未上报 IP"));
+  assert.ok(localOverlay.includes('overlay-health-card__state--degraded">ACCESS_DENIED')&&!localOverlay.includes('<script>fixture</script>')&&!localOverlay.includes('VLAN Tag'));
+  const staleOverlay=renderToStaticMarkup(React.createElement(OverlayLocalDetails,{node:{...overlayFixture,online:false},provider:"zerotier"}));
+  assert.ok(staleOverlay.includes("历史快照")&&staleOverlay.includes("历史 · OK")&&!staleOverlay.includes('overlay-health-card__state--healthy'));
+  const unassignedOverlay=renderToStaticMarkup(React.createElement(OverlayLocalDetails,{node:{...overlayFixture,metrics:{...overlayFixture.metrics,overlay_networks:[]}},provider:"zerotier"}));
+  assert.ok(unassignedOverlay.includes("192.0.2.1/24")&&unassignedOverlay.includes('overlay-health-card__state--unknown">未上报')&&!unassignedOverlay.includes('overlay-health-card__state--healthy'));
+  console.log("PASS overlay cards default closed; local IPs, network IDs, per-network states and stale snapshots stay separate without new probes");
   const { Security } = await server.ssrLoadModule("/src/pages/Security.tsx");
   const securityFixture = { ...networkFixture, metrics: { inventory_collected_at: new Date().toISOString(),
     host_security: { collected_at: new Date(Date.now() - 1800_000).toISOString(), interval_seconds: 3600, apparmor_enabled: true, aslr_mode: 2, ptrace_scope: 1, kernel_lockdown: "integrity" },
@@ -235,6 +251,35 @@ try {
     memory_used_bytes:(index+1)*1024**3,memory_total_bytes:24*1024**3,temperature_celsius:45+index*12}));
   const multiNode={...props.node,id:'multi-fixture',hostname:'Multi GPU fixture',metrics:{...metrics,gpus:[multiGpus[2],multiGpus[0],multiGpus[3],multiGpus[1]]}};
   const cardProps={node:multiNode,liveSamples:[],temperatureSnapshots:[],checkedAt:end,onElevate:()=>{},elevationAvailable:false};
+  {
+    const {NodePanel}=await server.ssrLoadModule('/src/components/NodePanel.tsx');
+    let bodyCalls=0;
+    const panel=(node)=>renderToStaticMarkup(React.createElement(NodePanel,{node,
+      header:React.createElement('header',null,React.createElement('h2',null,node.hostname),React.createElement('button',null,'恢复监控')),
+      notice:React.createElement('p',{role:'alert'},'visible-control-error'),
+      children:()=>{bodyCalls++;return React.createElement('p',null,'lazy-body-fixture');}}));
+    const pausedNode={...multiNode,online:false,monitoring_paused:true,monitoring_revision:3,monitoring_applied_revision:2,
+      metrics:{...multiNode.metrics,disks:[{name:'/dev/synthetic',mount_point:'/paused-storage',file_system:'ext4',total_bytes:1000,available_bytes:500}],block_devices:[]}};
+    const pending=panel(pausedNode);
+    const confirmed=panel({...pausedNode,monitoring_applied_revision:3});
+    assert.equal(bodyCalls,0,'neither pending nor confirmed paused panels render their detailed body');
+    for(const html of [pending,confirmed])assert.ok(html.includes('aria-expanded="false"')&&html.includes('aria-controls=')&&html.includes('恢复监控')&&html.includes('visible-control-error')&&html.includes('hidden=""')&&!html.includes('lazy-body-fixture'));
+    const offline=panel({...pausedNode,monitoring_paused:false});
+    assert.equal(bodyCalls,1);
+    assert.ok(offline.includes('lazy-body-fixture')&&!offline.includes('node-panel--paused'));
+    const pausedCard=renderToStaticMarkup(React.createElement(NodeCard,{...cardProps,node:pausedNode}));
+    assert.ok(pausedCard.includes('暂停待确认')&&pausedCard.includes('设备详情')&&pausedCard.includes('历史使用记录')&&pausedCard.includes('aria-expanded="false"'));
+    assert.ok(!pausedCard.includes('class="history-chart"')&&!pausedCard.includes('收起 GPU'));
+    for(const name of ['Storage','Network','Users','PermissionChecks','Security','OSandSoftwares','AiTools','ProgrammingEnvironment','GlobalNetwork']) {
+      const page=await server.ssrLoadModule(`/src/pages/${name}.tsx`);
+      const html=renderToStaticMarkup(React.createElement(page[name],{nodes:[pausedNode],targets:[]}));
+      assert.ok(html.includes('node-panel--paused')&&html.includes('aria-expanded="false"'),`${name} uses paused disclosure`);
+      assert.ok(html.includes('暂停待确认'),`${name} keeps pause status visible`);
+      const card=html.match(/<article class="[^"]*node-panel--paused[^>]*>([\s\S]*?)<\/article>/)?.[1];
+      assert.ok(card&&!/class="(?:storage-device-card|history-chart|overlay-health-grid|permission-table)"/.test(card),`${name} omits collapsed detail rendering`);
+    }
+    console.log('PASS paused/pending machines default closed across all monitoring cards, retain management controls and skip detail rendering; ordinary offline machines stay expanded');
+  }
   const defaultGpuCard=renderToStaticMarkup(React.createElement(NodeCard,cardProps));
   assert.ok(defaultGpuCard.includes('收起 GPU')&&defaultGpuCard.includes('aria-expanded="true"'));
   assert.ok(defaultGpuCard.includes('href="/usage-history?node=multi-fixture" target="_blank" rel="noopener noreferrer"'));

@@ -1,3 +1,5 @@
+import { NodeStatus } from "../components/NodeStatus";
+import { NodePanel } from "../components/NodePanel";
 import { PageHeading } from "../components/PageHeading";
 import { formatDate } from "../lib/format";
 import type { NodeSummary } from "../types/monitoring";
@@ -21,8 +23,9 @@ export function Security({ nodes }: { nodes: NodeSummary[] }) {
         const admins = (metrics?.users ?? []).filter((user) => user.groups.some((group) => ["sudo", "wheel", "lab-admins"].includes(group)));
         const sshRunning = (metrics?.running_services ?? []).some((service) => ["ssh.service", "sshd.service"].includes(service.name));
         const lockdown = security?.kernel_lockdown;
-        return <article className="data-panel" key={node.id}>
-          <header className="panel-header"><div><h2>{node.hostname}</h2><p>{node.os_name} {node.os_version} · Kernel {node.kernel_version} · 安全配置采集于 {formatDate(securityAt)}</p><p>{hourly ? "每小时一次 · 缓存结果" : "旧版采样 · 更新 Agent 后启用小时采集"}</p></div><span className={current ? "positive" : "muted"}>{current ? hourly ? "小时快照" : "旧版快照" : "历史或未知"}</span></header>
+        return <NodePanel node={node} key={node.id} header={
+          <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p>{node.os_name} {node.os_version} · Kernel {node.kernel_version} · 安全配置采集于 {formatDate(securityAt)}</p><p>{hourly ? "每小时一次 · 缓存结果" : "旧版采样 · 更新 Agent 后启用小时采集"}</p></div><span className={current ? "positive" : "muted"}>{current ? hourly ? "小时快照" : "旧版快照" : "历史或未知"}</span></header>
+          }>{() => <>
           <div className="health-grid">
             <div><strong>AppArmor</strong><span className={security?.apparmor_enabled ? "positive" : security?.apparmor_enabled === false ? "form-error" : "muted"}>{securityObservation(security?.apparmor_enabled, "已启用", "未启用")}</span><small>内核强制访问控制开关</small></div>
             <div><strong>ASLR</strong><span className={security?.aslr_mode === 2 ? "positive" : security?.aslr_mode == null ? "muted" : "form-error"}>{security?.aslr_mode == null ? "未知" : security.aslr_mode === 2 ? "完整随机化" : security.aslr_mode === 1 ? "部分随机化" : "已关闭"}</span><small>kernel.randomize_va_space = {security?.aslr_mode ?? "?"}</small></div>
@@ -37,7 +40,7 @@ export function Security({ nodes }: { nodes: NodeSummary[] }) {
           </tbody></table></div>
           <p className="hint">账户和 SSH 服务清单采集于 {formatDate(inventoryAt)}；沿用扩展清单频率和各机器采集开关。</p>
           <p className="hint">这是当前 Agent 可读取的安全配置快照，不是漏洞扫描或合规结论。离线及过期数据仅供历史参考；未知项不可视作安全。</p>
-        </article>;
+        </>}</NodePanel>;
       })}
       {!nodes.length && <p className="table-empty">尚无受管服务器安全数据。</p>}
     </section>

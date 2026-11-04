@@ -1,3 +1,4 @@
+import { NodePanel } from "../components/NodePanel";
 import { useMemo, useState } from "react";
 import { CollectionNotes, NodeStatus, SnapshotAge } from "../components/NodeStatus";
 import { PageHeading } from "../components/PageHeading";
@@ -80,19 +81,19 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
         const hidden=!proxyMonitoringVisible(node,enabled);
         const services = node.metrics?.proxy_services ?? [];
         const accounts = new Set(services.map((service) => service.uid));
-        return <article className="data-panel" key={node.id}>
+        return <NodePanel node={node} key={node.id} header={
           <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p><SnapshotAge node={node} inventory /></p></div>
             <NodeCollectionToggle hostname={node.hostname} label="代理监控采集" enabled={enabled} applied={applied}
               unavailable={settings!==null&&enabled===undefined}
               online={node.online} busy={!!busy[node.id]} onChange={()=>{if(enabled!==undefined)void toggle(node.id,enabled);}}/>
           </header>
-          {errors[node.id]&&<p className="form-error" role="alert">{errors[node.id]}</p>}
+          } notice={errors[node.id]&&<p className="form-error" role="alert">{errors[node.id]}</p>}>{() => <>
           {hidden?<p className="table-empty">{enabled===true?"代理采集正在开启，等待 Agent 应用并采集新清单。":"代理监控采集已关闭，不展示旧快照。"}{enabled===false?(applied===false?"Agent 已确认停止代理采集。":"等待 Agent 应用；离线或旧版节点暂不能确认。"):""}</p>:<>
           <p>{services.length} 个可见代理进程 · {accounts.size} 个用户上下文 · Agent {node.metrics?.privilege?.mode ?? "未知"} 权限</p>
           {!services.length && <p className="table-empty">当前权限下未观测到已识别的代理进程；不代表该节点没有代理。</p>}
           <CollectionNotes node={node} components={["proxy", "processes", "privilege"]} />
           </>}
-        </article>;
+        </>}</NodePanel>;
       })}
       <article className="data-panel">
         <header className="panel-header"><div><h2>代理实例与监听</h2><p>按节点、所属用户和进程列出；端口状态只比较当前筛选范围内的新鲜、可见监听。</p></div>

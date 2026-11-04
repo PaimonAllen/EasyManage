@@ -270,6 +270,11 @@ summary:focus-visible {
 }
 .status--paused { color: var(--muted); }
 .status--paused i { background: currentColor; }
+.node-panel--paused > .panel-header,
+.node-panel--paused > .node-card__header { flex-wrap: wrap; }
+.node-panel--paused > .panel-header > :first-child,
+.node-panel--paused > .node-card__header > :first-child { flex: 1; min-width: 0; }
+.node-panel__toggle { flex-shrink: 0; margin-left: auto; }
 .node-card__header {
   padding: 10px 10px;
   display: flex;
@@ -1327,6 +1332,7 @@ select:disabled {
 }
 .overlay-health-grid {
   display: grid;
+  align-items: start;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   padding: 0 24px 18px;
@@ -1347,6 +1353,35 @@ select:disabled {
   gap: 4px 10px;
 }
 .overlay-health-card__heading strong { font-size: 13px; }
+.overlay-health-card__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.overlay-local-details {
+  margin-top: 12px;
+  padding-top: 2px;
+  border-top: 1px solid var(--line);
+}
+.overlay-local-details__network {
+  min-width: 0;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.overlay-local-details__network dl {
+  display: grid;
+  grid-template-columns: minmax(0, 90px) minmax(0, 1fr);
+  gap: 7px 10px;
+  margin: 10px 0 0;
+}
+.overlay-local-details__network dt { color: var(--muted); }
+.overlay-local-details__network dd { min-width: 0; margin: 0; }
+.overlay-local-details__addresses { display: grid; gap: 5px; }
 .overlay-health-card__state { font-size: 11px; font-weight: 600; }
 .overlay-health-card__state--healthy { color: var(--cyan); }
 .overlay-health-card__state--not_joined { color: var(--amber); }

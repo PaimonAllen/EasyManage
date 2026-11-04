@@ -1,3 +1,4 @@
+import { NodePanel } from "../components/NodePanel";
 import { useState } from "react";
 import { CollectionNotes, NodeStatus, SnapshotAge } from "../components/NodeStatus";
 import { PageHeading } from "../components/PageHeading";
@@ -41,8 +42,9 @@ export function ProgrammingEnvironment({ nodes }: { nodes: NodeSummary[] }) {
         const tools = node.metrics?.programming_tools;
         const categoryNotReported = !!tools?.length && category in PROGRAMMING_CATEGORY_HINTS && !tools.some((tool) => displayCategory(tool) === category);
         const visible = (tools ?? []).filter((tool) => (category === "全部" || displayCategory(tool) === category) && (showMissing || tool.executable_paths.length));
-        return <article className="data-panel" key={node.id}>
+        return <NodePanel node={node} key={node.id} header={
           <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p><SnapshotAge node={node} inventory /></p></div><span className={fresh(node) ? "positive" : "muted"}>{fresh(node) ? "当前观测" : "历史或未知"}</span></header>
+          }>{() => <>
           {tools?.length ? <>
             <div className="table-scroll"><table><thead><tr><th>工具</th><th>类别</th><th>状态</th><th>系统包版本</th><th>发现路径</th></tr></thead><tbody>
               {visible.map((tool) => <tr key={tool.name}>
@@ -55,7 +57,7 @@ export function ProgrammingEnvironment({ nodes }: { nodes: NodeSummary[] }) {
             {!visible.length && <p className="table-empty">{categoryNotReported ? `此节点 Agent 尚未上报“${category}”检测项，请在 Agent 管理中更新后等待清单采集。` : <>{category === "全部" ? "当前范围暂无发现的工具" : `“${category}”类别当前暂无发现的工具`}；可切换为“全部检测项”。</>}</p>}
           </> : <p className="table-empty">尚未收到新版 Agent 的编程环境清单。</p>}
           <CollectionNotes node={node} components={["software", "privilege"]} />
-        </article>;
+        </>}</NodePanel>;
       })}
       {!nodes.length && <p className="table-empty">尚无受管节点。</p>}
     </section>

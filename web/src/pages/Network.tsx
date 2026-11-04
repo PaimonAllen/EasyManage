@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { NodePanel } from "../components/NodePanel";
+import { useId, useState } from "react";
 import {
   CollectionNotes,
   NodeStatus,
@@ -8,6 +9,7 @@ import {
 import { PageHeading } from "../components/PageHeading";
 import { formatBytes, formatRate } from "../lib/format";
 import type { NodeSummary, OverlayNetworkStatus } from "../types/monitoring";
+import { localOverlayNetworks } from "../lib/overlayNetworks";
 
 const overlayProviders = ["tailscale", "zerotier"] as const;
 
@@ -31,6 +33,63 @@ function overlayState(status?: OverlayNetworkStatus): OverlayNetworkStatus["stat
   if (status.provider === "tailscale" && status.state === "offline" &&
       status.detail.includes("需要登录")) return "not_joined";
   return status.state;
+}
+
+export function OverlayLocalDetails({ node, provider }: { node: NodeSummary; provider: OverlayNetworkStatus["provider"] }) {
+  const status = node.metrics?.overlay_networks?.find((item) => item.provider === provider);
+  const rows = localOverlayNetworks(provider, status, node.metrics?.interfaces ?? []);
+  const fresh = inventoryFresh(node);
+  return <div className="overlay-local-details">
+    <p className={fresh ? "muted" : "stale-note"}>{fresh
+      ? "本机网卡快照 · 入网状态来自 CLI，网卡 UP 不代表节点互通。"
+      : "历史快照：节点离线或清单已过期，以下 IP 和状态不代表当前连接。"}</p>
+    {rows.length === 0 && <p>暂未上报本机虚拟网卡或 IP；当前服务状态见上方，不以缺少网卡判定离线。</p>}
+    {rows.map((row, index) => {
+      const membershipState = row.membership?.state || (provider === "tailscale" ? overlayLabel(status) : "未上报");
+      const stateClass = !fresh || (provider === "zerotier" && !row.membership) ? "unknown"
+        : row.membership && row.membership.state !== "OK" ? "degraded" : overlayState(status);
+      return <section className="overlay-local-details__network" key={`${row.membership?.network_id ?? "interface"}-${row.interface?.name ?? index}`}>
+        <strong>{row.membership?.name || (provider === "tailscale" ? "Tailscale 虚拟网络" : row.membership?.network_id || "ZeroTier 虚拟网卡")}</strong>
+        <dl>
+          {row.membership && <><dt>网络 ID</dt><dd><code>{row.membership.network_id}</code></dd></>}
+          <dt>入网状态</dt><dd className={`overlay-health-card__state--${stateClass}`}>{fresh ? membershipState : `历史 · ${membershipState}`}</dd>
+          <dt>本机接口</dt><dd><code>{row.interface?.name || row.membership?.interface || "未上报"}</code></dd>
+          <dt>本机 IP / 前缀</dt><dd className="overlay-local-details__addresses">{row.interface?.addresses.length
+            ? [...new Set(row.interface.addresses)].map((address) => <code key={address}>{address}</code>)
+            : <span className="muted">未上报 IP</span>}</dd>
+          <dt>网卡状态</dt><dd>{row.interface?.state.toUpperCase() || "未知"}</dd>
+          {row.interface?.vlan_id != null && <><dt>VLAN Tag</dt><dd>{row.interface.vlan_id}</dd></>}
+          {row.interface?.mtu != null && <><dt>MTU</dt><dd>{row.interface.mtu}</dd></>}
+          {row.interface?.master && <><dt>主接口</dt><dd><code>{row.interface.master}</code></dd></>}
+        </dl>
+      </section>;
+    })}
+  </div>;
+}
+
+export function OverlayHealthCard({ node, provider }: { node: NodeSummary; provider: OverlayNetworkStatus["provider"] }) {
+  const [expanded, setExpanded] = useState(false);
+  const detailsId = useId();
+  const status = node.metrics?.overlay_networks?.find((item) => item.provider === provider);
+  const fresh = inventoryFresh(node);
+  const name = provider === "tailscale" ? "Tailscale" : "ZeroTier";
+  return <div className="overlay-health-card">
+    <div className="overlay-health-card__heading">
+      <strong>{name}</strong>
+      <div className="overlay-health-card__actions">
+        <span className={`overlay-health-card__state overlay-health-card__state--${fresh ? overlayState(status) : "unknown"}`}>{fresh ? overlayLabel(status) : "历史 / 未知"}</span>
+        <button type="button" className="button button--secondary button--small" aria-expanded={expanded} aria-controls={detailsId}
+          aria-label={`${node.hostname} ${name} ${expanded ? "收起" : "展开"}本机 IP 和网络详情`} onClick={() => setExpanded((value) => !value)}>{expanded ? "收起" : "展开"}</button>
+      </div>
+    </div>
+    <p>{status ? (fresh ? status.detail : `上次采集：${status.detail}`) : "等待新版 Agent 上报 CLI 状态"}</p>
+    {status?.networks.length ? <ul className="overlay-health-card__networks">
+      {status.networks.map((network) => <li key={network.network_id}>
+        <span>{network.name || network.network_id}{network.interface ? ` · ${network.interface}` : ""}</span><code>{network.state}</code>
+      </li>)}
+    </ul> : null}
+    <div id={detailsId} hidden={!expanded}>{expanded && <OverlayLocalDetails node={node} provider={provider} />}</div>
+  </div>;
 }
 
 export function Network({ nodes }: { nodes: NodeSummary[] }) {
@@ -64,7 +123,7 @@ export function Network({ nodes }: { nodes: NodeSummary[] }) {
             const overlays = node.metrics?.overlay_networks ?? [];
             const fresh = inventoryFresh(node);
             return (
-            <article className="data-panel" key={node.id}>
+            <NodePanel node={node} key={node.id} header={
               <header className="panel-header">
                 <div>
                   <h2>
@@ -76,25 +135,11 @@ export function Network({ nodes }: { nodes: NodeSummary[] }) {
                 </div>
                 <PrivilegeBadge node={node} />
               </header>
+          }>{() => <>
               <h3 className="section-title">组网服务健康</h3>
               <p className="section-hint">Tailscale 读取 <code>tailscale status --json</code>；ZeroTier 读取 <code>zerotier-cli -j info / listnetworks</code>。网卡 UP 不等于服务健康；这里也不主动测试节点互通。</p>
               <div className="overlay-health-grid">
-                {overlayProviders.map((provider) => {
-                  const status = overlays.find((item) => item.provider === provider);
-                  return <div className="overlay-health-card" key={provider}>
-                    <div className="overlay-health-card__heading">
-                      <strong>{provider === "tailscale" ? "Tailscale" : "ZeroTier"}</strong>
-                      <span className={`overlay-health-card__state overlay-health-card__state--${fresh ? overlayState(status) : "unknown"}`}>{fresh ? overlayLabel(status) : "历史 / 未知"}</span>
-                    </div>
-                    <p>{status ? (fresh ? status.detail : `上次采集：${status.detail}`) : "等待新版 Agent 上报 CLI 状态"}</p>
-                    {status?.networks.length ? <ul className="overlay-health-card__networks">
-                      {status.networks.map((network) => <li key={network.network_id}>
-                        <span>{network.name || network.network_id}{network.interface ? ` · ${network.interface}` : ""}</span>
-                        <code>{network.state}</code>
-                      </li>)}
-                    </ul> : null}
-                  </div>;
-                })}
+                {overlayProviders.map((provider) => <OverlayHealthCard key={provider} node={node} provider={provider} />)}
               </div>
               <h3 className="section-title">网卡与虚拟网络</h3>
               <div className="table-scroll">
@@ -228,7 +273,7 @@ export function Network({ nodes }: { nodes: NodeSummary[] }) {
                 node={node}
                 components={["network", "interface", "route"]}
               />
-            </article>
+            </>}</NodePanel>
           );
           })}
       </section>

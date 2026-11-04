@@ -1,3 +1,4 @@
+import { NodePanel } from "../components/NodePanel";
 import { useEffect, useId, useRef, useState } from "react";
 import { permissionFreshSeconds } from "../lib/collection";
 import { fetchPermissionReviews, markPermissionReview, type PermissionReview } from "../api/client";
@@ -156,7 +157,7 @@ export function PermissionChecks({ nodes }: { nodes: NodeSummary[] }) {
         const collected = audit ? Date.parse(audit.collected_at) : NaN;
         const current = enabled!==false && node.metrics?.collection_policy?.permissions_enabled!==false && node.online && Number.isFinite(collected) && Date.now() - collected < permissionFreshSeconds(node) * 1000;
         const isReviewed = (item: PermissionCheck) => Boolean(current && reviewFor(node.id, item));
-        return <article className="data-panel" key={node.id}>
+        return <NodePanel node={node} key={node.id} header={
           <header className="panel-header">
             <div><h2>{node.hostname} <NodeStatus node={node} /></h2><p>权限采集于 {formatDate(audit?.collected_at)} · Agent {node.metrics?.privilege?.mode === "full" ? "Full" : "Basic"}</p></div>
             <div className="user-collection-actions"><span className={current ? "positive" : "muted"}>{enabled===false?"采集已关闭":current?"当前快照":"历史或待采集"}</span>
@@ -165,7 +166,7 @@ export function PermissionChecks({ nodes }: { nodes: NodeSummary[] }) {
                 onChange={()=>{if(enabled!==undefined){setReason(null);void toggle(node.id,enabled);}}}/>
             </div>
           </header>
-          {errors[node.id]&&<p className="form-error" role="alert">{errors[node.id]}</p>}
+          } notice={errors[node.id]&&<p className="form-error" role="alert">{errors[node.id]}</p>}>{() => <>
           {enabled===false?<p className="table-empty">权限检查采集已关闭，不展示旧快照。{node.metrics?.collection_policy?.permissions_enabled===false?"Agent 已确认停止采集。":"等待 Agent 应用；离线或旧版节点暂不能确认。"}</p>:!audit ? <p className="table-empty">尚未收到权限审计数据；需要更新平台 Server 和此节点的 Agent。不能把缺少结果当作安全通过。</p> : <>
             <Summary checks={audit.checks} isReviewed={isReviewed} />
             {audit.truncated && <p className="permission-limit">扫描超过上限：最多展示 64 个个人目录、32 个项目目录和 64 个 sudo 附加规则文件；未覆盖的路径状态未知。</p>}
@@ -190,7 +191,7 @@ export function PermissionChecks({ nodes }: { nodes: NodeSummary[] }) {
             })}
           </>}
           {enabled!==false&&<CollectionNotes node={node} components={["permissions"]} />}
-        </article>;
+        </>}</NodePanel>;
       })}
       {!nodes.length && <p className="table-empty">尚无受管节点。</p>}
       <p className="hint">sudo 检查不执行 sudo 命令、不尝试密码、不解析所有 include/LDAP 规则；“符合检查项”只表示列出的静态条件成立，不是完整安全认证。修复权限需管理员单独评估，本页不提供自动 chmod/chown。</p>

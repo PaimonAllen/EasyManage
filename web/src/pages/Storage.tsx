@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { Meter } from "../components/Meter";
+import { NodePanel } from "../components/NodePanel";
 import { BlockDeviceMap } from "../components/BlockDeviceMap";
 import { DiskSpaceExplorer } from "../components/DiskSpaceExplorer";
 import {
@@ -65,7 +66,7 @@ export function Storage({ nodes }: { nodes: NodeSummary[] }) {
           const visibleDisks=disks.filter(d=>d.mount_point==="/"||showBoot||(!isBootMount(d.mount_point)&&!bootDevices.has(d.name)));
           const sharing=sharedStorage(disks);
           return (
-          <article className="data-panel" key={node.id}>
+          <NodePanel node={node} key={node.id} header={
             <header className="panel-header">
               <div>
                 <h2>
@@ -88,6 +89,7 @@ export function Storage({ nodes }: { nodes: NodeSummary[] }) {
                 </strong>
               </div>
             </header>
+          }>{() => <>
             <StorageTopology devices={devices} disks={disks} showBoot={showBoot}/>
             <details className="storage-mounted-section" open>
               <summary className="storage-mounted-toggle">
@@ -162,7 +164,7 @@ export function Storage({ nodes }: { nodes: NodeSummary[] }) {
               </div>
               <CollectionNotes node={node} components={["disk", "storage"]} />
             </details>
-          </article>
+          </>}</NodePanel>
           );
         })}
         <DiskSpaceExplorer nodes={nodes} showBoot={showBoot}/>
