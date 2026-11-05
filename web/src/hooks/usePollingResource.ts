@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 // One request at a time, only while visible; every request has a deadline.
-export function usePollingResource<T>(load: (signal: AbortSignal) => Promise<T>, intervalMs: number) {
+export function usePollingResource<T>(load: (signal: AbortSignal) => Promise<T>, intervalMs: number, refreshKey = 0) {
   const [data, setData] = useState<T>();
   const [error, setError] = useState("");
   useEffect(() => {
@@ -21,6 +21,6 @@ export function usePollingResource<T>(load: (signal: AbortSignal) => Promise<T>,
     const timer = window.setInterval(() => void refresh(), intervalMs);
     document.addEventListener("visibilitychange", refresh);
     return () => { controller.abort(); window.clearInterval(timer); document.removeEventListener("visibilitychange", refresh); };
-  }, [load, intervalMs]);
+  }, [load, intervalMs, refreshKey]);
   return { data, error };
 }

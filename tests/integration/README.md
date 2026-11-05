@@ -1,5 +1,7 @@
 # 隔离集成测试
 
+完全停止 Agent：`agent_service_stop_smoke.py` 使用私有嵌套命名空间和 mock systemd，验证 Full、systemd Basic 和真实兼容守护的停服、禁用自动拉起、错误 UUID / Full 账户拒绝，以及文件 / 身份库字节保留。`isolated_smoke.py --machine-agent-stop --agent-binary ...` 另需下述 Paramiko venv；执行真实 SSH、真实 Agent 和临时 PostgreSQL，区分暂停后原进程轻量心跳与停止后进程退出，验证三连接上限、保存凭据授权、停止后禁止直接恢复 / 重启 / SSH 重连、原 UUID 重新部署恢复和平台重启不自动拨号。Full 系统服务管理仍为隔离 mock，不在生产上执行停服验证。
+
 存储挂载回归：Agent `platform::linux::mounts::tests` 使用合成 mountinfo 验证 NFS/autofs 清单、绑定目录身份、未知容量、转义路径和凭据不输出，不连接网络文件系统。HTTPS smoke 验证新增元数据入库与旧 Agent 兼容，且未知 NFS I/O 不影响已有块设备的速率。前端 `storageMounts.test.ts` 和 SSR 验证启动分区默认隐藏、真实布局保留、共享容量和未知值显示。
 
 全机磁盘扫描回归在私有 mount namespace 创建两个小型 tmpfs 和重叠的 bind mount，验证各文件系统覆盖、绑定去重、真实路径、全局预算、取消和不可读主入口的绑定回退；生产默认仍禁止扫描 tmpfs。HTTP 用 `all_local` 加 1 条预算验证新范围持久化，在发现或枚举文件系统前停止，不扫描宿主目录。

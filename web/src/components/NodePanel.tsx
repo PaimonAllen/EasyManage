@@ -10,8 +10,8 @@ export function NodePanel({ node, header, children, notice, className = "data-pa
   className?: string;
 }) {
   const bodyId = useId();
-  const paused = Boolean(node.monitoring_paused);
-  const pauseKey = `${node.id}:${node.monitoring_revision ?? 0}`;
+  const paused = Boolean(node.monitoring_paused||node.agent_service_desired_stopped||node.agent_service_state&&node.agent_service_state!=="running");
+  const pauseKey = `${node.id}:${node.monitoring_revision ?? 0}:${node.agent_service_revision??0}`;
   const [openedPause, setOpenedPause] = useState<string | null>(null);
   // A normal data refresh preserves a manual expansion. A new pause revision
   // defaults closed; resuming also clears the choice for legacy snapshots.

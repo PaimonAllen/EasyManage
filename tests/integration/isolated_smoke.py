@@ -198,6 +198,8 @@ def exercise_api(base_url, context, enrollment_token, node_id):
             "wrong enrollment secret is rejected")
     require(request("/api/v1/machines/probe", {"host":"10.0.0.8","port":22}, {"Origin":"https://foreign.invalid"})[0]==403,
             "cross-origin machine probe is rejected before SSH")
+    require(request(f"/api/v1/machines/{node_id}/agent/stop",{'confirmation':node_id,'expected_revision':0}, {'Origin':'https://foreign.invalid'})[0]==403,
+            'cross-origin complete Agent shutdown is rejected before credentials, SSH or state writes')
     add_fixture={"host":"10.0.0.8","port":22,"display_name":"fixture","server_url":base_url,
                  "fingerprint":"fixture","username":"tester","password":"fixture"}
     require(request("/api/v1/machines",add_fixture,{"Origin":"https://foreign.invalid"})[0]==403,
@@ -1182,6 +1184,8 @@ def smoke(args):
                 exercise_api(base_url, context, enrollment, node_id)
                 from documents_smoke import exercise as exercise_documents
                 saved_document = exercise_documents(base_url, context, require)
+                from external_platforms_smoke import exercise as exercise_external_platforms
+                saved_external_platforms = exercise_external_platforms(base_url, context, require)
                 if args.usage_history:
                     from usage_history_smoke import exercise as exercise_usage_history
                     exercise_usage_history(root, base_url, context, enrollment, require)
@@ -1203,11 +1207,27 @@ def smoke(args):
                                     if response.status==200:return
                             except OSError:time.sleep(0.1)
                         raise RuntimeError('Isolated controller restart failed')
-                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment, args.machine_admin_credentials, args.machine_disk_space, args.machine_update)
+                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment, args.machine_admin_credentials, args.machine_disk_space, args.machine_update,args.machine_agent_stop)
                 with opener.open(base_url + "/api/v1/operations/targets", timeout=2) as response:
                     expected_target_count = len(json.load(response)["targets"])
+                with opener.open(base_url+'/api/v1/machines',timeout=5) as response:
+                    stopped_agent_ids=[m['node_id'] for m in json.load(response)['machines'] if m.get('agent_service_state')=='stopped']
                 # Reproduce PostgreSQL outage and restart the Server with DB down.
                 stop_process(postgres)
+                try:
+                    opener.open(base_url + "/api/v1/machines", timeout=5)
+                except urllib.error.HTTPError as error:
+                    body = json.load(error)
+                    require(error.code == 503 and 'PostgreSQL' in body['message']
+                            and '运维连接过多' not in body['message'],
+                            'database outage is reported as unavailable storage rather than an SSH rate limit')
+                else:
+                    raise AssertionError("machine listing incorrectly accepted an unavailable database")
+                for stopped_id in stopped_agent_ids:
+                    req=urllib.request.Request(base_url+f'/api/v1/nodes/{stopped_id}/agent/force-restart',data=b'{}',headers={'Content-Type':'application/json','Origin':base_url})
+                    try:opener.open(req,timeout=2)
+                    except urllib.error.HTTPError as error:require(error.code==409,'database-independent emergency recovery cannot restart a deliberately stopped Agent')
+                    else:raise AssertionError('Stopped Agent was offered an emergency restart')
                 stop_process(server)
                 server = subprocess.Popen([str(args.server_binary.resolve())], cwd=root, env=server_env, stdout=log, stderr=subprocess.STDOUT)
                 deadline = time.monotonic() + 15
@@ -1234,6 +1254,15 @@ def smoke(args):
                     require(error.code == 503, "monitoring fails fast with 503 until database initialization completes")
                 else:
                     raise AssertionError("uninitialized monitoring was not gated")
+                try:
+                    opener.open(base_url + "/api/v1/machines", timeout=5)
+                except urllib.error.HTTPError as error:
+                    body = json.load(error)
+                    require(error.code == 503 and '数据库' in body['message']
+                            and '运维连接过多' not in body['message'],
+                            'cold-start machine management correctly reports that database initialization is pending')
+                else:
+                    raise AssertionError("machine listing incorrectly accepted an unavailable database")
                 for endpoint in (f"/api/v1/nodes/{node_id}/agent/force-restart", "/api/v1/platform/force-restart"):
                     req = urllib.request.Request(base_url + endpoint, data=json.dumps({"username":"smoke","password":"fixture"}).encode(),
                         headers={"Content-Type":"application/json","Origin":"https://cross-origin.invalid"})
@@ -1254,8 +1283,14 @@ def smoke(args):
                         time.sleep(0.3)
                 else: raise RuntimeError("Server did not recover automatically after PostgreSQL returned")
                 require(True, "database recovery automatically restores monitoring without another platform restart")
+                with opener.open(base_url + '/api/v1/machines', timeout=5) as response:
+                    require(response.status == 200 and json.load(response)['machines'],
+                            'machine management recovers automatically after PostgreSQL returns')
                 with opener.open(base_url+'/api/v1/documents/gpu-comparison',timeout=5) as response:
                     require(json.load(response)==saved_document, 'saved Markdown persists across real platform and PostgreSQL restarts')
+                with opener.open(base_url+'/api/v1/external-platforms',timeout=5) as response:
+                    require({item['id']:item for item in json.load(response)['platforms']} == saved_external_platforms,
+                            'active and archived external shortcuts persist across real platform and PostgreSQL restarts')
                 with opener.open(base_url + "/api/v1/collection-settings", timeout=3) as response:
                     before_restart = json.load(response)["policy"]
                 stop_process(server)
@@ -1303,6 +1338,7 @@ if __name__ == "__main__":
     parser.add_argument("--agent-binary", type=Path)
     parser.add_argument("--machine-onboarding", action="store_true", help="Opt-in SSH/SCP fixture with mocked systemd and a real installed Agent; temporary Paramiko venv required")
     parser.add_argument("--machine-update",action="store_true",help="Focused real SSH update and nonce/hash receipt while remote output stays open")
+    parser.add_argument("--machine-agent-stop",action="store_true",help="Real Basic pause/heartbeat, process stop, no automatic reconnect and redeployment-only recovery")
     parser.add_argument("--machine-redeployment",action="store_true",help="Add real same-UUID uninstalled Agent redeployment coverage; skips the separate three-minute retry-exhaustion scenario")
     parser.add_argument("--machine-admin-credentials",action="store_true",help="Focused real SSH administrator password/key vault and saved-credential operations regression")
     parser.add_argument("--usage-history",action="store_true",help="Standalone seven-day history, cache, calendar boundaries and reader isolation")
@@ -1311,5 +1347,5 @@ if __name__ == "__main__":
     parser.add_argument("--host-netns", required=True)
     parser.add_argument("--host-mntns", required=True)
     args=parser.parse_args()
-    if args.machine_redeployment or args.machine_admin_credentials or args.machine_disk_space or args.machine_update:args.machine_onboarding=True
+    if args.machine_redeployment or args.machine_admin_credentials or args.machine_disk_space or args.machine_update or args.machine_agent_stop:args.machine_onboarding=True
     smoke(args)

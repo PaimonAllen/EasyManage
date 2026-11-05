@@ -50,6 +50,10 @@ mod platform_update;
 #[cfg(target_os = "linux")]
 mod disk_space;
 
+#[path = "agent_service.rs"]
+#[cfg(target_os = "linux")]
+mod agent_service;
+
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const SSH_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -197,7 +201,7 @@ struct PublicTarget {
 
 type UpdateRequest = Credentials;
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Credentials {
     #[serde(default)]
@@ -349,6 +353,8 @@ pub fn router(
     #[cfg(target_os = "linux")]
     machines::restore_ssh(state.clone());
     #[cfg(target_os = "linux")]
+    agent_service::initialize(state.clone());
+    #[cfg(target_os = "linux")]
     disk_space::initialize(state.clone());
     Router::new()
         .route("/api/v1/operations/targets", get(list_targets))
@@ -390,6 +396,8 @@ async fn change_monitoring(
 ) -> Result<Json<serde_json::Value>, Response> {
     // Share the existing per-node mutation lease without opening SSH or charging its login budget.
     let _lease = acquire_node_lease(&state.limits, id, true, false).map_err(IntoResponse::into_response)?;
+    #[cfg(target_os = "linux")]
+    agent_service::require_running(&state.pool,id).await.map_err(IntoResponse::into_response)?;
     crate::agent_control::change(State(state.pool), Path(id), headers, uri, change).await
 }
 
@@ -407,7 +415,7 @@ fn platform_update_routes() -> Router<OperationsState> {
 fn machine_routes() -> Router<OperationsState> {
     #[cfg(target_os = "linux")]
     {
-        machines::router().merge(admin_credentials::router())
+        machines::router().merge(admin_credentials::router()).merge(agent_service::router())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -472,6 +480,8 @@ async fn force_restart_agent(
     Json(credentials): Json<Credentials>,
 ) -> Result<Json<serde_json::Value>, OperationsError> {
     validate_origin(&headers, &uri)?;
+    #[cfg(target_os = "linux")]
+    agent_service::emergency_allowed(&state.registry,node_id)?;
     let target = load_targets(&state.registry)?.into_iter().find(|target| target.node_id == node_id).ok_or(OperationsError::registry())?;
     let credentials = resolve_credentials(&state, &target, &headers, credentials)?;
     force_restart(state, node_id, credentials, false).await
@@ -527,11 +537,15 @@ fn run_force_restart(
 
 fn run_privileged_command(
     target: &Target,
-    mut credentials: Credentials,
+    credentials: Credentials,
     cancellation: &Cancellation,
     invocation: &str,
 ) -> Result<(), OperationsError> {
     let session = ssh_connect(target, &credentials, cancellation)?;
+    run_privileged_on(&session,credentials,invocation)
+}
+
+fn run_privileged_on(session: &Session, mut credentials: Credentials, invocation: &str) -> Result<(),OperationsError> {
     session.set_timeout(50_000);
     let command = if credentials.username == "root" {
         invocation.to_owned()
@@ -722,6 +736,8 @@ fn release_root() -> Result<PathBuf, OperationsError> {
 }
 
 async fn reported_agent_mode(pool: &PgPool, node_id: Uuid) -> Result<bool, OperationsError> {
+    #[cfg(target_os = "linux")]
+    agent_service::require_running(pool,node_id).await?;
     let row = sqlx::query("SELECT n.last_seen, m.metrics->'privilege'->>'mode' AS mode, m.metrics->'privilege'->>'uid' AS uid FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.id=$1")
         .bind(node_id).fetch_optional(pool).await.map_err(|_| OperationsError::busy())?
         .ok_or(OperationsError::bad_request("节点尚未注册"))?;
@@ -1237,6 +1253,8 @@ async fn elevate(
 ) -> Result<Json<serde_json::Value>, OperationsError> {
     validate_origin(&headers, &uri)?;
     let (target, lease) = target_and_lease(&state, node_id, true)?;
+    #[cfg(target_os = "linux")]
+    agent_service::require_running(&state.pool,node_id).await?;
     let credentials = resolve_credentials(&state, &target, &headers, credentials)?;
     if !target.elevation_available() {
         return Err(OperationsError::bad_request(
@@ -1972,6 +1990,14 @@ impl OperationsError {
         Self(
             StatusCode::TOO_MANY_REQUESTS,
             "运维连接过多或尝试过于频繁，请稍后重试",
+        )
+    }
+
+    fn database(error: sqlx::Error) -> Self {
+        tracing::warn!(code=?error.as_database_error().and_then(|error|error.code()), "machine management database unavailable");
+        Self(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "数据库暂不可用，请检查 PostgreSQL；数据库恢复后机器管理会自动恢复",
         )
     }
 }

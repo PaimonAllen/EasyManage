@@ -379,13 +379,6 @@ try {
   const storage = renderToStaticMarkup(React.createElement(BlockDeviceMap, {
     devices: [{ ...devices[0], children: [partition] }, ...devices.slice(1)], disks: [],
   }));
-  const wdStorage=renderToStaticMarkup(React.createElement(BlockDeviceMap,{devices:[
-    {...devices[0],name:'wd-full',path:'/dev/sdb',model:'WDC WD40EFPX-68C6CN0'},
-    {...devices[0],name:'wd-short',path:'/dev/fixture-wd',model:'WDC WD40EFPX-68C'},
-  ],disks:[]}));
-  assert.equal((wdStorage.match(/storage-recording-badge--cmr/g)??[]).length,2);
-  assert.ok(!wdStorage.includes('storage-recording-badge--unknown')&&!wdStorage.includes('ⓘ'));
-  assert.ok(wdStorage.includes('西数 WD Red Plus 官方规格表')&&wdStorage.includes('WD40EFPX-68C6CN0'));
   assert.equal((storage.match(/storage-recording-badge--smr/g) ?? []).length, 2);
   assert.equal((storage.match(/storage-recording-badge--cmr/g) ?? []).length, 1);
   assert.equal((storage.match(/storage-recording-badge--unknown/g) ?? []).length, 1);
@@ -396,6 +389,13 @@ try {
   for (const [, kind, content] of recordingBadges) {
     assert.equal(content.includes("ⓘ"), kind !== "cmr", "green CMR label has no notice icon; other labels retain theirs");
   }
+  const wdStorage=renderToStaticMarkup(React.createElement(BlockDeviceMap,{devices:[
+    {...devices[0],name:'wd-full',path:'/dev/sdb',model:'WDC WD40EFPX-68C6CN0'},
+    {...devices[0],name:'wd-short',path:'/dev/fixture-wd',model:'WDC WD40EFPX-68C'},
+  ],disks:[]}));
+  assert.equal((wdStorage.match(/storage-recording-badge--cmr/g)??[]).length,2);
+  assert.ok(!wdStorage.includes('storage-recording-badge--unknown')&&!wdStorage.includes('ⓘ'));
+  assert.ok(wdStorage.includes('西数 WD Red Plus 官方规格表')&&wdStorage.includes('WD40EFPX-68C6CN0'));
   assert.equal((storage.match(/<details class="storage-device-details">/g) ?? []).length, 5);
   assert.equal((storage.match(/<details class="storage-device-details" open/g) ?? []).length, 0,
     "partition trees start collapsed independently for each disk");
@@ -586,28 +586,65 @@ try {
   const oldAi = renderToStaticMarkup(React.createElement(AiTools, { nodes: [{ id: "old-ai", hostname: "old", online: false, metrics: {} }] }));
   assert.ok(oldAi.includes("尚未收到新版 Agent 的 AI 工具清单"));
   console.log("PASS expanded multi-user AI inventory paths and incomplete-scan reasons, with legacy Agent fallback");
-  const { MachineManagement, MachineMonitoringButton, machineMonitoringLabel, MachineSshDialog, RedeployMachineDialog, SshAuthenticationFields, AgentConnectionSettings, AgentDeploymentFields } = await server.ssrLoadModule("/src/components/MachineManagement.tsx");
+  const { MachineManagement, AddMachineDialog, MachineMonitoringButton, machineMonitoringLabel, MachineSshDialog, RedeployMachineDialog, SshAuthenticationFields, AgentConnectionSettings, AgentDeploymentFields } = await server.ssrLoadModule("/src/components/MachineManagement.tsx");
   const pausedMachine={monitoring_paused:true,monitoring_revision:1,monitoring_applied_revision:1,monitoring_supported:true,control_seen_at:new Date().toISOString()};
-  assert.equal(machineMonitoringLabel(pausedMachine),"已暂停 · 轻量控制在线");
+  assert.equal(machineMonitoringLabel(pausedMachine),"已暂停 · 轻量心跳在线");
   assert.equal(machineMonitoringLabel({...pausedMachine,monitoring_supported:false}),"暂停待确认 · 需更新 Agent");
   assert.equal(machineMonitoringLabel({...pausedMachine,monitoring_applied_revision:0}),"暂停待确认");
-  assert.equal(machineMonitoringLabel({...pausedMachine,control_seen_at:"2020-01-01T00:00:00Z"}),"已暂停 · 控制连接离线");
+  assert.equal(machineMonitoringLabel({...pausedMachine,control_seen_at:"2020-01-01T00:00:00Z"}),"已暂停 · 轻量心跳离线");
   assert.match(machineMonitoringLabel({...pausedMachine,monitoring_paused:false,monitoring_revision:2}),/恢复待确认/);
   assert.equal(machineMonitoringLabel({...pausedMachine,monitoring_paused:false}),"已恢复 · 等待新指标");
+  const legacyMonitoring={monitoring_paused:false,monitoring_supported:false,monitoring_revision:2,monitoring_applied_revision:null,last_seen:new Date().toISOString()};
+  assert.equal(machineMonitoringLabel(legacyMonitoring),"在线",'legacy resume uses real heartbeats rather than an acknowledgement it cannot send');
+  assert.equal(machineMonitoringLabel({...legacyMonitoring,last_seen:'2020-01-01T00:00:00Z'}),"离线 / 等待部署");
+  assert.equal(machineMonitoringLabel({...legacyMonitoring,monitoring_paused:true}),"暂停待确认 · 需更新 Agent");
   const monitoringButton=(machine,busy=false)=>renderToStaticMarkup(React.createElement(MachineMonitoringButton,{machine:{hostname:"Paused fixture",...machine},busy,onToggle:()=>{}}));
   assert.ok(monitoringButton(pausedMachine).includes('aria-label="Paused fixture 恢复监控"'));
   assert.ok(monitoringButton({...pausedMachine,monitoring_paused:false}).includes('aria-label="Paused fixture 暂停监控"'));
+  assert.ok(monitoringButton(legacyMonitoring).includes('当前 Agent 需先更新'));
   assert.ok(monitoringButton({}).includes("需先更新平台后端")&&monitoringButton({}).includes('disabled=""'));
   assert.ok(monitoringButton(pausedMachine,true).includes('disabled=""'));
+  const stoppedMachine={node_id:'stopped-fixture',hostname:'Stopped fixture',deployment_mode:'basic',agent_service_state:'stopped',agent_service_desired_stopped:true,agent_service_revision:1,agent_stop_available:true,...pausedMachine};
+  assert.equal(machineMonitoringLabel(stoppedMachine),'Agent 已停止 · 需重新部署');
+  assert.ok(monitoringButton(stoppedMachine).includes('disabled=""')&&monitoringButton(stoppedMachine).includes('只能重新部署'));
+  const {AgentStopButton,AgentStopDialog}=await server.ssrLoadModule('/src/components/AgentStopDialog.tsx');
+  const stopButton=machine=>renderToStaticMarkup(React.createElement(AgentStopButton,{machine,busy:false,onStop:()=>{}}));
+  assert.ok(stopButton({...stoppedMachine,agent_service_state:null,agent_service_desired_stopped:false}).includes('>停止 Agent</button>'));
+  assert.ok(!stopButton({...stoppedMachine,agent_service_state:null,agent_service_desired_stopped:false}).includes('disabled=""'));
+  assert.ok(stopButton(stoppedMachine).includes('Agent 已停止')&&stopButton(stoppedMachine).includes('disabled=""'));
+  const stopDialog=renderToStaticMarkup(React.createElement(AgentStopDialog,{machine:{...stoppedMachine,saved_credentials_usable:true},onClose:()=>{},onStopped:()=>{}}));
+  assert.ok(stopDialog.includes('继续使用只能重新部署 Agent')&&stopDialog.includes('保留 Agent 文件'));
+  assert.ok(stopDialog.includes('确认停止 Agent')&&stopDialog.includes('使用平台已加密保存的 SSH 凭据')&&!stopDialog.includes('type="password"'));
+  const stoppedRedeploy=renderToStaticMarkup(React.createElement(RedeployMachineDialog,{machine:{...stoppedMachine,deployment_mode:'full'},onClose:()=>{},onStarted:()=>{}}));
+  assert.ok(stoppedRedeploy.includes('管理员鉴权')&&stoppedRedeploy.includes('重新部署会恢复 Agent 和监控'));
   console.log("PASS monitoring pause distinguishes confirmed, pending, unsupported, disconnected and resume states");
   const { NodeStatus }=await server.ssrLoadModule("/src/components/NodeStatus.tsx");
   const pausedStatus=(node)=>renderToStaticMarkup(React.createElement(NodeStatus,{node}));
   assert.ok(pausedStatus({monitoring_paused:true,monitoring_revision:1,monitoring_applied_revision:0,online:true}).includes("暂停待确认"));
   const confirmedStatus=pausedStatus({monitoring_paused:true,monitoring_revision:1,monitoring_applied_revision:1,online:false});
   assert.ok(confirmedStatus.includes("监控已暂停")&&confirmedStatus.includes("status--paused")&&!confirmedStatus.includes("status--offline"));
+  assert.ok(pausedStatus({...stoppedMachine,online:false}).includes('Agent 已停止')&&!pausedStatus({...stoppedMachine,online:false}).includes('监控已暂停'));
   const management=renderToStaticMarkup(React.createElement(MachineManagement,{onRefresh:()=>{}}));
   assert.ok(management.includes("机器管理") && management.includes("添加机器") && management.includes("软删除保留历史和身份"));
-  assert.ok(management.includes("查看受管机器与已删除机器") && management.includes("disabled"));
+  assert.ok(management.includes("查看受管机器与已删除机器") && management.includes("外部平台入口管理"));
+  assert.ok(management.includes('<details class="machine-list" open="">'),'machine action buttons are in the default-open management list');
+  assert.ok(!management.includes('aria-label="Agent 监控开关"'),'monitoring uses the shared action buttons without a separate module');
+  assert.ok(!/<button[^>]*disabled[^>]*>添加机器<\/button>/.test(management),'external shortcuts stay available without Agent candidates');
+  const externalAdd=renderToStaticMarkup(React.createElement(AddMachineDialog,{agentAvailable:false,onClose:()=>{},onStarted:()=>{},onExternalSaved:()=>{}}));
+  assert.ok(externalAdd.includes('value="external" selected=""')&&externalAdd.includes('type="url"')&&externalAdd.includes('value="agent" disabled=""'));
+  assert.ok(!externalAdd.includes('type="password"')&&!externalAdd.includes('type="file"'));
+  const agentAdd=renderToStaticMarkup(React.createElement(AddMachineDialog,{agentAvailable:true,onClose:()=>{},onStarted:()=>{},onExternalSaved:()=>{}}));
+  assert.ok(agentAdd.includes('value="agent" selected=""')&&agentAdd.includes('value="basic" selected=""')&&agentAdd.includes('检查 SSH 主机指纹'));
+  const {ExternalPlatformCard,ExternalPlatformManagement}=await server.ssrLoadModule('/src/components/ExternalPlatform.tsx');
+  const externalFixture={id:'external-fixture',name:'External <script>fixture</script>',url:'https://compute.example/gpu#console',note:'GPU cloud entry',revision:1,created_at:'fixture',updated_at:'fixture',deleted_at:null};
+  const externalCard=renderToStaticMarkup(React.createElement(ExternalPlatformCard,{platform:externalFixture,onChanged:()=>{}}));
+  assert.ok(externalCard.includes('前往算力平台')&&externalCard.includes('external-platform-card__launch')&&externalCard.includes('href="https://compute.example/gpu#console" target="_blank" rel="noopener noreferrer"'));
+  assert.ok(!externalCard.includes('<script>fixture</script>')&&!externalCard.includes('history-chart')&&!externalCard.includes('status--online'));
+  const invalidExternal=renderToStaticMarkup(React.createElement(ExternalPlatformCard,{platform:{...externalFixture,url:'javascript:alert(1)'},onChanged:()=>{}}));
+  assert.ok(!invalidExternal.includes('href="javascript:')&&invalidExternal.includes('入口链接无效'));
+  const archivedExternal=renderToStaticMarkup(React.createElement(ExternalPlatformManagement,{platforms:[{...externalFixture,deleted_at:'fixture'}],onChanged:()=>{}}));
+  assert.ok(archivedExternal.includes('已软删除')&&archivedExternal.includes('>恢复</button>'));
+  console.log('PASS external compute cards have a prominent safe link, no fake telemetry, independent add mode and recoverable soft deletion');
   console.log("PASS overview machine management entry, safe default Basic, archive list and unavailable-candidate protection");
   const connectionSettings = renderToStaticMarkup(React.createElement(AgentConnectionSettings,{url:"https://platform.example:8443",busy:false,onChange:()=>{}}));
   assert.ok(connectionSettings.includes("自动写入 Agent 配置") && connectionSettings.includes('value="https://platform.example:8443"'));

@@ -96,7 +96,7 @@ async fn list_live_nodes(
             i64::try_from(state.collection.current().live_seconds + 3).unwrap_or(63),
         );
     let active = LIVE_ACCESS.get(async {
-        sqlx::query_scalar("SELECT n.id FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.deleted_at IS NULL AND NOT n.monitoring_paused AND (n.monitoring_revision=0 OR (n.monitoring_applied_revision IS NULL AND m.metrics IS NOT NULL AND COALESCE(m.agent_control,'null'::jsonb)='null'::jsonb) OR m.agent_control=jsonb_build_object('revision',n.monitoring_revision,'paused',false))")
+        sqlx::query_scalar("SELECT n.id FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.deleted_at IS NULL AND NOT n.monitoring_paused AND NOT EXISTS(SELECT 1 FROM agent_service_controls s WHERE s.node_id=n.id AND (s.desired_stopped OR s.state<>'running')) AND (n.monitoring_revision=0 OR (n.monitoring_applied_revision IS NULL AND m.metrics IS NOT NULL AND COALESCE(m.agent_control,'null'::jsonb)='null'::jsonb) OR m.agent_control=jsonb_build_object('revision',n.monitoring_revision,'paused',false))")
         .fetch_all(&state.pool)
         .await
         .map(|ids| Arc::new(ids.into_iter().collect::<HashSet<Uuid>>()))
@@ -747,12 +747,13 @@ async fn list_nodes(
 async fn load_node_view(state: &AppState, software: bool) -> Result<NodeViewBody, ApiError> {
     let rows = sqlx::query(
         r"
-        SELECT n.id, n.monitoring_paused, n.monitoring_revision, n.monitoring_applied_revision, COALESCE(NULLIF(n.display_name,''),n.hostname) AS hostname, n.os_name, n.os_version, n.kernel_version, n.architecture,
+        SELECT n.id, n.monitoring_paused, n.monitoring_revision, n.monitoring_applied_revision, s.state AS agent_service_state,s.desired_stopped AS agent_service_desired_stopped,s.revision AS agent_service_revision, COALESCE(NULLIF(n.display_name,''),n.hostname) AS hostname, n.os_name, n.os_version, n.kernel_version, n.architecture,
                n.cpu_model, n.cpu_logical_cores, n.cpu_physical_cores, n.agent_version,
                n.last_seen, CASE WHEN $1 AND m.metrics IS NOT NULL THEN m.metrics || jsonb_build_object('software_packages',COALESCE(p.packages,'[]'::jsonb)) ELSE m.metrics END AS metrics
         FROM nodes n
         LEFT JOIN metrics_latest m ON m.node_id = n.id
         LEFT JOIN node_software_inventory p ON p.node_id = n.id
+        LEFT JOIN agent_service_controls s ON s.node_id=n.id
         WHERE n.deleted_at IS NULL
         ORDER BY n.hostname, n.id
         ",
@@ -995,6 +996,9 @@ fn map_node(row: &PgRow, online_cutoff: chrono::DateTime<Utc>) -> Result<NodeSum
         .map_err(|error| ApiError::internal(error.to_string()))?;
 
     Ok(NodeSummary {
+        agent_service_state: row.try_get("agent_service_state").map_err(ApiError::database)?,
+        agent_service_desired_stopped: row.try_get::<Option<bool>,_>("agent_service_desired_stopped").map_err(ApiError::database)?.unwrap_or(false),
+        agent_service_revision: row.try_get::<Option<i64>,_>("agent_service_revision").map_err(ApiError::database)?.unwrap_or(0) as u64,
         monitoring_paused,
         monitoring_revision,
         monitoring_applied_revision,
@@ -1018,7 +1022,9 @@ fn map_node(row: &PgRow, online_cutoff: chrono::DateTime<Utc>) -> Result<NodeSum
             .map_err(|_| ApiError::internal("invalid cpu_physical_cores"))?,
         agent_version: row.try_get("agent_version").map_err(ApiError::database)?,
         last_seen,
-        online: !monitoring_paused
+        online: !row.try_get::<Option<bool>,_>("agent_service_desired_stopped").map_err(ApiError::database)?.unwrap_or(false)
+            && row.try_get::<Option<String>,_>("agent_service_state").map_err(ApiError::database)?.is_none_or(|state|state=="running")
+            && !monitoring_paused
             && last_seen >= online_cutoff
             && (monitoring_revision == 0
                 || metrics.as_ref().is_some_and(|snapshot| {

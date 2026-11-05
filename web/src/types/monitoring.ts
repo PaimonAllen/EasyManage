@@ -272,6 +272,9 @@ export interface NetworkActivity {
 }
 
 export interface NodeSummary {
+  agent_service_state?:string|null;
+  agent_service_desired_stopped?:boolean;
+  agent_service_revision?:number;
   monitoring_paused?: boolean;
   monitoring_revision?: number;
   monitoring_applied_revision?: number | null;

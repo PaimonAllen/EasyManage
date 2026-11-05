@@ -8,13 +8,14 @@ import { NodeStatus, PrivilegeBadge } from "../components/NodeStatus";
 import { PageHeading } from "../components/PageHeading";
 import { formatDate } from "../lib/format";
 import type { NodeSummary } from "../types/monitoring";
+import {agentServiceBlocked} from "../components/AgentStopDialog";
 
 function updateHeartbeatAvailable(node: NodeSummary): boolean {
   // A pause request hides monitoring, not the real heartbeat of a legacy
   // collector that still needs this update to implement the requested pause.
   const age=Date.now()-Date.parse(node.last_seen);
-  return node.online || Boolean(node.monitoring_paused && node.metrics?.agent_control==null
-    && Number.isFinite(age) && age>=-5_000 && age<=45_000);
+  return !agentServiceBlocked(node) && (node.online || Boolean(node.monitoring_paused && node.metrics?.agent_control==null
+    && Number.isFinite(age) && age>=-5_000 && age<=45_000));
 }
 
 export function updateEligible(node: NodeSummary, target?: OperationTarget): boolean {
@@ -25,7 +26,7 @@ export function updateEligible(node: NodeSummary, target?: OperationTarget): boo
 
 function restartEligible(node: NodeSummary, target?: OperationTarget): boolean {
   const privilege = node.metrics?.privilege;
-  return Boolean(target?.restart_available && node.online
+  return Boolean(!agentServiceBlocked(node) && target?.restart_available && node.online
     && ((privilege?.mode === "basic" && privilege.uid !== 0) || (privilege?.mode === "full" && privilege.uid === 0)));
 }
 
@@ -150,7 +151,7 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
         <p className={`hint agent-management-hint ${recovery && !recovery.database_healthy ? "form-error" : ""}`} role="status">{recoveryError || recovery?.message || "正在检查恢复接口…"}</p>
         <div className="table-scroll"><table><thead><tr><th>可信节点</th><th>SSH 目标</th><th>应急操作</th></tr></thead><tbody>
           {targets.map((target) => <tr key={target.node_id}><td><strong>{target.hostname}</strong><small>{nodes.find((node) => node.id === target.node_id)?.online ? "心跳在线" : "心跳离线或暂不可读取"}</small></td>
-            <td>{target.host}:{target.port}</td><td><button className="button button--danger button--small" type="button" disabled={!target.restart_available || busy || Boolean(forceTarget) || Boolean(restarting)} onClick={() => setForceTarget({ target })}>强制重启 Agent</button></td></tr>)}
+            <td>{target.host}:{target.port}</td><td><button className="button button--danger button--small" type="button" disabled={agentServiceBlocked(nodes.find(node=>node.id===target.node_id)??{}) || !target.restart_available || busy || Boolean(forceTarget) || Boolean(restarting)} title="已停止的 Agent 只能重新部署后继续" onClick={() => setForceTarget({ target })}>强制重启 Agent</button></td></tr>)}
         </tbody></table></div>
         {!targets.length && <p className="table-empty">尚未读取到可信 SSH 目标，强制重启暂不可用。</p>}
       </article>

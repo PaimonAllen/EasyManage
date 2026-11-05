@@ -1,0 +1,9 @@
+.external-platform-badge { border-color: var(--violet); color: var(--violet); }
+.external-platform-card__url { max-width: 780px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.external-platform-card__body { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 20px; padding: 24px; }
+.external-platform-card__body > p { flex: 1 1 220px; margin: 0; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+.external-platform-card__launch { min-width: 280px; min-height: 64px; padding: 18px 30px; font-size: 18px; }
+.external-platform-card__launch span { font-size: 25px; line-height: 1; }
+.external-platform-management { margin-top: 18px; }
+.external-platform-management td code { white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 700px) { .external-platform-card__launch { width: 100%; min-width: 0; } }

@@ -527,6 +527,12 @@ pub struct LiveNodeListResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NodeSummary {
     #[serde(default)]
+    pub agent_service_state: Option<String>,
+    #[serde(default)]
+    pub agent_service_desired_stopped: bool,
+    #[serde(default)]
+    pub agent_service_revision: u64,
+    #[serde(default)]
     pub monitoring_paused: bool,
     #[serde(default)]
     pub monitoring_revision: u64,

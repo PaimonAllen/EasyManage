@@ -889,7 +889,14 @@ td .badge {
 .machine-management { margin-bottom: 18px; }
 .machine-management > details, .machine-progress { padding: 12px 18px; }
 .machine-management summary { cursor: pointer; }
-.machine-actions { display: flex; gap: 8px; }
+.machine-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.machine-actions .button { white-space: nowrap; }
+.machine-list table { table-layout: fixed; min-width: 640px; }
+.machine-list th, .machine-list td { padding: 14px 12px; overflow-wrap: anywhere; }
+.machine-list th:last-child { width: 35%; }
+.machine-list .block { white-space: normal; }
+.machine-actions .machine-monitoring-button--pause, .machine-monitoring-warning { color: var(--amber); }
+.machine-actions .machine-monitoring-button--resume { color: var(--cyan); }
 .machine-progress progress { width: 100%; accent-color: var(--cyan); }
 .deployment-log { max-height: 240px; overflow: auto; background: var(--panel); padding: 12px; border: 1px solid var(--border); font: 12px/1.7 monospace; }
 .deployment-log time { color: var(--muted); }

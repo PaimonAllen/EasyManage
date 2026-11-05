@@ -34,12 +34,17 @@ def exercise(previous,current,root,env,url,context,enrollment,log,require):
         stop(process);process=start(current)
         retained_document='# retained Markdown across rollback\n'
         database("INSERT INTO platform_documents(slug,content,revision) VALUES('gpu-comparison','# retained Markdown across rollback'||chr(10),1)")
+        external_id=str(uuid.uuid4())
+        database(f"INSERT INTO external_platforms(id,name,url,revision,deleted_at) VALUES('{external_id}','retained external','https://compute.example/retained',2,NOW())")
+        database(f"INSERT INTO agent_service_controls(node_id,desired_stopped,state,revision) VALUES('{node}',TRUE,'stopped',1)")
         observed=next(n for n in request('/api/v1/nodes')['nodes'] if n['id']==node)
         require(observed['metrics']['software_packages']==packages and observed['metrics']['cpu_usage_percent']==2.5
             and database(f"SELECT COUNT(*) FROM metrics_samples WHERE node_id='{node}'")=="1"
             and database(f"SELECT metrics ? 'software_packages' FROM metrics_latest WHERE node_id='{node}'")=='f',
             'schema upgrade preserves legacy software and history while separating dynamic snapshots')
         stop(process);process=None
+        database((Path(__file__).resolve().parents[2]/'deploy/database/rollback-agent-service.sql').read_text())
+        database((Path(__file__).resolve().parents[2]/'deploy/database/rollback-external-platforms.sql').read_text())
         database((Path(__file__).resolve().parents[2]/'deploy/database/rollback-platform-documents.sql').read_text())
         database((Path(__file__).resolve().parents[2]/'deploy/database/rollback-resource-accounting.sql').read_text())
         process=start(previous)
@@ -51,8 +56,11 @@ def exercise(previous,current,root,env,url,context,enrollment,log,require):
         except urllib.error.HTTPError as error:require(error.code==400,'old backend rejects negotiated compact reports instead of clearing inventory')
         else:raise AssertionError('Old backend silently accepted an incompatible compact report')
         stop(process);process=start(current)
-        require(database('SELECT MAX(version) FROM _sqlx_migrations')=='19','forward migration remains repeatable after an emergency rollback')
+        require(database('SELECT MAX(version) FROM _sqlx_migrations')=='21','forward migration remains repeatable after an emergency rollback')
         require(request('/api/v1/documents/gpu-comparison')['content']==retained_document,'document rollback and upgrade retain saved Markdown instead of restoring the initial reference')
+        require(any(item['id']==external_id and item['deleted_at'] is not None for item in request('/api/v1/external-platforms')['platforms']),'external platform rollback and upgrade retain shortcut identity and soft-delete state')
+        require(request('/api/v1/nodes')['nodes'][0]['agent_service_state']=='stopped' and not request('/api/v1/nodes')['nodes'][0]['online'],
+            'service stop remains distinct from monitoring pause through compatibility rollback and upgrade')
         stop(process);process=None
-        database(f"DELETE FROM metrics_samples WHERE node_id='{node}'; DELETE FROM nodes WHERE id='{node}'; DELETE FROM platform_documents WHERE slug='gpu-comparison'")
+        database(f"DELETE FROM metrics_samples WHERE node_id='{node}'; DELETE FROM agent_service_controls WHERE node_id='{node}'; DELETE FROM nodes WHERE id='{node}'; DELETE FROM platform_documents WHERE slug='gpu-comparison'; DELETE FROM external_platforms WHERE id='{external_id}'")
     finally:stop(process)

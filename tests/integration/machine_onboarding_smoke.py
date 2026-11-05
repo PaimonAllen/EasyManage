@@ -26,7 +26,7 @@ import urllib.request
 import uuid
 
 
-def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False, admin_only=False, disk_only=False, update_only=False):
+def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False, admin_only=False, disk_only=False, update_only=False,service_only=False):
     import paramiko
     logging.getLogger("paramiko").setLevel(logging.CRITICAL)
     mounts = Path("/proc/self/mountinfo").read_text().splitlines()
@@ -510,6 +510,10 @@ sys.exit(0)
         _,machines=request("/api/v1/machines")
         persistent=next(machine for machine in machines["machines"] if machine["node_id"]==node_id)
         require(persistent["connection_mode"]=="ssh" and persistent["ssh_transport"]["connections"]==2,"control and reverse HTTPS use exactly two long TCP SSH connections")
+        if service_only:
+            from agent_service_http_smoke import exercise as exercise_service
+            exercise_service(request,wait_job,begin_redeployment,node_id,current.pw_name,home,ssh_env,base_url,context,restart_controller,require,transports,max_connections)
+            return
         if disk_only:
             dials=len(transports)
             scan_path=f'/api/v1/nodes/{node_id}/disk-space'

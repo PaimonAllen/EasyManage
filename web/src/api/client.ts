@@ -85,6 +85,8 @@ export interface OperationTarget {
 }
 
 export interface ManagedMachine {
+  agent_service_state?:string|null; agent_service_desired_stopped?:boolean; agent_service_revision?:number;
+  agent_service_last_error?:string|null; agent_stop_available?:boolean;
   node_id: string; hostname: string; display_name: string | null; note: string;
   deleted_at: string | null; last_seen: string; host: string | null; port: number | null;
   username: string | null; manageable: boolean;
@@ -117,6 +119,12 @@ export async function setMachineMonitoring(machine: ManagedMachine, paused: bool
     body:JSON.stringify({confirmation:machine.node_id, paused, expected_revision:machine.monitoring_revision}),
   }));
 }
+export async function stopMachineAgent(machine:ManagedMachine,credentials:AdminAuthentication):Promise<{message:string}> {
+  return readResponse(await fetch(`/api/v1/machines/${encodeURIComponent(machine.node_id)}/agent/stop`,{
+    method:"POST",headers:{"Content-Type":"application/json"},cache:"no-store",signal:AbortSignal.timeout(110_000),
+    body:JSON.stringify({confirmation:machine.node_id,expected_revision:machine.agent_service_revision,credentials}),
+  }));
+}
 export async function probeMachine(host: string, port: number): Promise<{fingerprint: string; message: string}> {
   return readResponse(await fetch("/api/v1/machines/probe", { method: "POST", headers: {"Content-Type":"application/json"},
     body: JSON.stringify({host, port}), cache:"no-store", signal:AbortSignal.timeout(30_000) }));
@@ -131,7 +139,7 @@ export async function manageMachineSsh(id: string, request: {action: "connect" |
   return readResponse(await fetch(`/api/v1/machines/${encodeURIComponent(id)}/ssh`, {method:"POST", headers:{"Content-Type":"application/json"},
     body, cache:"no-store", signal:AbortSignal.timeout(110_000)}));
 }
-export async function redeployMachine(id: string, request: {confirmation:string;username:string;server_url:string;connection_mode:"auto"|"direct"|"ssh";use_saved?:boolean} & Partial<MachineAuthentication>): Promise<{job_id:string;job_key:string;node_id:string}> {
+export async function redeployMachine(id: string, request: {confirmation:string;username:string;server_url:string;connection_mode:"auto"|"direct"|"ssh";use_saved?:boolean;administrator?:AdminAuthentication} & Partial<MachineAuthentication>): Promise<{job_id:string;job_key:string;node_id:string}> {
   const body=serializeMachineRequest(request);
   return readResponse(await fetch(`/api/v1/machines/${encodeURIComponent(id)}/redeploy`,{method:"POST",headers:{"Content-Type":"application/json"},
     body,cache:"no-store",signal:AbortSignal.timeout(20_000)}));
