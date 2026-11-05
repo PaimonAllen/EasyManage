@@ -1207,7 +1207,7 @@ def smoke(args):
                                     if response.status==200:return
                             except OSError:time.sleep(0.1)
                         raise RuntimeError('Isolated controller restart failed')
-                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment, args.machine_admin_credentials, args.machine_disk_space, args.machine_update,args.machine_agent_stop)
+                    exercise(args.agent_binary, root, env, base_url, context, enrollment, require, restart_controller, args.machine_redeployment, args.machine_admin_credentials, args.machine_disk_space, args.machine_update,args.machine_agent_stop,args.machine_admin_http2)
                 with opener.open(base_url + "/api/v1/operations/targets", timeout=2) as response:
                     expected_target_count = len(json.load(response)["targets"])
                 with opener.open(base_url+'/api/v1/machines',timeout=5) as response:
@@ -1341,11 +1341,12 @@ if __name__ == "__main__":
     parser.add_argument("--machine-agent-stop",action="store_true",help="Real Basic pause/heartbeat, process stop, no automatic reconnect and redeployment-only recovery")
     parser.add_argument("--machine-redeployment",action="store_true",help="Add real same-UUID uninstalled Agent redeployment coverage; skips the separate three-minute retry-exhaustion scenario")
     parser.add_argument("--machine-admin-credentials",action="store_true",help="Focused real SSH administrator password/key vault and saved-credential operations regression")
+    parser.add_argument("--machine-admin-http2",action="store_true",help="Real TLS/HTTP2 split-cookie administrator authorization, renewal and platform restart")
     parser.add_argument("--usage-history",action="store_true",help="Standalone seven-day history, cache, calendar boundaries and reader isolation")
     parser.add_argument("--disk-space",action="store_true",help="Read-only disk scanner task, permission and database API regression")
     parser.add_argument("--machine-disk-space",action="store_true",help="Focused disk scanner over real persistent SSH with a real Basic Agent")
     parser.add_argument("--host-netns", required=True)
     parser.add_argument("--host-mntns", required=True)
     args=parser.parse_args()
-    if args.machine_redeployment or args.machine_admin_credentials or args.machine_disk_space or args.machine_update or args.machine_agent_stop:args.machine_onboarding=True
+    if args.machine_redeployment or args.machine_admin_credentials or args.machine_disk_space or args.machine_update or args.machine_agent_stop or args.machine_admin_http2:args.machine_onboarding=True
     smoke(args)

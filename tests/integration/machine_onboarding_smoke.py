@@ -26,7 +26,7 @@ import urllib.request
 import uuid
 
 
-def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False, admin_only=False, disk_only=False, update_only=False,service_only=False):
+def exercise(binary, root, environment, base_url, context, enrollment, require, restart_controller=None, redeployment=False, admin_only=False, disk_only=False, update_only=False,service_only=False,http2_only=False):
     import paramiko
     logging.getLogger("paramiko").setLevel(logging.CRITICAL)
     mounts = Path("/proc/self/mountinfo").read_text().splitlines()
@@ -389,7 +389,7 @@ sys.exit(0)
             status,result=request(f'/api/v1/machines/{node_id}/redeploy',body)
             if status!=429 or time.monotonic()>=deadline:return status,result
             time.sleep(5)  # Respect per-node operation limits from earlier tests.
-    def exercise_admin(full_created):
+    def exercise_admin(full_created, http2_only=False):
         admin_path=f'/api/v1/nodes/{full_created["node_id"]}/admin-credentials'
         def admin_request(body):
             deadline=time.monotonic()+70
@@ -399,13 +399,43 @@ sys.exit(0)
                 time.sleep(5)
         require(request(admin_path)[1]=={'available':False},'ordinary transport authorization cannot authorize administrator credential reuse')
         admin_key={'username':current.pw_name,'private_key':ed_private,'passphrase':key_phrase,'sudo_password':password}
-        require(admin_request(admin_key|{'passphrase':'wrong-fixture-key-phrase'})[0]==401,
-                'administrator private-key authentication failure is rejected before vault persistence')
         admin_file=root/'ssh-vault'/('admin-'+full_created['node_id']+'.enc')
-        require(not admin_file.exists(),'failed administrator authentication does not create encrypted credential record')
+        if not http2_only:
+            require(admin_request(admin_key|{'passphrase':'wrong-fixture-key-phrase'})[0]==401,
+                    'administrator private-key authentication failure is rejected before vault persistence')
+            require(not admin_file.exists(),'failed administrator authentication does not create encrypted credential record')
         require(admin_request({'username':current.pw_name,'password':password})[0]==200,
                 'first administrator password authentication verifies root authorization and saves encrypted credentials')
         require(request(admin_path)[1]=={'available':True},'only authorized browser sees saved administrator credentials as usable')
+        if http2_only:
+            # Browsers can encode each cookie as its own HTTP/2 field. Exercise the
+            # real TLS/HTTP2 server, with this machine's admin cookie after another
+            # cookie; fixture capabilities travel through stdin, never argv/logs.
+            import ssl
+            ca_file=mock/'http2-ca.crt'
+            ca_file.write_text(''.join(ssl.DER_cert_to_PEM_cert(value) for value in context.get_ca_certs(binary_form=True)))
+            cookie_name='em_admin_'+full_created['node_id'].replace('-','')
+            cookie_value=next(cookie.value for cookie in cookies if cookie.name==cookie_name)
+            def http2_request(authorized=True,renew=False):
+                curl_config='header = "Cookie: unrelated=fixture"\n'
+                if authorized:curl_config+='header = "Cookie: '+cookie_name+'='+cookie_value+'"\n'
+                if renew:curl_config+='header = "Content-Type: application/json"\nheader = "Origin: '+base_url+'"\ndata = "{\\"use_saved\\":true}"\n'
+                result=subprocess.run(['/usr/bin/curl','--http2','--noproxy','*','--silent','--show-error','--max-time','15',
+                    '--cacert',str(ca_file),'--config','-','--write-out','\n%{http_version}\n%{http_code}',base_url+admin_path],
+                    input=curl_config.encode(),capture_output=True,timeout=17)
+                body,version,code=result.stdout.rsplit(b'\n',2) if result.stdout.count(b'\n')>=2 else (b'{}',b'',b'000')
+                require(result.returncode==0 and version==b'2','administrator regression uses real TLS-verified HTTP/2')
+                return int(code),json.loads(body)
+            code,body=http2_request()
+            require(code==200 and body=={'available':True},
+                    'real HTTP/2 accepts split browser cookies without losing the selected machine administrator authorization')
+            require(http2_request(False)==(200,{'available':False}),'unrelated HTTP/2 cookies do not authorize another browser')
+            code,body=http2_request(renew=True)
+            require(code==200 and body['available'],'HTTP/2 renews encrypted administrator authorization without new passwords or keys')
+            require(request(admin_path)[1]=={'available':True},'HTTP/2 renewal retains existing HTTP/1.1 browser authorization')
+            restart_controller()
+            require(http2_request()==(200,{'available':True}),'HTTP/2 split-cookie administrator authorization survives platform restart')
+            return
         no_cookie=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=context))
         with no_cookie.open(base_url+admin_path,timeout=5) as response:
             require(json.load(response)=={'available':False},'administrator status never authorizes a different browser or reveals credentials')
@@ -446,7 +476,7 @@ sys.exit(0)
         require(not admin_file.exists() and (root/'ssh-vault'/(full_created['node_id']+'.enc')).is_file(),
                 'clearing administrator credentials leaves ordinary SSH transport credentials intact')
     try:
-        if admin_only:
+        if admin_only or http2_only:
             allow_full.set()
             _,probe=request('/api/v1/machines/probe',{'host':'10.222.0.10','port':2222})
             payload={'host':'10.222.0.10','port':2222,'display_name':'Admin SSH fixture','server_url':base_url,
@@ -454,7 +484,7 @@ sys.exit(0)
                 'private_key':ed_private,'passphrase':key_phrase,'sudo_password':password,'deployment_mode':'full','connection_mode':'ssh'}
             status,created=request('/api/v1/machines',payload)
             require(status==200 and wait_job(created)['status']=='success','administrator fixture starts with real Full SSH installation and heartbeat')
-            exercise_admin(created)
+            exercise_admin(created,http2_only)
             return
         _,probe=request("/api/v1/machines/probe",{"host":"10.222.0.9","port":2222})
         require("fingerprint" in probe and not attempts,"onboarding fingerprint probe never sends SSH credentials")

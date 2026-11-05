@@ -1,5 +1,11 @@
 # 裸机部署
 
+## 内网与虚拟网卡 HTTPS 访问
+
+平台默认监听 `0.0.0.0:8443`，客户端来源不绑定物理网卡、VLAN、ZeroTier 或 Tailscale 网段；所有能路由到平台的内网客户端走相同的 HTTPS 和权限流程。页面与 API 使用同一个 HTTPS 地址和端口，来源校验比较当前站点而非固定 IP 清单。来自不同网络的客户端访问同一入口时可沿用各自已验证的浏览器授权；更换访问 IP / 域名属于不同浏览器站点，Cookie 仍按站点隔离。平台读取全部 Cookie 字段，兼容 HTTP/2 的分段发送，不会因主题或其他机器的 Cookie 排在前面而漏掉管理员 / SSH 授权，参见 [RFC 9113 §8.2.3](https://www.rfc-editor.org/rfc/rfc9113.html#section-8.2.3)。
+
+证书 SAN 必须覆盖实际访问的平台地址，包括虚拟网卡 IP；客户端需一次信任现有 EasyManage CA。新增 / 变更网卡 IP 后，可由管理员执行 `EASYMANAGE_OPERATOR_USER=operator bash deploy/linux/operations/renew_controller_tls_for_interfaces.sh --apply`，其中 `operator` 替换为实际平台服务用户。脚本复用现有 root CA 和服务端密钥，备份后仅重签平台叶证书，验证各地址并短暂重启平台，失败尝试回退；不替换 Agent CA 或身份，不开放其他服务。证书不会自动让未信任该 CA 的客户端获得浏览器信任。
+
 ## 暂停 / 恢复整机 Agent 监控
 
 设备总览 → 机器管理 → 展开受管机器，每台未删除机器有「暂停监控 / 恢复监控」。这是暂停采集，不是软删除、断开 SSH 或停止服务；无需重新输入 SSH 凭据、重新部署或更换 UUID。原权限、历史及身份保留，用户/权限检查独立开关也保持原设置。

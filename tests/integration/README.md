@@ -1,5 +1,7 @@
 # 隔离集成测试
 
+HTTP/2 浏览器授权：`isolated_smoke.py --machine-admin-http2 --agent-binary ...` 使用下述 Paramiko 环境和支持 HTTP/2 的 `/usr/bin/curl`。在私有 TLS/SSH/PostgreSQL 中完成首次管理员验证，用 stdin 提供合成 Cookie，验证分段 Cookie 排在其他 Cookie 后仍可读取管理员授权、无 Cookie 不授权、保存凭据续期兼容 HTTP/1.1，以及平台重启后的授权保留；不调用生产运维接口。来源校验单测覆盖物理 LAN、任意私网 VLAN、ZeroTier、Tailscale、IPv6 overlay 和内部 DNS，不以客户端网段作为授权。
+
 完全停止 Agent：`agent_service_stop_smoke.py` 使用私有嵌套命名空间和 mock systemd，验证 Full、systemd Basic 和真实兼容守护的停服、禁用自动拉起、错误 UUID / Full 账户拒绝，以及文件 / 身份库字节保留。`isolated_smoke.py --machine-agent-stop --agent-binary ...` 另需下述 Paramiko venv；执行真实 SSH、真实 Agent 和临时 PostgreSQL，区分暂停后原进程轻量心跳与停止后进程退出，验证三连接上限、保存凭据授权、停止后禁止直接恢复 / 重启 / SSH 重连、原 UUID 重新部署恢复和平台重启不自动拨号。Full 系统服务管理仍为隔离 mock，不在生产上执行停服验证。
 
 存储挂载回归：Agent `platform::linux::mounts::tests` 使用合成 mountinfo 验证 NFS/autofs 清单、绑定目录身份、未知容量、转义路径和凭据不输出，不连接网络文件系统。HTTPS smoke 验证新增元数据入库与旧 Agent 兼容，且未知 NFS I/O 不影响已有块设备的速率。前端 `storageMounts.test.ts` 和 SSR 验证启动分区默认隐藏、真实布局保留、共享容量和未知值显示。

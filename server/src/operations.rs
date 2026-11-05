@@ -2166,6 +2166,9 @@ mod tests {
             "192.168.10.110:8443",      // physical LAN
             "100.108.29.94:8443",       // Tailscale
             "10.78.11.136:8443",        // ZeroTier
+            "172.20.40.5:8443",         // another routed VLAN
+            "10.160.22.10:8443",        // another private network
+            "easymanage.internal:8443", // internal DNS
             "[fd7a:115c:a1e0::1]:8443", // IPv6 overlay
         ] {
             headers.insert("host", host.parse().unwrap());
