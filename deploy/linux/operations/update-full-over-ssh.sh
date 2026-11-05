@@ -8,7 +8,9 @@ stage=$1
 expected_node=$2
 expected_hash=$3
 expected_ca=$4
-[[ "$stage" =~ ^(/home/[a-zA-Z0-9_.-]+|/root)/\.easymanage/staging/agent\.[a-zA-Z0-9]{8}$ ]] || exit 64
+# Direct deployments already stage the verified candidate in the original
+# account's bin directory; SSH-only deployments use a private upload directory.
+[[ "$stage" =~ ^(/home/[a-zA-Z0-9_.-]+|/root)/\.easymanage/(staging/agent\.[a-zA-Z0-9]{8}|bin)$ ]] || exit 64
 [[ "$expected_hash" =~ ^[a-f0-9]{64}$ && "$expected_ca" =~ ^[a-f0-9]{64}$ ]] || exit 64
 [[ "$expected_node" =~ ^[a-f0-9-]{36}$ ]] || exit 64
 for path in "$stage/easymanage-agent" /usr/local/sbin/easymanage-agent /etc/easymanage/agent.env /etc/easymanage/tls/ca.crt /var/lib/easymanage-agent; do
@@ -23,7 +25,9 @@ for path in /usr/local/sbin /usr/local/sbin/easymanage-agent /etc/easymanage /et
     mode=$(stat -c %a "$path")
     (( (8#$mode & 0022) == 0 )) || exit 64
 done
-[[ "$(systemctl show easymanage-agent.service -p User --value)" == root ]] || exit 3
+[[ "$(systemctl show easymanage-agent.service -p LoadState --value)" == loaded ]] || exit 3
+service_user="$(systemctl show easymanage-agent.service -p User --value)"
+[[ "$service_user" == root || -z "$service_user" ]] || exit 3
 [[ "$(sed -n 's/^EASYMANAGE_NODE_ID=//p' /etc/easymanage/agent.env)" == "$expected_node" ]] || exit 64
 printf '%s  %s\n' "$expected_ca" /etc/easymanage/tls/ca.crt | sha256sum --check --status
 [[ -f "$stage/easymanage-agent" && "$(stat -c %s "$stage/easymanage-agent")" -le 268435456 ]] || exit 64

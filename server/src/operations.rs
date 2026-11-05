@@ -822,13 +822,16 @@ async fn update_agent(
         if target.connection_mode == ssh_transport::Mode::Ssh {
             let stage = machines::update_over_ssh(&target, &binary, full)?;
             if full {
-                machines::finish_full_ssh_update(&target, credentials.ok_or(OperationsError::registry())?, stage.as_deref().ok_or(OperationsError::registry())?, &release_hash, &cancellation)?;
+                machines::finish_full_update(&target, credentials.ok_or(OperationsError::registry())?, stage.as_deref().ok_or(OperationsError::registry())?, &release_hash, &cancellation)?;
             }
         } else {
             run_deployment(&script, &root, node_id, action)?;
             if full {
-                target.agent_sha256 = Some(release_hash.clone());
-                promote_agent(&target, credentials.ok_or(OperationsError::registry())?, &cancellation)?;
+                // Updating an existing Full service must not re-promote Basic,
+                // copy its SQLite outbox, or rewrite its system configuration.
+                let stage=target.agent_home.join("bin");
+                machines::finish_full_update(&target,credentials.ok_or(OperationsError::registry())?,
+                    stage.to_str().ok_or(OperationsError::registry())?,&release_hash,&cancellation)?;
                 run_deployment(&script, &root, node_id, "record-full")?;
             }
         }

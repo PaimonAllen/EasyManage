@@ -14,24 +14,35 @@ MOCK = '''#!/usr/bin/python3
 import pathlib,sys
 root=pathlib.Path('/tmp/fixture')
 args=sys.argv[1:]
-if 'show' in args: print('loaded' if 'LoadState' in args else ('' if (root/'implicit-root').exists() else 'root'));sys.exit(0)
+if 'show' in args: print('loaded' if 'LoadState' in args else ('other' if (root/'case').read_text()=='wrong-user' else ('' if (root/'implicit-root').exists() else 'root')));sys.exit(0)
 if 'restart' in args and (root/'case').read_text()=='start-failure': sys.exit(1)
 sys.exit(0)
 '''
 CHECK = '''import hashlib,json,pathlib,subprocess,sys
 root=pathlib.Path('/tmp/fixture');case=(root/'case').read_text()
-stage=pathlib.Path('/home/tester/.easymanage/staging/agent.ABC123xy');stage.mkdir(parents=True)
+stage=pathlib.Path('/home/tester/.easymanage/bin' if case=='direct-large-state' else '/home/tester/.easymanage/staging/agent.ABC123xy');stage.mkdir(parents=True)
 stage.joinpath('easymanage-agent').write_bytes(b'new fixture release')
 binary=pathlib.Path('/usr/local/sbin/easymanage-agent');binary.write_bytes(b'original Full binary');binary.chmod(0o755)
 config=pathlib.Path('/etc/easymanage/agent.env');node='11111111-2222-4333-8444-555555555555'
 config.write_text('EASYMANAGE_NODE_ID='+node+'\\nEASYMANAGE_SERVER_URL=https://old.example:8443\\nEASYMANAGE_ENROLLMENT_TOKEN='+'a'*64+'\\n');config.chmod(0o600)
 ca=pathlib.Path('/etc/easymanage/tls/ca.crt');ca.write_bytes(b'public fixture CA');ca.chmod(0o600)
 state=pathlib.Path('/var/lib/easymanage-agent/state.db');state.write_bytes(b'private unchanged Full identity')
-sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+if case=='direct-large-state':
+ with state.open('r+b') as stream:stream.truncate(96*1024*1024)
+if case=='implicit-root':(root/'implicit-root').touch()
+def sha(path):
+ digest=hashlib.sha256()
+ with path.open('rb') as stream:
+  for chunk in iter(lambda:stream.read(1024*1024),b''):digest.update(chunk)
+ return digest.hexdigest()
+original_state=(state.stat().st_size,sha(state));original_config=config.read_bytes()
 result=subprocess.run(['/bin/bash','-x','/tmp/fixture/update.sh',str(stage),node if case!='wrong-node' else '22222222-2222-4333-8444-555555555555',sha(stage/'easymanage-agent') if case!='bad-hash' else '0'*64,sha(ca)],capture_output=True,timeout=30)
-assert (result.returncode==0)==(case=='valid'),(case,result.returncode,result.stderr.decode()[-1600:])
-assert state.read_bytes()==b'private unchanged Full identity'
-assert binary.read_bytes()==(b'new fixture release' if case=='valid' else b'original Full binary')
+success=case in ('valid','direct-large-state','implicit-root')
+assert (result.returncode==0)==success,(case,result.returncode,result.stderr.decode()[-1600:])
+assert (state.stat().st_size,sha(state))==original_state
+assert config.read_bytes()==original_config
+assert binary.read_bytes()==(b'new fixture release' if success else b'original Full binary')
+if case=='direct-large-state':assert state.stat().st_size>64*1024*1024
 if case=='valid':
  result=subprocess.run(['/usr/bin/python3','/tmp/fixture/network.py','/home/tester/.easymanage',node,'https://127.0.0.1:18443',sha(ca),'full'],input=json.dumps({'enrollment_token':None}).encode(),capture_output=True,timeout=10)
  assert result.returncode==0,result.stderr.decode()
@@ -45,7 +56,7 @@ if case=='valid':
  assert result.returncode==0,'systemd empty User= defaults to root and must not reject an existing loaded Full service'
 '''
 
-for case in ("valid", "bad-hash", "wrong-node", "start-failure"):
+for case in ("valid", "direct-large-state", "implicit-root", "wrong-user", "bad-hash", "wrong-node", "start-failure"):
     with tempfile.TemporaryDirectory(prefix="full-ssh-update.", dir="/tmp") as temporary:
         fixture = Path(temporary)
         (fixture / "systemctl").write_text(MOCK)

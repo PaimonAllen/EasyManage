@@ -51,16 +51,32 @@ url='https://platform.example:8443'
 (base/'config/agent.env').write_text('EASYMANAGE_SERVER_URL='+url+'\\nEASYMANAGE_NODE_ID='+node+'\\nEASYMANAGE_ENROLLMENT_TOKEN='+'a'*64+'\\n')
 (base/'config/agent-launch.json').write_text(json.dumps({'backend':'compatibility'}))
 (base/'state/compat.enabled').touch()
-(base/'state/state.db').write_bytes(b'original-user-identity')
-sha=lambda path:hashlib.sha256(path.read_bytes()).hexdigest()
+state=base/'state/state.db';state.write_bytes(b'original-user-identity')
+case=(root/'case').read_text()
+if case in ('large-state','oversized-state'):
+ with state.open('r+b') as stream:stream.truncate(172236800 if case=='large-state' else 268435457)
+def sha(path):
+ digest=hashlib.sha256()
+ with path.open('rb') as stream:
+  for chunk in iter(lambda:stream.read(1024*1024),b''):digest.update(chunk)
+ return digest.hexdigest()
+original_size=state.stat().st_size
+original_hash=sha(state) if case!='oversized-state' else None
 args=[str(base),'tester',sha(base/'bin/easymanage-agent'),node,url,sha(base/'config/ca.crt')]
 result=subprocess.run(['/bin/bash','/tmp/fixture/promote.sh',*args],capture_output=True,timeout=45)
-success=(root/'case').read_text()=='valid'
+success=case in ('valid','large-state')
 assert (result.returncode==0)==success,(result.returncode,result.stderr.decode()[-500:])
+if case=='oversized-state':
+ assert not (root/'compat-stopped').exists()
+ assert state.stat().st_size==original_size
+ assert '256 MiB limit' in result.stderr.decode()
+ print('PASS state above 256 MiB refused before service changes',flush=True)
+ sys.exit(0)
 assert (root/'compat-stopped').exists()
-assert (base/'state/state.db').read_bytes()==b'original-user-identity'
+assert state.stat().st_size==original_size and sha(state)==original_hash
 if success:
- assert pathlib.Path('/var/lib/easymanage-agent/state.db').read_bytes()==b'original-user-identity'
+ full_state=pathlib.Path('/var/lib/easymanage-agent/state.db')
+ assert full_state.stat().st_size==original_size and sha(full_state)==original_hash
  assert 'User=root' in pathlib.Path('/etc/systemd/system/easymanage-agent.service').read_text()
  assert not (root/'compat-restored').exists()
 else:
@@ -81,7 +97,7 @@ with tempfile.TemporaryDirectory(dir="/tmp",prefix="compat-promotion-test.") as 
         mock.write_text(MOCK)
         mock.chmod(0o755)
         binds.extend(["--ro-bind",str(mock),target])
-    for case in ("valid","start-failure"):
+    for case in ("valid","large-state","oversized-state","start-failure"):
         (root/"case").write_text(case)
         (root/"calls").write_text("")
         (root/"compat-stopped").unlink(missing_ok=True)

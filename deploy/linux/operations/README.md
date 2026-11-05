@@ -2,10 +2,11 @@
 
 这里放平台调用的固定受认证操作脚本；常规安装入口仍位于 `system/` 和 `user/`。
 
-- `promote-agent.sh`：受认证的 Basic → Full 提权及 Full 候选更新，保留节点身份与回滚边界。
+- `promote-agent.sh`：受认证的 Basic → Full 提权，保留节点身份与回滚边界。SQLite 主文件及 WAL / SHM 单文件上限为 256 MiB；既有 Full 使用下述二进制更新器。
 - `install-new-full-agent.sh`：GUI 首次安装 Full 的内嵌固定安装器，仅接受新机器；root/sudo 执行前验证摘要与无既有身份，不依赖用户 linger，不运行普通用户暂存目录里的脚本。失败尝试撤回新增服务并保留恢复数据。
 - `install-full-candidate.sh`：只暂存已验证的 Full 候选包，不由普通用户改变运行中的 root 服务。
 - `restart-full-agent.sh`、`force-restart-service.sh`：受认证的 Agent / 平台重启；不是整机重启。
+- `update-full-over-ssh.sh`：直连和 SSH-only 共用的 Full 更新器。只替换已核验的 Agent 二进制并重启原系统服务，不重新提权安装，不复制或重写 SQLite、配置与服务单元，因此较大的身份 / 待上报数据库不会触发提权安装的文件大小限制。首次 Basic → Full 仍使用 `promote-agent.sh`。
 - `manage-user.sh`：受管理员认证的目标账户操作。
 - `platform-release.py`：平台自身候选发布、完整性检查、独立更新与文件回退；不接触 Agent、私有配置及数据库文件。
 - `renew_controller_tls_for_interfaces.sh --apply`：复用现有 CA 重签用户平台证书，会短暂重启平台，需显式指定服务用户。

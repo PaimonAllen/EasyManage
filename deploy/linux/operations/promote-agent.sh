@@ -17,6 +17,8 @@ expected_ca="${6,,}"
 [[ "$expected_node" =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ ]] || exit 64
 [[ "$expected_url" =~ ^https://([a-zA-Z0-9.-]+|\[[a-fA-F0-9:]+\]):[0-9]+/?$ ]] || exit 64
 started_seconds=$SECONDS
+# Per-file SQLite bound; large legitimate queues must not block promotion.
+state_file_max_bytes=268435456
 operator_home="$(getent passwd "$operator_user" | cut -d: -f6)"
 operator_uid="$(id -u "$operator_user")"
 [[ "$operator_home" == "/home/$operator_user" && "$agent_base" == "$operator_home/.easymanage" ]] || exit 64
@@ -115,7 +117,7 @@ for state_name in state.db state.db-wal state.db-shm; do
     target="$directory/$state_name"
     no_symlink_chain "$target" || die 'Unsafe Agent identity path.'
     if [[ -e "$target" ]]; then
-      regular_file "$target" 67108864 || die 'Agent state is not a bounded regular file.'
+      regular_file "$target" "$state_file_max_bytes" || die 'Agent state is not a regular file within the 256 MiB limit.'
     fi
   done
 done
@@ -244,7 +246,7 @@ for state_name in state.db state.db-wal state.db-shm; do
   if [[ "$full_active" == true ]]; then source_state="$target"; else source_state="$agent_base/state/$state_name"; fi
   no_symlink_chain "$source_state" || die 'Agent identity path changed during promotion.'
   if [[ -e "$source_state" ]]; then
-    regular_file "$source_state" 67108864 || die 'Agent state changed during promotion.'
+    regular_file "$source_state" "$state_file_max_bytes" || die 'Agent state changed during promotion or exceeds the 256 MiB limit.'
     install -m 0600 "$source_state" "$root_stage/new-state/$state_name"
   fi
 done

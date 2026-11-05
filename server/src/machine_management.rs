@@ -1156,16 +1156,10 @@ mod update_receipt_tests {
     }
 }
 
-pub(super) fn finish_full_ssh_update(target: &Target, credentials: Credentials, stage: &str, hash: &str, cancellation: &Cancellation) -> Result<(), OperationsError> {
-    let session = ssh_connect(target, &credentials, cancellation)?;
-    session.set_timeout(60_000);
-    let sudo_password = Zeroizing::new(credentials.sudo_secret().to_owned());
-    let request = AddMachine { host:target.host,port:target.port,display_name:target.hostname.clone(),server_url:target.server_url.clone().unwrap_or_default(),
-        connection_mode:ssh_transport::Mode::Ssh,fingerprint:String::new(),username:credentials.username,deployment_mode:DeploymentMode::Full,
-        sudo_password,auth_method:AuthMethod::Password,password:Zeroizing::new(String::new()),private_key:Zeroizing::new(String::new()),passphrase:Zeroizing::new(String::new()) };
+pub(super) fn finish_full_update(target: &Target, credentials: Credentials, stage: &str, hash: &str, cancellation: &Cancellation) -> Result<(), OperationsError> {
     let invocation = format!("/usr/bin/timeout --signal=TERM --kill-after=3s 50s /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc -c {} -- {} {} {} {}",
         shell_quote(include_str!("../../deploy/linux/operations/update-full-over-ssh.sh")),shell_quote(stage),shell_quote(&target.node_id.to_string()),shell_quote(hash),shell_quote(target.ca_sha256.as_deref().ok_or(OperationsError::registry())?));
-    admin_command(&session,&request,&invocation)
+    run_privileged_command(target,credentials,cancellation,&invocation)
 }
 
 fn deployment_home(username: &str) -> PathBuf {
