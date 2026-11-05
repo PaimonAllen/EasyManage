@@ -12,10 +12,19 @@ test("manufacturer-confirmed models match exact base number and observed hardwar
   const result = diskRecording(disk("ST4000NM0035"))!;
   assert.equal(result.verifiedAt, "2026-09-29");
   assert.ok(result.sources.every(source => source.url.startsWith("https://www.seagate.com/")));
+  for (const model of ["WDC WD40EFPX-68C6CN0", "WDC WD40EFPX-68C", "WD40EFPX", " western digital wd40efpx-68c6cn0 "]) {
+    const wd = diskRecording(disk(model))!;
+    assert.equal(wd.kind, "cmr");
+    assert.equal(wd.matchedModel, "WD40EFPX");
+    assert.equal(wd.verifiedAt, "2026-11-05");
+    assert.ok(wd.sources.every(source => source.url.startsWith("https://documents.westerndigital.com/")));
+    assert.ok(wd.explanation.includes("WD40EFPX") && !wd.explanation.includes("Exos"));
+  }
 });
 
 test("do not infer recording technology from family, prefixes, capacity or missing model", () => {
-  for (const model of ["ST2000DM006", "ST2000DM0050", "ST4000DM000", "ST4000NM0035X", "bridge-ST2000DM005", "ST2000DM005/foo", null]) {
+  for (const model of ["ST2000DM006", "ST2000DM0050", "ST4000DM000", "ST4000NM0035X", "bridge-ST2000DM005", "ST2000DM005/foo",
+    "WD40EFAX", "WD40EFRX", "WDC WD40EFPX0", "WDC WD40EFPXX", "bridge-WD40EFPX", "WD40EFPX/foo", "SEAGATE WD40EFPX", "WDC ST4000NM0035", null]) {
     assert.equal(diskRecording(disk(model))?.kind, "unknown");
     assert.deepEqual(diskRecording(disk(model))?.sources, []);
   }

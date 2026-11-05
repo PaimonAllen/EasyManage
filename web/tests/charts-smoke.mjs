@@ -356,6 +356,13 @@ try {
   const storage = renderToStaticMarkup(React.createElement(BlockDeviceMap, {
     devices: [{ ...devices[0], children: [partition] }, ...devices.slice(1)], disks: [],
   }));
+  const wdStorage=renderToStaticMarkup(React.createElement(BlockDeviceMap,{devices:[
+    {...devices[0],name:'wd-full',path:'/dev/sdb',model:'WDC WD40EFPX-68C6CN0'},
+    {...devices[0],name:'wd-short',path:'/dev/fixture-wd',model:'WDC WD40EFPX-68C'},
+  ],disks:[]}));
+  assert.equal((wdStorage.match(/storage-recording-badge--cmr/g)??[]).length,2);
+  assert.ok(!wdStorage.includes('storage-recording-badge--unknown')&&!wdStorage.includes('ⓘ'));
+  assert.ok(wdStorage.includes('西数 WD Red Plus 官方规格表')&&wdStorage.includes('WD40EFPX-68C6CN0'));
   assert.equal((storage.match(/storage-recording-badge--smr/g) ?? []).length, 2);
   assert.equal((storage.match(/storage-recording-badge--cmr/g) ?? []).length, 1);
   assert.equal((storage.match(/storage-recording-badge--unknown/g) ?? []).length, 1);
