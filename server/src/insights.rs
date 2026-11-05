@@ -91,7 +91,20 @@ pub fn router(
 }
 
 fn targets(path: &PathBuf) -> Result<Vec<LinkTarget>, &'static str> {
-    crate::operations::health_targets(path).map(|targets| targets.into_iter().map(|(node_id,hostname,host,port,ssh_persistent_connected)|LinkTarget{node_id,hostname,host,port,ssh_persistent_connected}).collect())
+    crate::operations::health_targets(path).map(|targets| {
+        targets
+            .into_iter()
+            .map(
+                |(node_id, hostname, host, port, ssh_persistent_connected)| LinkTarget {
+                    node_id,
+                    hostname,
+                    host,
+                    port,
+                    ssh_persistent_connected,
+                },
+            )
+            .collect()
+    })
 }
 
 async fn platform_health(State(state): State<InsightState>) -> Json<Value> {
@@ -153,14 +166,18 @@ async fn platform_health_uncached(state: InsightState) -> Json<Value> {
     let mut checks = JoinSet::new();
     for target in configured {
         checks.spawn(async move {
-            if let Some(connected) = target.ssh_persistent_connected { return (target, connected); }
-            let mut attempt=easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::TcpProbe).begin();
+            if let Some(connected) = target.ssh_persistent_connected {
+                return (target, connected);
+            }
+            let mut attempt =
+                easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::TcpProbe)
+                    .begin();
             let connected = tokio::time::timeout(
                 Duration::from_secs(2),
                 TcpStream::connect(SocketAddr::new(target.host, target.port)),
             )
             .await;
-            attempt.finish(matches!(connected,Ok(Ok(_))));
+            attempt.finish(matches!(connected, Ok(Ok(_))));
             (target, matches!(connected, Ok(Ok(_))))
         });
     }
@@ -212,46 +229,89 @@ async fn platform_health_uncached(state: InsightState) -> Json<Value> {
 }
 
 async fn gitea_uncached(state: InsightState) -> Json<Value> {
+    Json(gitea_observation(&state.http, &state.gitea).await)
+}
+
+// Gitea returns HTTP 424 with useful dependency checks when its database is
+// down. Keep that evidence, and query the version independently of health.
+async fn gitea_observation(http: &reqwest::Client, base: &str) -> Value {
     let started = Instant::now();
-    let health = crate::network::service_request(state
-        .http
-        .get(format!("{}/api/healthz", state.gitea))
-        ,easymanage_protocol::NetworkGroup::HttpService).await;
-    let (reachable, checks, message) = match health {
-        Ok(response) if response.status.is_success() => {
-            let body: Value = response.json().unwrap_or(Value::Null);
-            let passed = body["status"] == "pass";
-            (
-                passed,
-                body["checks"].clone(),
-                if passed {
-                    "健康"
-                } else {
-                    "健康检查未通过"
-                },
-            )
+    let health = crate::network::service_request(
+        http.get(format!("{base}/api/healthz")),
+        easymanage_protocol::NetworkGroup::HttpService,
+    )
+    .await;
+    let (healthy, checks, message, health_http_status) = match health {
+        Ok(response) => {
+            let body = response.json().unwrap_or(Value::Null);
+            let checks = gitea_checks(&body);
+            let passed = response.status.is_success() && body["status"] == "pass";
+            let database_failed = checks["database:ping"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["status"] == "fail"));
+            let message = if passed {
+                "健康".to_owned()
+            } else if database_failed {
+                format!("Gitea 数据库连接失败（HTTP {}）", response.status.as_u16())
+            } else if matches!(body["status"].as_str(), Some("fail" | "warn")) {
+                format!("健康检查未通过（HTTP {}）", response.status.as_u16())
+            } else {
+                format!(
+                    "健康接口返回错误或无效数据（HTTP {}）",
+                    response.status.as_u16()
+                )
+            };
+            (passed, checks, message, Some(response.status.as_u16()))
         }
-        Ok(_) => (false, Value::Null, "健康接口返回错误"),
-        Err(_) => (false, Value::Null, "无法连接本机 Gitea"),
+        Err(_) => (false, Value::Null, "无法连接本机 Gitea".to_owned(), None),
     };
-    let version: Option<String> = if reachable {
-        match crate::network::service_request(state
-            .http
-            .get(format!("{}/api/v1/version", state.gitea))
-            ,easymanage_protocol::NetworkGroup::HttpService).await
-        {
-            Ok(response) if response.status.is_success() => response
-                .json()
-                .ok()
-                .and_then(|body| body["version"].as_str().map(str::to_owned)),
-            _ => None,
-        }
-    } else {
-        None
+    let version: Option<String> = match crate::network::service_request(
+        http.get(format!("{base}/api/v1/version")),
+        easymanage_protocol::NetworkGroup::HttpService,
+    )
+    .await
+    {
+        Ok(response) if response.status.is_success() => response
+            .json()
+            .ok()
+            .and_then(|body| body["version"].as_str().map(str::to_owned)),
+        _ => None,
     };
-    Json(json!({ "generated_at": Utc::now(), "healthy": reachable,
+    json!({ "generated_at": Utc::now(), "healthy": healthy,
         "message": message, "version": version, "latency_ms": started.elapsed().as_millis(),
-        "checks": checks, "source": "本机 Gitea /api/healthz 与 /api/v1/version" }))
+        "health_http_status": health_http_status,
+        "checks": checks, "source": "本机 Gitea /api/healthz 与 /api/v1/version" })
+}
+
+fn gitea_checks(body: &Value) -> Value {
+    let Some(checks) = body["checks"].as_object() else {
+        return Value::Null;
+    };
+    let mut result = serde_json::Map::new();
+    for (name, items) in checks.iter().take(32) {
+        if name.len() > 128 {
+            continue;
+        }
+        let Some(items) = items.as_array() else {
+            continue;
+        };
+        let items: Vec<Value> = items
+            .iter()
+            .take(32)
+            .filter_map(|item| {
+                let status = item["status"]
+                    .as_str()
+                    .filter(|value| matches!(*value, "pass" | "fail" | "warn"))?;
+                // Do not return arbitrary upstream error messages, SQL or secrets.
+                let time = item["time"]
+                    .as_str()
+                    .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok());
+                Some(json!({"status": status, "time": time}))
+            })
+            .collect();
+        result.insert(name.clone(), Value::Array(items));
+    }
+    Value::Object(result)
 }
 
 #[derive(Deserialize)]
@@ -318,7 +378,12 @@ async fn gitea_users_uncached(state: InsightState) -> Json<Value> {
                 .query(&[("sort", "id"), ("order", "asc")])
                 .header(reqwest::header::AUTHORIZATION, format!("token {token}"));
         }
-        let response = match crate::network::service_request(request,easymanage_protocol::NetworkGroup::HttpService).await {
+        let response = match crate::network::service_request(
+            request,
+            easymanage_protocol::NetworkGroup::HttpService,
+        )
+        .await
+        {
             Ok(response) if response.status.is_success() => response,
             Ok(response) => {
                 let message = if verified
@@ -328,6 +393,7 @@ async fn gitea_users_uncached(state: InsightState) -> Json<Value> {
                 } else {
                     "Gitea 用户接口返回错误"
                 };
+                let message = format!("{message}（HTTP {}）", response.status.as_u16());
                 return Json(json!({ "generated_at": Utc::now(), "scope": "unavailable",
                     "users": [], "total_count": null, "truncated": false, "message": message }));
             }
@@ -424,4 +490,90 @@ async fn gitea_users_uncached(state: InsightState) -> Json<Value> {
     Json(json!({ "generated_at": Utc::now(), "scope": scope,
         "users": users, "total_count": total_count, "truncated": !complete,
         "message": message }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn observation(status: &str, body: Value) -> Value {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_owned();
+        let fixture = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 8192];
+                let length = stream.read(&mut request).await.unwrap();
+                let health = request[..length].starts_with(b"GET /api/healthz ");
+                assert!(health || request[..length].starts_with(b"GET /api/v1/version "));
+                let (status, body) = if health {
+                    (status.as_str(), body.to_string())
+                } else {
+                    ("200 OK", json!({"version":"1.26.2"}).to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let result = gitea_observation(&client, &format!("http://{address}")).await;
+        fixture.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn gitea_failed_dependency_keeps_evidence_and_independent_version() {
+        let result = observation("424 Failed Dependency", json!({"status":"fail", "checks":{
+            "database:ping":[{"status":"fail","time":"2026-11-05T06:56:37Z", "output":"private-upstream-database-error"}],
+            "cache:ping":[{"status":"pass","time":"2026-11-05T06:56:37Z"}]
+        }})).await;
+        assert_eq!(result["healthy"], false);
+        assert_eq!(result["version"], "1.26.2");
+        assert_eq!(result["health_http_status"], 424);
+        assert_eq!(result["checks"]["database:ping"][0]["status"], "fail");
+        assert_eq!(result["checks"]["cache:ping"][0]["status"], "pass");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("数据库连接失败")
+        );
+        assert!(!result.to_string().contains("private-upstream"));
+    }
+
+    #[tokio::test]
+    async fn gitea_recovery_and_invalid_responses_are_distinct() {
+        let healthy = observation("200 OK", json!({"status":"pass","checks":{}})).await;
+        assert_eq!(healthy["healthy"], true);
+        for (status, body) in [
+            ("200 OK", json!({"error":"private-error"})),
+            ("502 Bad Gateway", json!({"status":"pass"})),
+        ] {
+            let failed = observation(status, body).await;
+            assert_eq!(failed["healthy"], false);
+            assert_eq!(failed["version"], "1.26.2");
+            assert!(!failed.to_string().contains("private-error"));
+        }
+    }
+
+    #[test]
+    fn gitea_checks_reject_invalid_shapes_and_private_fields() {
+        let checks = gitea_checks(&json!({"checks":{
+            "invalid":"text", "database:ping":[{"status":"private-text"},
+            {"status":"fail","time":"private-time","output":"private-error"}]
+        }}));
+        assert!(checks.get("invalid").is_none());
+        assert_eq!(checks["database:ping"].as_array().unwrap().len(), 1);
+        assert_eq!(checks["database:ping"][0]["time"], Value::Null);
+        assert!(!checks.to_string().contains("private-"));
+    }
 }

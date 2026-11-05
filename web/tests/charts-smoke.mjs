@@ -18,6 +18,17 @@ const server = await createServer({
   server: { middlewareMode: true, watch: null },
 });
 try {
+  const {GiteaDependencyChecks,GiteaAccountSummary}=await server.ssrLoadModule('/src/pages/Gitea.tsx');
+  const failedGitea=renderToStaticMarkup(React.createElement(GiteaDependencyChecks,{checks:{
+    'database:ping':[{status:'fail',time:'2026-11-05T06:56:37Z'}],'cache:ping':[{status:'pass'}],
+  }}));
+  assert.ok(failedGitea.includes('数据库连接')&&failedGitea.includes('缓存连接')&&failedGitea.includes('失败')&&failedGitea.includes('正常'));
+  const unavailableGitea=renderToStaticMarkup(React.createElement(GiteaAccountSummary,{accounts:{scope:'unavailable',users:[]}}));
+  assert.equal((unavailableGitea.match(/>—<\/span>/g)??[]).length,4);
+  assert.ok(unavailableGitea.includes('暂不可用')&&!unavailableGitea.includes('>0</span>'));
+  const emptyGitea=renderToStaticMarkup(React.createElement(GiteaAccountSummary,{accounts:{scope:'public',users:[]}}));
+  assert.equal((emptyGitea.match(/>0<\/span>/g)??[]).length,4);
+  console.log('PASS Gitea failed dependencies stay visible and unavailable accounts are distinct from a verified empty list');
   const { Network, OverlayHealthCard, OverlayLocalDetails } = await server.ssrLoadModule("/src/pages/Network.tsx");
   const networkFixture = { id: "route-one", hostname: "Route machine", online: true, metrics: {
     inventory_collected_at: new Date().toISOString(), routes: [{ destination: "198.51.100.0/24", gateway: "198.51.100.1", interface: "fixture0", metric: 100 }],
