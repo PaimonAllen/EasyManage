@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchAdminCredentials, forgetAdminCredentials, saveAdminCredentials, type AdminAuthentication } from "../api/client";
+import { verifyAdminCredentialScopes } from "../lib/adminCredentialScope";
 
 export function useAdminCredentials(nodeIds: (string | null)[]) {
   const scope = JSON.stringify(nodeIds);
@@ -51,7 +52,8 @@ export function useAdminCredentials(nodeIds: (string | null)[]) {
     clear();
     try {
       // Only fixed read-only root verification runs here. The explicit operation follows it.
-      for (const id of nodeIds) await saveAdminCredentials(id, credentials);
+      await verifyAdminCredentialScopes(nodeIds,
+        id => saveAdminCredentials(id, credentials), id => fetchAdminCredentials(id));
       setAvailable(true); setMode("saved");
       return {use_saved:true};
     } finally {

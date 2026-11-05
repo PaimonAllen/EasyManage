@@ -9,6 +9,7 @@ import { PageHeading } from "../components/PageHeading";
 import { formatDate } from "../lib/format";
 import type { NodeSummary } from "../types/monitoring";
 import {agentServiceBlocked} from "../components/AgentStopDialog";
+import {AdminCredentialScopeError} from "../lib/adminCredentialScope";
 
 function updateHeartbeatAvailable(node: NodeSummary): boolean {
   // A pause request hides monitoring, not the real heartbeat of a legacy
@@ -118,7 +119,11 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
     setResults([]);
     let credentials;
     try { credentials = full.length ? await auth.prepare() : undefined; }
-    catch (caught) { setResults([caught instanceof Error ? caught.message : "管理员验证失败"]); setBusy(false); return; }
+    catch (caught) {
+      const target=caught instanceof AdminCredentialScopeError?chosen.find(node=>node.id===caught.nodeId):undefined;
+      setResults([`${target?`${target.hostname}：`:""}${caught instanceof Error?caught.message:"管理员验证失败"}；批量更新尚未开始，可先选择该机器单独鉴权。`]);
+      setBusy(false);return;
+    }
     const progress: string[] = [];
     for (const node of chosen) {
       try {
