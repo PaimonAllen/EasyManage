@@ -230,6 +230,7 @@ async fn collect_and_send(
         )
         .await
         .context("upload batch deadline reached; unacknowledged metrics stay buffered")??;
+        store.maintain_if_due().await;
     }
     Ok(())
 }

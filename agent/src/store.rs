@@ -7,10 +7,12 @@ use std::path::Path;
 use uuid::Uuid;
 
 const OUTBOX_LIMIT: i64 = 1_000;
+mod maintenance;
 
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+    maintenance: std::sync::Arc<maintenance::Maintenance>,
 }
 
 impl Store {
@@ -143,11 +145,16 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             state_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        let options = SqliteConnectOptions::new()
+        let fresh = state_file.metadata()?.len() == 0;
+        let mut options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal);
+            .journal_mode(SqliteJournalMode::Wal)
+            .pragma("journal_size_limit", "4194304");
+        if fresh {
+            options = options.pragma("auto_vacuum", "INCREMENTAL");
+        }
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -174,7 +181,10 @@ impl Store {
         .await
         .context("failed to initialize agent state database")?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            maintenance: std::sync::Arc::new(maintenance::Maintenance::new(path)),
+        })
     }
 
     pub async fn node_id(&self) -> Result<Uuid> {
@@ -286,7 +296,7 @@ impl Store {
     async fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE metadata.value IS NOT excluded.value",
         )
         .bind(key)
         .bind(value)
@@ -479,6 +489,100 @@ mod tests {
             "3",
             "pre-upgrade report format remains readable"
         );
+    }
+
+    #[tokio::test]
+    async fn unchanged_metadata_does_not_generate_repeated_sqlite_writes() {
+        let state = TemporaryState::new();
+        let store = Store::open(&state.database()).await.unwrap();
+        store
+            .set_metadata("unchanged-setting", "retained")
+            .await
+            .unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            store
+                .set_metadata("unchanged-setting", "retained")
+                .await
+                .unwrap();
+        }
+        let after: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        let journal: i64 = sqlx::query_scalar("PRAGMA journal_size_limit")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(journal, 4 * 1024 * 1024);
+        let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, 2);
+    }
+
+    #[tokio::test]
+    async fn idle_legacy_compaction_keeps_identity_settings_and_unacknowledged_reports() {
+        let state = TemporaryState::new();
+        let store = Store::open(&state.database()).await.unwrap();
+        store
+            .set_metadata("node_id", &Uuid::new_v4().to_string())
+            .await
+            .unwrap();
+        store
+            .set_metadata("agent_token", "retained-test-identity")
+            .await
+            .unwrap();
+        store.save_users_enabled(false).await.unwrap();
+        let identity = store.metadata("node_id").await.unwrap();
+        // Reproduce a legacy non-auto-vacuum database with already freed pages.
+        sqlx::query("PRAGMA auto_vacuum=NONE")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("VACUUM").execute(&store.pool).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE temporary_bloat(payload BLOB); INSERT INTO temporary_bloat VALUES(zeroblob(25165824)); DELETE FROM temporary_bloat;")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        let id = store.enqueue(&report(Uuid::new_v4(), 7)).await.unwrap();
+        assert!(
+            !store.maintain_once().await.unwrap(),
+            "a pending report prevents idle compaction"
+        );
+        assert_eq!(store.oldest().await.unwrap().unwrap().0, id);
+        store.acknowledge(id).await.unwrap();
+        let before = std::fs::metadata(state.database()).unwrap().len();
+        assert!(before > 16 * 1024 * 1024);
+        assert!(store.maintain_once().await.unwrap());
+        let after = std::fs::metadata(state.database()).unwrap().len();
+        assert!(
+            after < 1024 * 1024,
+            "legacy free pages must be physically reclaimed"
+        );
+        assert_eq!(store.metadata("node_id").await.unwrap(), identity);
+        assert_eq!(
+            store.agent_token().await.unwrap().as_deref(),
+            Some("retained-test-identity")
+        );
+        assert!(!store.users_enabled().await.unwrap());
+        assert!(store.oldest().await.unwrap().is_none());
+        let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, 2);
+        store.pool.close().await;
+        let reopened = Store::open(&state.database()).await.unwrap();
+        assert_eq!(reopened.metadata("node_id").await.unwrap(), identity);
+        assert!(!reopened.users_enabled().await.unwrap());
     }
 
     #[tokio::test]
