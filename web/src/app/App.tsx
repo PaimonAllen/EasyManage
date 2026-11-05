@@ -20,6 +20,7 @@ import { Users } from "../pages/Users";
 import type { NodeSummary } from "../types/monitoring";
 
 const Operations = lazy(() => import("../pages/Operations"));
+const GpuComparison = lazy(() => import("../pages/GpuComparison"));
 type Theme = "dark" | "light";
 const THEME_KEY = "easymanage-theme";
 const DOC_THEME_KEY = "vitepress-theme-appearance";
@@ -48,6 +49,7 @@ const pages = [
   { id: "gitea", label: "Gitea 状态" },
   { id: "ai-tools", label: "AI 工具状态" },
   { id: "programming-environment", label: "编程环境" },
+  { id: "gpu-comparison", label: "GPU 性能对比" },
   { id: "agent-management", label: "Agent 管理" },
 ] as const;
 
@@ -60,7 +62,8 @@ function currentPage() {
 export function App() {
   const [page, setPage] = useState(currentPage);
   const [theme, setTheme] = useState<Theme>(savedTheme);
-  const needsFleet = page !== "platform-health" && page !== "gitea";
+  const documentPage = page === "gpu-comparison";
+  const needsFleet = page !== "platform-health" && page !== "gitea" && !documentPage;
   const fleet = useFleet(page === "overview" ? 5_000 : 30_000, needsFleet, page === "software");
   const [config, setConfig] = useState<PlatformConfig>({
     documentation_url: "/guide/easymanage.html",
@@ -70,6 +73,7 @@ export function App() {
   const [targetsError, setTargetsError] = useState("");
   const [configError, setConfigError] = useState("");
   const [elevating, setElevating] = useState<NodeSummary | null>(null);
+  const [documentDirty, setDocumentDirty] = useState(false);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -94,12 +98,20 @@ export function App() {
 
   useEffect(() => {
     const onHashChange = () => {
-      setPage(currentPage());
+      const nextPage = currentPage();
+      if (documentDirty && nextPage !== "gpu-comparison") {
+        if (!window.confirm("GPU 文档有未保存的修改，离开会丢弃草稿。确认离开？可先下载草稿。")) {
+          window.history.replaceState(null, "", "#/gpu-comparison");
+          return;
+        }
+        setDocumentDirty(false);
+      }
+      setPage(nextPage);
       window.scrollTo(0, 0);
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
-  }, []);
+  }, [documentDirty]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -111,6 +123,12 @@ export function App() {
             caught instanceof Error ? caught.message : "平台配置读取失败",
           );
       });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    if (documentPage) return;
+    const controller = new AbortController();
     let pending = false;
     async function refreshTargets() {
       if (pending || document.hidden) return;
@@ -135,7 +153,7 @@ export function App() {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refreshTargets);
     };
-  }, []);
+  }, [documentPage]);
 
   const nodes = fleet.data?.nodes ?? [];
   return (
@@ -151,7 +169,7 @@ export function App() {
             className={`live-indicator ${fleet.error ? "live-indicator--error" : ""}`}
           >
             <i />
-            {fleet.error ? "采集接口连接异常" : page === "overview" ? "总览实时指标每 1 秒刷新" : "每 30 秒刷新"}
+            {documentPage ? "文档按需读取" : fleet.error ? "采集接口连接异常" : page === "overview" ? "总览实时指标每 1 秒刷新" : "每 30 秒刷新"}
           </span>
           <button
             className="theme-toggle"
@@ -227,6 +245,7 @@ export function App() {
         {page === "gitea" && <Gitea />}
         {page === "ai-tools" && <AiTools nodes={nodes} />}
         {page === "programming-environment" && <ProgrammingEnvironment nodes={nodes} />}
+        {documentPage && <Suspense fallback={<div className="loading">正在载入 GPU 文档…</div>}><GpuComparison onDirtyChange={setDocumentDirty} /></Suspense>}
         {page === "agent-management" && <AgentManagement nodes={nodes} targets={targets} onRefresh={() => void fleet.refresh()} onElevate={setElevating} />}
         {page === "operations" && (
           <Suspense fallback={<div className="loading">正在载入终端…</div>}>

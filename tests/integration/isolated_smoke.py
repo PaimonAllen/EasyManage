@@ -1180,6 +1180,8 @@ def smoke(args):
                         raise RuntimeError("Isolated EasyManage server did not become ready")
                     time.sleep(0.1)
                 exercise_api(base_url, context, enrollment, node_id)
+                from documents_smoke import exercise as exercise_documents
+                saved_document = exercise_documents(base_url, context, require)
                 if args.usage_history:
                     from usage_history_smoke import exercise as exercise_usage_history
                     exercise_usage_history(root, base_url, context, enrollment, require)
@@ -1252,6 +1254,8 @@ def smoke(args):
                         time.sleep(0.3)
                 else: raise RuntimeError("Server did not recover automatically after PostgreSQL returned")
                 require(True, "database recovery automatically restores monitoring without another platform restart")
+                with opener.open(base_url+'/api/v1/documents/gpu-comparison',timeout=5) as response:
+                    require(json.load(response)==saved_document, 'saved Markdown persists across real platform and PostgreSQL restarts')
                 with opener.open(base_url + "/api/v1/collection-settings", timeout=3) as response:
                     before_restart = json.load(response)["policy"]
                 stop_process(server)

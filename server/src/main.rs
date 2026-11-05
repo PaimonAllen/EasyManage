@@ -6,6 +6,7 @@ mod api;
 mod collection_settings;
 mod config;
 mod database;
+mod documents;
 mod guide;
 mod insights;
 mod network;
@@ -151,6 +152,7 @@ async fn run() -> Result<()> {
         collection,
     )?)
     .merge(network::router(pool.clone()))
+    .merge(documents::router(pool.clone()))
     .merge(usage_history::router(&pool))
     .merge(performance::router(pool, performance_monitor))
     .merge(guide::router(&config.web_root)?)

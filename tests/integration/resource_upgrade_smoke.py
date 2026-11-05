@@ -1,4 +1,4 @@
-"""Schema 16 -> 18 -> 16 -> 18, using only the parent test's private database."""
+"""Schema 16 -> current -> 16 -> current, using the private test database."""
 import json,subprocess,time,urllib.request,urllib.error,uuid
 from pathlib import Path
 
@@ -32,12 +32,15 @@ def exercise(previous,current,root,env,url,context,enrollment,log,require):
             'load_average_one':0,'load_average_five':0,'load_average_fifteen':0,'disks':[],'networks':[],'gpus':[],'software_packages':packages}
         request('/api/v1/agent/report',{'protocol_version':1,'node_id':node,'agent_version':'fixture','inventory':inventory,'metrics':metrics},{'x-easymanage-agent-token':identity['agent_token']})
         stop(process);process=start(current)
+        retained_document='# retained Markdown across rollback\n'
+        database("INSERT INTO platform_documents(slug,content,revision) VALUES('gpu-comparison','# retained Markdown across rollback'||chr(10),1)")
         observed=next(n for n in request('/api/v1/nodes')['nodes'] if n['id']==node)
         require(observed['metrics']['software_packages']==packages and observed['metrics']['cpu_usage_percent']==2.5
             and database(f"SELECT COUNT(*) FROM metrics_samples WHERE node_id='{node}'")=="1"
             and database(f"SELECT metrics ? 'software_packages' FROM metrics_latest WHERE node_id='{node}'")=='f',
             'schema upgrade preserves legacy software and history while separating dynamic snapshots')
         stop(process);process=None
+        database((Path(__file__).resolve().parents[2]/'deploy/database/rollback-platform-documents.sql').read_text())
         database((Path(__file__).resolve().parents[2]/'deploy/database/rollback-resource-accounting.sql').read_text())
         process=start(previous)
         require(request('/api/v1/nodes')['nodes'][0]['metrics']['software_packages']==packages
@@ -48,7 +51,8 @@ def exercise(previous,current,root,env,url,context,enrollment,log,require):
         except urllib.error.HTTPError as error:require(error.code==400,'old backend rejects negotiated compact reports instead of clearing inventory')
         else:raise AssertionError('Old backend silently accepted an incompatible compact report')
         stop(process);process=start(current)
-        require(database('SELECT MAX(version) FROM _sqlx_migrations')=='18','forward migration remains repeatable after an emergency rollback')
+        require(database('SELECT MAX(version) FROM _sqlx_migrations')=='19','forward migration remains repeatable after an emergency rollback')
+        require(request('/api/v1/documents/gpu-comparison')['content']==retained_document,'document rollback and upgrade retain saved Markdown instead of restoring the initial reference')
         stop(process);process=None
-        database(f"DELETE FROM metrics_samples WHERE node_id='{node}'; DELETE FROM nodes WHERE id='{node}'")
+        database(f"DELETE FROM metrics_samples WHERE node_id='{node}'; DELETE FROM nodes WHERE id='{node}'; DELETE FROM platform_documents WHERE slug='gpu-comparison'")
     finally:stop(process)

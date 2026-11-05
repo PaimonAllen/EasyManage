@@ -29,6 +29,18 @@ try {
   const emptyGitea=renderToStaticMarkup(React.createElement(GiteaAccountSummary,{accounts:{scope:'public',users:[]}}));
   assert.equal((emptyGitea.match(/>0<\/span>/g)??[]).length,4);
   console.log('PASS Gitea failed dependencies stay visible and unavailable accounts are distinct from a verified empty list');
+  const {MarkdownPreview}=await server.ssrLoadModule('/src/components/MarkdownPreview.tsx');
+  const gpuMarkdown=await readFile(new URL('../../server/content/gpu-comparison.md',import.meta.url),'utf8');
+  const gpuReference=renderToStaticMarkup(React.createElement(MarkdownPreview,{content:gpuMarkdown}));
+  assert.equal((gpuReference.match(/<table>/g)??[]).length,2);
+  assert.ok(gpuReference.includes('RTX PRO 6000 Blackwell')&&gpuReference.includes('Tesla V100')&&gpuReference.includes('FP64'));
+  const unsafeMarkdown=renderToStaticMarkup(React.createElement(MarkdownPreview,{content:'# Safe\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\n[bad](javascript:alert)\n\n[good](https://example.com)'}));
+  assert.ok(!unsafeMarkdown.includes('<script')&&!unsafeMarkdown.includes('onerror=')&&!unsafeMarkdown.includes('href="javascript:'));
+  assert.ok(unsafeMarkdown.includes('href="https://example.com"')&&unsafeMarkdown.includes('rel="noopener noreferrer"'));
+  const GpuComparison=(await server.ssrLoadModule('/src/pages/GpuComparison.tsx')).default;
+  const gpuEditor=renderToStaticMarkup(React.createElement(GpuComparison));
+  assert.ok(gpuEditor.includes('GPU 性能对比')&&gpuEditor.includes('重新读取'));
+  console.log('PASS GPU reference preserves supplied tables and Markdown formatting, excludes executable HTML/URLs and keeps links separate from the editor');
   const { Network, OverlayHealthCard, OverlayLocalDetails } = await server.ssrLoadModule("/src/pages/Network.tsx");
   const networkFixture = { id: "route-one", hostname: "Route machine", online: true, metrics: {
     inventory_collected_at: new Date().toISOString(), routes: [{ destination: "198.51.100.0/24", gateway: "198.51.100.1", interface: "fixture0", metric: 100 }],

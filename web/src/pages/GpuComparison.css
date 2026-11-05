@@ -1,0 +1,30 @@
+.gpu-document__toolbar { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.gpu-document__notice { margin: 16px 24px; }
+.gpu-document__reader { padding: 8px 28px 24px; }
+.gpu-document__editor { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 22px; padding: 24px; }
+.gpu-document__editor > * { min-width: 0; }
+.gpu-document__editor > label { display: flex; flex-direction: column; gap: 12px; }
+.gpu-document__editor h3 { margin: 0 0 12px; font-size: 14px; }
+.gpu-document__editor textarea { width: 100%; min-height: 560px; resize: vertical; padding: 14px; border: 1px solid var(--border); border-radius: 8px; color: inherit; background: var(--surface); font: 12px/1.7 "Cascadia Code", "SFMono-Regular", Consolas, monospace; tab-size: 2; }
+.gpu-document__footer { padding-bottom: 18px; }
+.markdown-preview { min-width: 0; line-height: 1.85; font-size: 14px; overflow-wrap: anywhere; }
+.markdown-preview h1 { font-size: 26px; line-height: 1.4; margin: 22px 0 18px; }
+.markdown-preview h2 { font-size: 20px; margin: 26px 0 14px; }
+.markdown-preview h3 { font-size: 16px; margin: 20px 0 10px; }
+.markdown-preview p { margin: 12px 0; }
+.markdown-preview ul, .markdown-preview ol { padding-left: 24px; }
+.markdown-preview li { margin: 5px 0; }
+.markdown-preview blockquote { margin: 16px 0; padding: 4px 16px; color: var(--muted); background: var(--surface); border-left: 3px solid var(--cyan); }
+.markdown-preview a { color: var(--cyan); }
+.markdown-preview code { padding: 2px 5px; background: var(--surface); border-radius: 4px; }
+.markdown-preview pre { overflow-x: auto; padding: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+.markdown-preview pre code { padding: 0; }
+.markdown-preview img { max-width: 100%; height: auto; }
+.markdown-preview hr { border: 0; border-top: 1px solid var(--line); }
+.markdown-table-scroll { overflow-x: auto; max-width: 100%; margin: 18px 0; border: 1px solid var(--line); border-radius: 8px; }
+.markdown-table-scroll table { width: 100%; min-width: 550px; }
+.markdown-table-scroll th, .markdown-table-scroll td { padding: 12px 14px; }
+.markdown-table-scroll th { background: var(--surface); font-weight: 600; }
+.markdown-table-scroll tbody tr:last-child td { border-bottom: 0; }
+@media (max-width: 1100px) { .gpu-document__editor { grid-template-columns: 1fr; } }
+@media (max-width: 700px) { .gpu-document__reader, .gpu-document__editor { padding: 14px; } .gpu-document__toolbar { justify-content: flex-start; } }
