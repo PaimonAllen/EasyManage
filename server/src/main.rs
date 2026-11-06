@@ -101,6 +101,8 @@ async fn run() -> Result<()> {
     let config = Arc::new(ServerConfig::load()?);
     let pool = PgPoolOptions::new()
         .max_connections(config.database_max_connections)
+        .min_connections(0)
+        .idle_timeout(Some(Duration::from_secs(60)))
         .acquire_timeout(Duration::from_secs(3))
         .connect_lazy_with(
             config

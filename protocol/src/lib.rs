@@ -8,6 +8,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// Negotiated compact report lane. Legacy servers must reject, not mistake a
 /// missing software list for an intentionally empty inventory during rollback.
 pub const SOFTWARE_CACHE_PROTOCOL_VERSION: u16 = 2;
+pub const INVENTORY_CACHE_PROTOCOL_VERSION: u16 = 3;
+pub mod report_inventory;
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const ENROLLMENT_TOKEN_HEADER: &str = "x-easymanage-enrollment-token";
 pub const AGENT_TOKEN_HEADER: &str = "x-easymanage-agent-token";
@@ -474,6 +476,8 @@ pub struct EnrollmentResponse {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AgentReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_inventory: Option<String>,
     #[serde(default)]
     pub reuse_software_inventory: bool,
     pub protocol_version: u16,
@@ -485,6 +489,8 @@ pub struct AgentReport {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AgentReportResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_cached: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub software_inventory_cached: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

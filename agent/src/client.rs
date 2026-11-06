@@ -19,6 +19,7 @@ pub struct ServerClient {
     policy: std::sync::Mutex<Option<CollectionPolicy>>,
     control: std::sync::Mutex<Option<AgentControl>>,
     software: std::sync::Mutex<Option<(uuid::Uuid, chrono::DateTime<chrono::Utc>)>>,
+    inventory: std::sync::Mutex<Option<(uuid::Uuid, String)>>,
 }
 
 impl ServerClient {
@@ -48,6 +49,7 @@ impl ServerClient {
 
         Ok(Self {
             software: std::sync::Mutex::new(None),
+            inventory: std::sync::Mutex::new(None),
             http,
             base_url: config.server_url.clone(),
             enrollment_token: config.enrollment_token.clone(),
@@ -84,22 +86,32 @@ impl ServerClient {
                 .lock()
                 .ok()
                 .is_some_and(|cached| *cached == key);
-        let mut compact;
-        let outgoing = if reuse {
-            compact = report.clone();
-            compact.metrics.software_packages.clear();
-            compact.reuse_software_inventory = true;
-            compact.protocol_version = easymanage_protocol::SOFTWARE_CACHE_PROTOCOL_VERSION;
-            &compact
+        // Serialize once; remove only inventory explicitly acknowledged by this server.
+        let mut outgoing = serde_json::to_value(report)?;
+        let inventory = easymanage_protocol::report_inventory::take(&mut outgoing["metrics"]);
+        let inventory_digest = easymanage_protocol::report_inventory::digest(&inventory)?;
+        let reuse_inventory = self.inventory.lock().ok().is_some_and(|cached| {
+            cached.as_ref().is_some_and(|(node, digest)| *node == report.node_id && *digest == inventory_digest)
+        });
+        if reuse_inventory {
+            outgoing["reuse_inventory"] = serde_json::Value::String(inventory_digest.clone());
+            outgoing["protocol_version"] = easymanage_protocol::INVENTORY_CACHE_PROTOCOL_VERSION.into();
         } else {
-            report
-        };
+            easymanage_protocol::report_inventory::restore(&mut outgoing["metrics"], inventory);
+        }
+        if reuse {
+            outgoing["metrics"]["software_packages"] = serde_json::json!([]);
+            outgoing["reuse_software_inventory"] = true.into();
+            if !reuse_inventory {
+                outgoing["protocol_version"] = easymanage_protocol::SOFTWARE_CACHE_PROTOCOL_VERSION.into();
+            }
+        }
         let (mut status, mut body) = self
             .post_bytes(
                 "report",
                 AGENT_TOKEN_HEADER,
                 token,
-                serde_json::to_vec(outgoing)?,
+                serde_json::to_vec(&outgoing)?,
                 NetworkGroup::AgentReport,
             )
             .await
@@ -107,8 +119,11 @@ impl ServerClient {
 
         // A restored/moved database can lose its cache. Retry the durable full
         // report once, without re-enrolling, discarding history or new SSH.
-        if reuse && matches!(status,reqwest::StatusCode::CONFLICT | reqwest::StatusCode::BAD_REQUEST) {
+        if (reuse || reuse_inventory) && matches!(status,reqwest::StatusCode::CONFLICT | reqwest::StatusCode::BAD_REQUEST) {
             if let Ok(mut cached) = self.software.lock() {
+                *cached = None;
+            }
+            if let Ok(mut cached) = self.inventory.lock() {
                 *cached = None;
             }
             (status, body) = self
@@ -137,6 +152,11 @@ impl ServerClient {
             } else {
                 None
             };
+        }
+        if let Ok(mut cached) = self.inventory.lock() {
+            *cached = accepted.inventory_cached
+                .filter(|key| *key == inventory_digest)
+                .map(|key| (report.node_id, key));
         }
         if let Some(control) = accepted.agent_control {
             self.observe_control(control);
@@ -275,6 +295,7 @@ mod tests {
     fn monitoring_control_never_rolls_back_or_changes_at_the_same_revision() {
         let client = ServerClient {
             software: std::sync::Mutex::new(None),
+            inventory: std::sync::Mutex::new(None),
             http: reqwest::Client::new(),
             base_url: String::new(),
             enrollment_token: String::new(),

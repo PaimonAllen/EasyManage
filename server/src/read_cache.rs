@@ -7,7 +7,7 @@ use std::{
 use tokio::sync::Mutex;
 
 static EPOCH: AtomicU64 = AtomicU64::new(0);
-pub const TTL: Duration = Duration::from_secs(1);
+pub const TTL: Duration = Duration::from_secs(30);
 const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn invalidate() {

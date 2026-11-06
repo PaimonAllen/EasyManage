@@ -72,6 +72,8 @@ impl Store {
         sqlx::query("DELETE FROM outbox_software WHERE digest IN (SELECT digest FROM outbox_software LIMIT 16) AND NOT EXISTS(SELECT 1 FROM outbox)")
             .execute(&mut connection)
             .await?;
+        sqlx::query("DELETE FROM outbox_inventory WHERE digest IN (SELECT digest FROM outbox_inventory LIMIT 16) AND NOT EXISTS(SELECT 1 FROM outbox)")
+            .execute(&mut connection).await?;
         let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
             .fetch_one(&mut connection)
             .await?;

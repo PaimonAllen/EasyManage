@@ -209,6 +209,7 @@ async fn collect_and_send(
     metrics.network_activity = Some(easymanage_runtime::network::snapshot(true));
     metrics.agent_control = Some(control.clone());
     let report = AgentReport {
+        reuse_inventory: None,
         reuse_software_inventory: false,
         protocol_version: PROTOCOL_VERSION,
         node_id,

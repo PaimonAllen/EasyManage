@@ -40,7 +40,7 @@ impl ServerConfig {
                 .parse()
                 .context("EASYMANAGE_BIND must be a socket address")?,
             database_url: database_url()?,
-            database_max_connections: env_value("EASYMANAGE_DATABASE_MAX_CONNECTIONS", "10")?
+            database_max_connections: env_value("EASYMANAGE_DATABASE_MAX_CONNECTIONS", "4")?
                 .parse()
                 .context("EASYMANAGE_DATABASE_MAX_CONNECTIONS must be an integer")?,
             enrollment_token: required_secret("EASYMANAGE_ENROLLMENT_TOKEN")?,

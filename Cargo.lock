@@ -536,7 +536,10 @@ name = "easymanage-protocol"
 version = "0.5.0"
 dependencies = [
  "chrono",
+ "hex",
  "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "uuid",
 ]
 

@@ -1,0 +1,6 @@
+# Optional PostgreSQL profile for a small, dedicated EasyManage instance.
+# Copy to that cluster's conf.d directory only after confirming it is dedicated.
+# PostgreSQL must be restarted for shared_buffers to change; Agents buffer reports.
+# Existing data, WAL durability, authentication and retention are unchanged.
+# Larger fleets or sustained history/scan workloads may need a larger buffer.
+shared_buffers = '32MB'

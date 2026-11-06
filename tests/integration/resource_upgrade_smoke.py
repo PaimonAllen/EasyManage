@@ -43,6 +43,7 @@ def exercise(previous,current,root,env,url,context,enrollment,log,require):
             and database(f"SELECT metrics ? 'software_packages' FROM metrics_latest WHERE node_id='{node}'")=='f',
             'schema upgrade preserves legacy software and history while separating dynamic snapshots')
         stop(process);process=None
+        database((Path(__file__).resolve().parents[2]/'deploy/database/rollback-inventory-cache.sql').read_text())
         database((Path(__file__).resolve().parents[2]/'deploy/database/rollback-agent-service.sql').read_text())
         database((Path(__file__).resolve().parents[2]/'deploy/database/rollback-external-platforms.sql').read_text())
         database((Path(__file__).resolve().parents[2]/'deploy/database/rollback-platform-documents.sql').read_text())
@@ -56,7 +57,7 @@ def exercise(previous,current,root,env,url,context,enrollment,log,require):
         except urllib.error.HTTPError as error:require(error.code==400,'old backend rejects negotiated compact reports instead of clearing inventory')
         else:raise AssertionError('Old backend silently accepted an incompatible compact report')
         stop(process);process=start(current)
-        require(database('SELECT MAX(version) FROM _sqlx_migrations')=='21','forward migration remains repeatable after an emergency rollback')
+        require(database('SELECT MAX(version) FROM _sqlx_migrations')=='22','forward migration remains repeatable after an emergency rollback')
         require(request('/api/v1/documents/gpu-comparison')['content']==retained_document,'document rollback and upgrade retain saved Markdown instead of restoring the initial reference')
         require(any(item['id']==external_id and item['deleted_at'] is not None for item in request('/api/v1/external-platforms')['platforms']),'external platform rollback and upgrade retain shortcut identity and soft-delete state')
         require(request('/api/v1/nodes')['nodes'][0]['agent_service_state']=='stopped' and not request('/api/v1/nodes')['nodes'][0]['online'],

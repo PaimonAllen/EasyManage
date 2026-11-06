@@ -63,8 +63,9 @@ export function App() {
   const [page, setPage] = useState(currentPage);
   const [theme, setTheme] = useState<Theme>(savedTheme);
   const documentPage = page === "gpu-comparison";
+  const needsTargets = ["overview", "operations", "agent-management"].includes(page);
   const needsFleet = page !== "platform-health" && page !== "gitea" && !documentPage;
-  const fleet = useFleet(page === "overview" ? 5_000 : 30_000, needsFleet, page === "software");
+  const fleet = useFleet(page === "overview" ? 10_000 : 30_000, needsFleet, page === "software");
   const [config, setConfig] = useState<PlatformConfig>({
     documentation_url: "/guide/easymanage.html",
     operations_enabled: false,
@@ -127,7 +128,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (documentPage) return;
+    if (!needsTargets) return;
     const controller = new AbortController();
     let pending = false;
     async function refreshTargets() {
@@ -146,14 +147,14 @@ export function App() {
       }
     }
     void refreshTargets();
-    const timer = window.setInterval(() => void refreshTargets(), 15_000);
+    const timer = window.setInterval(() => void refreshTargets(), 60_000);
     document.addEventListener("visibilitychange", refreshTargets);
     return () => {
       controller.abort();
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refreshTargets);
     };
-  }, [documentPage]);
+  }, [needsTargets]);
 
   const nodes = fleet.data?.nodes ?? [];
   return (

@@ -136,7 +136,7 @@ async fn mark(
             return Err(error(StatusCode::BAD_REQUEST, "自动通过项无需人工标记"));
         }
         let last_seen: DateTime<Utc> = node.try_get("last_seen").map_err(database_error)?;
-        let latest = sqlx::query("SELECT metrics FROM metrics_latest WHERE node_id=$1 FOR SHARE")
+        let latest = sqlx::query("SELECT COALESCE(i.payload,'{}'::jsonb)||m.metrics AS metrics FROM metrics_latest m LEFT JOIN node_snapshot_inventory i ON i.node_id=m.node_id WHERE m.node_id=$1 FOR SHARE OF m")
             .bind(node_id)
             .fetch_optional(&mut *tx)
             .await
@@ -205,11 +205,11 @@ pub async fn invalidate_changed(
             DELETE FROM permission_reviews r WHERE r.node_id=$1 AND NOT EXISTS (
                 -- Explicitly paused/warming-up new collectors have no new evidence.
                 -- Keep annotations dormant; a fresh audit still invalidates changes.
-                SELECT 1 FROM metrics_latest m WHERE m.node_id=r.node_id
+                SELECT 1 FROM metrics_snapshot m WHERE m.node_id=r.node_id
                 AND m.metrics->'collection_policy'->>'permissions_enabled' IN ('true','false')
                 AND (m.metrics->'permission_audit' IS NULL OR m.metrics->'permission_audit'='null'::jsonb)
             ) AND NOT EXISTS (
-                SELECT 1 FROM metrics_latest m,
+                SELECT 1 FROM metrics_snapshot m,
                     jsonb_array_elements(COALESCE(NULLIF(m.metrics->'permission_audit'->'checks','null'::jsonb),'[]'::jsonb)) AS checks(evidence)
                 WHERE m.node_id=r.node_id AND checks.evidence=r.evidence
             ) RETURNING node_id,evidence,note,marked_at

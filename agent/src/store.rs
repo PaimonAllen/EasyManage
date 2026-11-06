@@ -175,6 +175,9 @@ impl Store {
             CREATE TABLE IF NOT EXISTS outbox_software (
                 digest TEXT PRIMARY KEY, payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS outbox_inventory (
+                digest TEXT PRIMARY KEY, payload TEXT NOT NULL
+            );
             ",
         )
         .execute(&pool)
@@ -224,10 +227,19 @@ impl Store {
         let software = serde_json::to_string(&software)?;
         let key = hex::encode(Sha256::digest(software.as_bytes()));
         value["_software_key"] = serde_json::Value::String(key.clone());
+        let inventory = easymanage_protocol::report_inventory::take(&mut value["metrics"]);
+        let inventory_key = easymanage_protocol::report_inventory::digest(&inventory)?;
+        value["_inventory_key"] = serde_json::Value::String(inventory_key.clone());
+        // Old Agents must reject, rather than publish incomplete inventory after rollback.
+        value["_original_protocol"] = report.protocol_version.into();
+        value["protocol_version"] = easymanage_protocol::INVENTORY_CACHE_PROTOCOL_VERSION.into();
+        let inventory = serde_json::to_string(&inventory)?;
         let payload = serde_json::to_string(&value)?;
         let mut transaction = self.pool.begin().await?;
         let inserted=sqlx::query("INSERT INTO outbox_software(digest,payload) VALUES(?1,?2) ON CONFLICT(digest) DO NOTHING")
             .bind(&key).bind(software).execute(&mut *transaction).await?.rows_affected()>0;
+        let inventory_inserted = sqlx::query("INSERT INTO outbox_inventory(digest,payload) VALUES(?1,?2) ON CONFLICT(digest) DO NOTHING")
+            .bind(&inventory_key).bind(inventory).execute(&mut *transaction).await?.rows_affected()>0;
         let id = sqlx::query("INSERT INTO outbox (payload, created_at) VALUES (?1, ?2)")
             .bind(payload)
             .bind(chrono::Utc::now().to_rfc3339())
@@ -242,6 +254,10 @@ impl Store {
         .await?;
         if inserted {
             sqlx::query("DELETE FROM outbox_software WHERE digest NOT IN (SELECT json_extract(payload,'$._software_key') FROM outbox WHERE json_type(payload,'$._software_key')='text')")
+                .execute(&mut *transaction).await?;
+        }
+        if inventory_inserted {
+            sqlx::query("DELETE FROM outbox_inventory WHERE digest NOT IN (SELECT json_extract(payload,'$._inventory_key') FROM outbox WHERE json_type(payload,'$._inventory_key')='text')")
                 .execute(&mut *transaction).await?;
         }
         transaction.commit().await?;
@@ -268,6 +284,13 @@ impl Store {
                         .await
                         .context("stored software inventory is missing")?;
                 value["metrics"]["software_packages"] = serde_json::from_str(&software)?;
+            }
+            if let Some(key) = value.get("_inventory_key").and_then(serde_json::Value::as_str) {
+                let inventory: String = sqlx::query_scalar("SELECT payload FROM outbox_inventory WHERE digest=?1")
+                    .bind(key).fetch_one(&self.pool).await.context("stored inventory is missing")?;
+                easymanage_protocol::report_inventory::restore(&mut value["metrics"], serde_json::from_str(&inventory)?);
+                value["protocol_version"] = value.get("_original_protocol").cloned()
+                    .context("stored inventory protocol is missing")?;
             }
             let report =
                 serde_json::from_value(value).context("stored metrics report is invalid")?;
@@ -427,6 +450,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!payload.contains("shared-software-marker"));
+        assert!(serde_json::from_str::<serde_json::Value>(&payload).unwrap()["_inventory_key"].is_string());
         report.metrics.software_packages[0].version = "2".into();
         store.enqueue(&report).await.unwrap();
         assert_eq!(
@@ -489,6 +513,34 @@ mod tests {
             "3",
             "pre-upgrade report format remains readable"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_inventory_keeps_each_version_across_restart_without_repeating_large_values() {
+        let state = TemporaryState::new();
+        let store = Store::open(&state.database()).await.unwrap();
+        let mut report = report(Uuid::new_v4(), 1);
+        report.metrics.inventory_collected_at = Some(chrono::Utc::now());
+        report.metrics.hardware_details = Some(serde_json::from_value(serde_json::json!({
+            "collected_at":"2026-11-05T00:00:00Z", "processors":[], "motherboard":[],
+            "memory":[], "graphics":[], "displays":[], "disks":[], "audio":[], "network":[],
+            "notes":[]
+        })).unwrap());
+        let expected = serde_json::to_value(&report).unwrap();
+        let first = store.enqueue(&report).await.unwrap();
+        let second = store.enqueue(&report).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox_inventory")
+            .fetch_one(&store.pool).await.unwrap();
+        assert_eq!(count, 1);
+        report.metrics.inventory_collected_at = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
+        let changed = serde_json::to_value(&report).unwrap();
+        store.enqueue(&report).await.unwrap();
+        store.pool.close().await;
+        let store = Store::open(&state.database()).await.unwrap();
+        assert_eq!(serde_json::to_value(store.oldest().await.unwrap().unwrap().1).unwrap(), expected);
+        store.acknowledge(first).await.unwrap();
+        store.acknowledge(second).await.unwrap();
+        assert_eq!(serde_json::to_value(store.oldest().await.unwrap().unwrap().1).unwrap(), changed);
     }
 
     #[tokio::test]

@@ -287,13 +287,43 @@ async fn report_metrics(
     headers: HeaderMap,
     Json(report): Json<AgentReport>,
 ) -> Result<Json<AgentReportResponse>, ApiError> {
-    if report.reuse_software_inventory {
+    if report.reuse_inventory.is_some() {
+        if report.protocol_version != easymanage_protocol::INVENTORY_CACHE_PROTOCOL_VERSION {
+            return Err(ApiError::bad_request("unsupported inventory cache protocol"));
+        }
+    } else if report.reuse_software_inventory {
         if report.protocol_version != easymanage_protocol::SOFTWARE_CACHE_PROTOCOL_VERSION {
             return Err(ApiError::bad_request("unsupported compact report protocol"));
         }
     } else { verify_protocol(report.protocol_version)?; }
     let provided_token = header_value(&headers, AGENT_TOKEN_HEADER)?;
     authenticate_agent(&state.pool, report.node_id, provided_token, false).await?;
+
+    // One node's cache and latest snapshot must advance together, including catch-up.
+    let mut transaction = state.pool.begin().await.map_err(ApiError::database)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(report.node_id.to_string()).execute(&mut *transaction).await.map_err(ApiError::database)?;
+    let mut metrics_json = serde_json::to_value(&report.metrics)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let inventory_json = easymanage_protocol::report_inventory::take(&mut metrics_json);
+    if let Some(key) = &report.reuse_inventory {
+        if !easymanage_protocol::report_inventory::valid_digest(key)
+            || !easymanage_protocol::report_inventory::empty(&inventory_json) {
+            return Err(ApiError::bad_request("conflicting cached inventory representation"));
+        }
+        let cached: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM node_snapshot_inventory WHERE node_id=$1 AND digest=$2)")
+            .bind(report.node_id).bind(key).fetch_one(&mut *transaction).await.map_err(ApiError::database)?;
+        if !cached {
+            return Err(ApiError { status: StatusCode::CONFLICT, message: "inventory required".into() });
+        }
+    }
+    // Cached cold fields were validated when stored; don't fetch/deserialize them on every heartbeat.
+    let inventory_digest = match &report.reuse_inventory {
+        Some(key) => key.clone(),
+        None => easymanage_protocol::report_inventory::digest(&inventory_json)
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+    };
 
     if report.reuse_software_inventory && !report.metrics.software_packages.is_empty() {
         return Err(ApiError::bad_request(
@@ -449,8 +479,6 @@ async fn report_metrics(
         }
     }
 
-    let mut metrics_json = serde_json::to_value(&report.metrics)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
     metrics_json
         .as_object_mut()
         .expect("snapshot object")
@@ -477,7 +505,6 @@ async fn report_metrics(
     let memory_used = i64::try_from(report.metrics.memory_used_bytes)
         .map_err(|_| ApiError::bad_request("memory_used_bytes exceeds PostgreSQL BIGINT"))?;
     let now = Utc::now();
-    let mut transaction = state.pool.begin().await.map_err(ApiError::database)?;
 
     if report.reuse_software_inventory {
         let exists: bool = sqlx::query_scalar(
@@ -539,7 +566,7 @@ async fn report_metrics(
             .map_err(ApiError::database)?;
     }
 
-    sqlx::query(
+    let latest_write = sqlx::query(
         r"
         INSERT INTO metrics_latest (node_id, collected_at, metrics, updated_at,agent_control)
         VALUES ($1, $2, $3, NOW(),$4)
@@ -559,9 +586,15 @@ async fn report_metrics(
     .await
     .map_err(ApiError::database)?;
 
-    crate::permission_reviews::invalidate_changed(&mut transaction, report.node_id)
-        .await
-        .map_err(ApiError::database)?;
+    if latest_write.rows_affected() > 0 && report.reuse_inventory.is_none() {
+        let changed = sqlx::query("INSERT INTO node_snapshot_inventory(node_id,digest,payload) VALUES($1,$2,$3) ON CONFLICT(node_id) DO UPDATE SET digest=EXCLUDED.digest,payload=EXCLUDED.payload WHERE node_snapshot_inventory.digest IS DISTINCT FROM EXCLUDED.digest")
+            .bind(report.node_id).bind(&inventory_digest).bind(&inventory_json)
+            .execute(&mut *transaction).await.map_err(ApiError::database)?;
+        if changed.rows_affected() > 0 {
+            crate::permission_reviews::invalidate_changed(&mut transaction, report.node_id)
+                .await.map_err(ApiError::database)?;
+        }
+    }
 
     sqlx::query(
         r"
@@ -675,6 +708,7 @@ async fn report_metrics(
     transaction.commit().await.map_err(ApiError::database)?;
     crate::read_cache::invalidate();
     Ok(Json(AgentReportResponse {
+        inventory_cached: (latest_write.rows_affected() > 0).then_some(inventory_digest),
         software_inventory_cached: Some(true),
         agent_control,
         accepted_at: now,
@@ -751,7 +785,7 @@ async fn load_node_view(state: &AppState, software: bool) -> Result<NodeViewBody
                n.cpu_model, n.cpu_logical_cores, n.cpu_physical_cores, n.agent_version,
                n.last_seen, CASE WHEN $1 AND m.metrics IS NOT NULL THEN m.metrics || jsonb_build_object('software_packages',COALESCE(p.packages,'[]'::jsonb)) ELSE m.metrics END AS metrics
         FROM nodes n
-        LEFT JOIN metrics_latest m ON m.node_id = n.id
+        LEFT JOIN metrics_snapshot m ON m.node_id = n.id
         LEFT JOIN node_software_inventory p ON p.node_id = n.id
         LEFT JOIN agent_service_controls s ON s.node_id=n.id
         WHERE n.deleted_at IS NULL

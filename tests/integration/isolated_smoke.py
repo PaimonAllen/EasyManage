@@ -272,6 +272,8 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     require(status==200 and accepted['software_inventory_cached'] is True
             and len(json.dumps(compact))<len(json.dumps(report))*.6,
             'negotiated inventory reuse removes repeated package payloads and accepts retry without duplicate history')
+    from inventory_cache_smoke import exercise as exercise_inventory_cache
+    exercise_inventory_cache(request, require, report, agent_token, accepted)
     with opener.open(base_url+'/api/v1/nodes?include_software=false',timeout=5) as response:
         etag=response.headers['ETag'];light=json.load(response)
     require(not light['nodes'][0]['metrics']['software_packages'],
@@ -1186,6 +1188,10 @@ def smoke(args):
                 saved_document = exercise_documents(base_url, context, require)
                 from external_platforms_smoke import exercise as exercise_external_platforms
                 saved_external_platforms = exercise_external_platforms(base_url, context, require)
+                if args.performance_baseline:
+                    from performance_benchmark import exercise as exercise_performance
+                    exercise_performance(args.performance_baseline, args.server_binary, root, server_env,
+                                         context, enrollment, log, require)
                 if args.usage_history:
                     from usage_history_smoke import exercise as exercise_usage_history
                     exercise_usage_history(root, base_url, context, enrollment, require)
@@ -1334,6 +1340,7 @@ def smoke(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-binary", type=Path, required=True)
+    parser.add_argument("--performance-baseline",type=Path,help="Compare synthetic report payload/CPU/WAL against a previous binary in private databases")
     parser.add_argument("--previous-server-binary",type=Path,help="Optional schema-16 binary to test private forward migration and emergency rollback")
     parser.add_argument("--agent-binary", type=Path)
     parser.add_argument("--machine-onboarding", action="store_true", help="Opt-in SSH/SCP fixture with mocked systemd and a real installed Agent; temporary Paramiko venv required")
