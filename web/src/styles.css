@@ -664,6 +664,11 @@ summary:focus-visible {
   color: white;
   text-decoration: underline;
 }
+.alert--warning {
+  border-color: #69542f;
+  background: #2a2317;
+  color: var(--amber);
+}
 .empty-dashboard {
   text-align: center;
   border-color: var(--line);
@@ -1974,6 +1979,11 @@ select:disabled {
   color: #9c2432;
 }
 :root[data-theme="light"] .alert button { color: #80212d; }
+:root[data-theme="light"] .alert--warning {
+  border-color: #e4d0ab;
+  background: #fff8ec;
+  color: var(--amber);
+}
 :root[data-theme="light"] .empty-dashboard {
   border-color: var(--line);
   background: #fff;

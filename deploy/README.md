@@ -12,6 +12,7 @@
 - `orchestration/`：可信清单、候选发布与分发编排；当前只实现 Linux 目标。
 - `examples/`：可发布的配置示例，不含真实节点身份或凭据。
 - `database/`：PostgreSQL 通用部署说明。
+- `third-party/`：平台探测用第三方源码版本、许可证与独立内核安装说明。
 - `windows/`、`macos/`：原生安装与权限适配的接入清单，不表示已支持。
 - `local/`：Git 忽略的本机清单和私有配置，不随项目发布。
 

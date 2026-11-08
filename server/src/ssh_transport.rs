@@ -87,13 +87,15 @@ impl Auth {
     }
 }
 
-fn authentication_failure(error:&ssh2::Error)->OperationsError {
+fn authentication_failure(error: &ssh2::Error) -> OperationsError {
     match error.code() {
         // libssh2: password expired, rejected authentication/public key,
         // or an unreadable/encrypted key with an invalid passphrase.
-        ssh2::ErrorCode::Session(-15|-18|-19|-48)=>OperationsError(StatusCode::UNAUTHORIZED,
-            "SSH 长连接认证失败，请重新提交有效凭据"),
-        _=>OperationsError::ssh("SSH 鉴权阶段连接超时或中断；将按既定策略重试"),
+        ssh2::ErrorCode::Session(-15 | -18 | -19 | -48) => OperationsError(
+            StatusCode::UNAUTHORIZED,
+            "SSH 长连接认证失败，请重新提交有效凭据",
+        ),
+        _ => OperationsError::ssh("SSH 鉴权阶段连接超时或中断；将按既定策略重试"),
     }
 }
 
@@ -226,11 +228,12 @@ fn dial(host: &Host, address: SocketAddr) -> Result<Arc<Connection>, OperationsE
         .clone()
         .try_acquire_owned()
         .map_err(|_| OperationsError::busy())?;
-    let counters=easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshConnect);
-    let mut attempt=counters.begin();
+    let counters =
+        easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshConnect);
+    let mut attempt = counters.begin();
     let socket = TcpStream::connect_timeout(&address, Duration::from_secs(8))
         .map_err(|_| OperationsError::ssh("SSH 连接失败"))?;
-    let connection=counters.connection();
+    let connection = counters.connection();
     socket
         .set_nodelay(true)
         .map_err(|_| OperationsError::ssh("SSH socket 初始化失败"))?;
@@ -439,9 +442,15 @@ pub(super) fn status(target: &Target) -> serde_json::Value {
         "last_error":state.last_error})
 }
 
-pub(super) fn restore_status(target: &Target, status: &'static str, attempt: u32, error: &'static str) {
-    if let Ok(host) = host(SocketAddr::new(target.host,target.port))
-        && let Ok(mut state) = host.state.lock() {
+pub(super) fn restore_status(
+    target: &Target,
+    status: &'static str,
+    attempt: u32,
+    error: &'static str,
+) {
+    if let Ok(host) = host(SocketAddr::new(target.host, target.port))
+        && let Ok(mut state) = host.state.lock()
+    {
         state.status = status;
         state.retry_attempt = attempt;
         state.last_error = Some(error);
@@ -470,13 +479,18 @@ pub(super) fn stop(target: &Target) -> Result<(), OperationsError> {
     // The libssh2 listener owns the remote port until its worker drops it.
     // Wait for acknowledgement before a manual reconnect can dial/rebind.
     if let Some(done) = done {
-        let deadline = Instant::now()+Duration::from_secs(3);
-        while !done.load(Ordering::Acquire) && Instant::now()<deadline {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !done.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         if !done.load(Ordering::Acquire) {
-            host.state.lock().map_err(|_|OperationsError::busy())?.worker_done = Some(done);
-            return Err(OperationsError::ssh("旧 SSH 会话尚未完全退出；未新建连接，请稍后重试"));
+            host.state
+                .lock()
+                .map_err(|_| OperationsError::busy())?
+                .worker_done = Some(done);
+            return Err(OperationsError::ssh(
+                "旧 SSH 会话尚未完全退出；未新建连接，请稍后重试",
+            ));
         }
     }
     Ok(())
@@ -587,7 +601,11 @@ pub(super) fn start(
     let host_clone = host.clone();
     std::thread::spawn(move || {
         struct Done(Arc<AtomicBool>);
-        impl Drop for Done { fn drop(&mut self) { self.0.store(true,Ordering::Release); } }
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
         let _done = Done(done);
         maintain(host_clone, target, auth, stop, local, tunnel, listener);
     });
@@ -600,8 +618,12 @@ fn retry_delay(attempt: u32) -> Option<Duration> {
 
 fn finish(host: &Host, stop: &Arc<AtomicBool>, status: &'static str) {
     if let Ok(mut state) = host.state.lock()
-        && state.stop.as_ref().is_some_and(|current| Arc::ptr_eq(current,stop)) {
-        for cached in [&state.control,&state.admin].into_iter().flatten() {
+        && state
+            .stop
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, stop))
+    {
+        for cached in [&state.control, &state.admin].into_iter().flatten() {
             let _ = cached.connection.socket.shutdown(Shutdown::Both);
         }
         state.control = None;
@@ -653,7 +675,9 @@ fn maintain(
                 return;
             }
             attempt += 1;
-            if let Ok(mut state) = host.state.lock() { state.retry_attempt = attempt; }
+            if let Ok(mut state) = host.state.lock() {
+                state.retry_attempt = attempt;
+            }
             let result = (|| {
                 let _dial = host.dial.lock().map_err(|_| OperationsError::busy())?;
                 if stop.load(Ordering::Relaxed) {
@@ -703,19 +727,26 @@ fn maintain(
                     // before the old control socket notices EOF; do not retain
                     // that dead cached control forever across retries.
                     drop(control_lease);
-                    if control.is_some() { return Err(error); }
-                    host.state.lock().map_err(|_| OperationsError::busy())?.control = None;
+                    if control.is_some() {
+                        return Err(error);
+                    }
+                    host.state
+                        .lock()
+                        .map_err(|_| OperationsError::busy())?
+                        .control = None;
                     // Rebuild the stale control within THIS retry, not after
                     // another minute. Release its lease/cache before dialing.
-                    let connection = dial(&host,SocketAddr::new(target.host,target.port))?;
-                    verify(&connection,&target)?;
+                    let connection = dial(&host, SocketAddr::new(target.host, target.port))?;
+                    verify(&connection, &target)?;
                     auth.authenticate(&connection.session)?;
-                    let replacement = Cached::new(connection,auth.identity());
+                    let replacement = Cached::new(connection, auth.identity());
                     let check = replacement.lease()?;
-                    verify_listener(&check,port)?;
+                    verify_listener(&check, port)?;
                     drop(check);
                     control = Some(replacement);
-                } else { drop(control_lease); }
+                } else {
+                    drop(control_lease);
+                }
                 let mut state = host.state.lock().map_err(|_| OperationsError::busy())?;
                 if stop.load(Ordering::Relaxed) {
                     return Err(OperationsError::busy());
@@ -742,13 +773,17 @@ fn maintain(
                 Err(error)
                     if error.0 == StatusCode::UNAUTHORIZED || error.0 == StatusCode::CONFLICT =>
                 {
-                    if let Ok(mut state) = host.state.lock() { state.last_error = Some(error.1); }
+                    if let Ok(mut state) = host.state.lock() {
+                        state.last_error = Some(error.1);
+                    }
                     finish(&host, &stop, "authentication_required");
                     // No tight retries against bad credentials or changed host keys.
                     return;
                 }
                 Err(error) => {
-                    if let Ok(mut state) = host.state.lock() { state.last_error = Some(error.1); }
+                    if let Ok(mut state) = host.state.lock() {
+                        state.last_error = Some(error.1);
+                    }
                 }
             }
         }
@@ -849,8 +884,14 @@ fn pump(
                             local_eof: false,
                             eof_sent: false,
                             last_io: Instant::now(),
-                            network_attempt:easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshTunnel).begin(),
-                            _network_connection:easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshTunnel).connection(),
+                            network_attempt: easymanage_runtime::network::counter(
+                                easymanage_protocol::NetworkGroup::SshTunnel,
+                            )
+                            .begin(),
+                            _network_connection: easymanage_runtime::network::counter(
+                                easymanage_protocol::NetworkGroup::SshTunnel,
+                            )
+                            .connection(),
                         });
                     }
                 }
@@ -880,7 +921,10 @@ impl Pipe {
                 Ok(0) => self.remote_eof = self.channel.eof(),
                 Ok(size) => {
                     self.to_local.extend_from_slice(&buffer[..size]);
-                    easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshTunnel).receive(size);
+                    easymanage_runtime::network::counter(
+                        easymanage_protocol::NetworkGroup::SshTunnel,
+                    )
+                    .receive(size);
                     self.last_io = Instant::now();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -923,7 +967,10 @@ impl Pipe {
                 Ok(0) => return Ok(false),
                 Ok(size) => {
                     self.remote_offset += size;
-                    easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::SshTunnel).submit(size);
+                    easymanage_runtime::network::counter(
+                        easymanage_protocol::NetworkGroup::SshTunnel,
+                    )
+                    .submit(size);
                     self.last_io = Instant::now();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -941,11 +988,13 @@ impl Pipe {
                 Err(_) => return Ok(false),
             }
         }
-        let finished=self.remote_eof
+        let finished = self.remote_eof
             && self.local_eof
             && self.to_local.is_empty()
             && self.to_remote.is_empty();
-        if finished { self.network_attempt.finish(true); }
+        if finished {
+            self.network_attempt.finish(true);
+        }
         Ok(!finished)
     }
 }
@@ -954,14 +1003,20 @@ impl Pipe {
 mod tests {
     use super::*;
     #[test]
-    fn network_failures_during_authentication_keep_the_bounded_reconnect_policy(){
-        for code in [-7,-9,-13,-30,-37,-43] {
-            let error=ssh2::Error::new(ssh2::ErrorCode::Session(code),"synthetic transport failure");
-            assert_eq!(authentication_failure(&error).0,StatusCode::BAD_GATEWAY);
+    fn network_failures_during_authentication_keep_the_bounded_reconnect_policy() {
+        for code in [-7, -9, -13, -30, -37, -43] {
+            let error = ssh2::Error::new(
+                ssh2::ErrorCode::Session(code),
+                "synthetic transport failure",
+            );
+            assert_eq!(authentication_failure(&error).0, StatusCode::BAD_GATEWAY);
         }
-        for code in [-15,-18,-19,-48] {
-            let error=ssh2::Error::new(ssh2::ErrorCode::Session(code),"synthetic credential rejection");
-            assert_eq!(authentication_failure(&error).0,StatusCode::UNAUTHORIZED);
+        for code in [-15, -18, -19, -48] {
+            let error = ssh2::Error::new(
+                ssh2::ErrorCode::Session(code),
+                "synthetic credential rejection",
+            );
+            assert_eq!(authentication_failure(&error).0, StatusCode::UNAUTHORIZED);
         }
     }
     #[test]
@@ -976,8 +1031,12 @@ mod tests {
     }
     #[test]
     fn reconnects_wait_one_minute_and_stop_after_three_attempts() {
-        for attempt in 0..3 { assert_eq!(retry_delay(attempt),Some(Duration::from_secs(60))); }
-        for attempt in 3..100 { assert_eq!(retry_delay(attempt),None); }
+        for attempt in 0..3 {
+            assert_eq!(retry_delay(attempt), Some(Duration::from_secs(60)));
+        }
+        for attempt in 3..100 {
+            assert_eq!(retry_delay(attempt), None);
+        }
     }
     #[test]
     fn exhausted_worker_cleanup_never_stops_a_newer_transport() {
@@ -985,13 +1044,13 @@ mod tests {
         let old = Arc::new(AtomicBool::new(false));
         let current = Arc::new(AtomicBool::new(false));
         host.state.lock().unwrap().stop = Some(current.clone());
-        finish(&host,&old,"retry_exhausted");
+        finish(&host, &old, "retry_exhausted");
         assert!(host.state.lock().unwrap().stop.is_some());
-        finish(&host,&current,"retry_exhausted");
+        finish(&host, &current, "retry_exhausted");
         let state = host.state.lock().unwrap();
         assert!(state.stop.is_none());
-        assert_eq!(state.status,"retry_exhausted");
-        assert_eq!(host.slots.available_permits(),3);
+        assert_eq!(state.status, "retry_exhausted");
+        assert_eq!(host.slots.available_permits(), 3);
     }
     #[test]
     fn legacy_targets_default_to_direct_but_onboarding_defaults_to_auto() {

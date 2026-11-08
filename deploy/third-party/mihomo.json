@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/MetaCubeX/mihomo.git",
+  "tag": "v1.19.33",
+  "commit": "3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8",
+  "license": "GPL-3.0",
+  "source_directory": "third_party/mihomo",
+  "linux_amd64_asset": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-v1-v1.19.33.gz",
+  "archive_sha256": "8ec92e7b2fdc6b853ba00156bab7e4e965c8b0d843b8c4ac8ab98795f02ad524",
+  "retrieved_on": "2026-11-06"
+}

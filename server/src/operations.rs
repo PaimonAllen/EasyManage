@@ -171,7 +171,8 @@ impl Target {
     }
 
     fn restart_available(&self) -> bool {
-        (self.default_user != "root" && self.ssh_alias.is_some()) || self.connection_mode == ssh_transport::Mode::Ssh
+        (self.default_user != "root" && self.ssh_alias.is_some())
+            || self.connection_mode == ssh_transport::Mode::Ssh
     }
 }
 
@@ -220,25 +221,49 @@ struct Credentials {
 
 impl Credentials {
     fn sudo_secret(&self) -> &str {
-        if self.sudo_password.is_empty() { &self.password } else { &self.sudo_password }
+        if self.sudo_password.is_empty() {
+            &self.password
+        } else {
+            &self.sudo_password
+        }
     }
     fn is_empty(&self) -> bool {
-        self.username.is_empty() && self.password.is_empty() && self.private_key.is_empty()
-            && self.passphrase.is_empty() && self.sudo_password.is_empty() && !self.use_saved
+        self.username.is_empty()
+            && self.password.is_empty()
+            && self.private_key.is_empty()
+            && self.passphrase.is_empty()
+            && self.sudo_password.is_empty()
+            && !self.use_saved
     }
 }
 
-fn resolve_credentials(state: &OperationsState, target: &Target, headers: &HeaderMap, request: Credentials) -> Result<Credentials, OperationsError> {
+fn resolve_credentials(
+    state: &OperationsState,
+    target: &Target,
+    headers: &HeaderMap,
+    request: Credentials,
+) -> Result<Credentials, OperationsError> {
     #[cfg(target_os = "linux")]
     if request.use_saved {
-        if !request.username.is_empty() || !request.password.is_empty() || !request.private_key.is_empty()
-            || !request.passphrase.is_empty() || !request.sudo_password.is_empty() {
-            return Err(OperationsError::bad_request("不能同时提交保存的凭据和新凭据"));
+        if !request.username.is_empty()
+            || !request.password.is_empty()
+            || !request.private_key.is_empty()
+            || !request.passphrase.is_empty()
+            || !request.sudo_password.is_empty()
+        {
+            return Err(OperationsError::bad_request(
+                "不能同时提交保存的凭据和新凭据",
+            ));
         }
         let saved = ssh_vault::load_admin(&state.registry, target, headers)?;
-        let credentials = Credentials { username: saved.username, password: saved.password,
-            private_key: saved.key, passphrase: saved.passphrase, sudo_password: saved.sudo_password,
-            use_saved: false };
+        let credentials = Credentials {
+            username: saved.username,
+            password: saved.password,
+            private_key: saved.key,
+            passphrase: saved.passphrase,
+            sudo_password: saved.sudo_password,
+            use_saved: false,
+        };
         validate_credentials(&credentials)?;
         return Ok(credentials);
     }
@@ -372,7 +397,10 @@ pub fn router(
         .route("/api/v1/nodes/{node_id}/users/manage", post(manage_user))
         .route("/api/v1/nodes/{node_id}/agent/update", post(update_agent))
         .route("/api/v1/nodes/{node_id}/agent/restart", post(restart_agent))
-        .route("/api/v1/machines/{node_id}/monitoring", post(change_monitoring))
+        .route(
+            "/api/v1/machines/{node_id}/monitoring",
+            post(change_monitoring),
+        )
         .merge(machine_routes())
         .merge(platform_update_routes())
         .merge(disk_space_routes())
@@ -382,9 +410,13 @@ pub fn router(
 
 fn disk_space_routes() -> Router<OperationsState> {
     #[cfg(target_os = "linux")]
-    { disk_space::router() }
+    {
+        disk_space::router()
+    }
     #[cfg(not(target_os = "linux"))]
-    { Router::new() }
+    {
+        Router::new()
+    }
 }
 
 async fn change_monitoring(
@@ -395,9 +427,12 @@ async fn change_monitoring(
     change: Json<crate::agent_control::Change>,
 ) -> Result<Json<serde_json::Value>, Response> {
     // Share the existing per-node mutation lease without opening SSH or charging its login budget.
-    let _lease = acquire_node_lease(&state.limits, id, true, false).map_err(IntoResponse::into_response)?;
+    let _lease =
+        acquire_node_lease(&state.limits, id, true, false).map_err(IntoResponse::into_response)?;
     #[cfg(target_os = "linux")]
-    agent_service::require_running(&state.pool,id).await.map_err(IntoResponse::into_response)?;
+    agent_service::require_running(&state.pool, id)
+        .await
+        .map_err(IntoResponse::into_response)?;
     crate::agent_control::change(State(state.pool), Path(id), headers, uri, change).await
 }
 
@@ -415,7 +450,9 @@ fn platform_update_routes() -> Router<OperationsState> {
 fn machine_routes() -> Router<OperationsState> {
     #[cfg(target_os = "linux")]
     {
-        machines::router().merge(admin_credentials::router()).merge(agent_service::router())
+        machines::router()
+            .merge(admin_credentials::router())
+            .merge(agent_service::router())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -481,8 +518,11 @@ async fn force_restart_agent(
 ) -> Result<Json<serde_json::Value>, OperationsError> {
     validate_origin(&headers, &uri)?;
     #[cfg(target_os = "linux")]
-    agent_service::emergency_allowed(&state.registry,node_id)?;
-    let target = load_targets(&state.registry)?.into_iter().find(|target| target.node_id == node_id).ok_or(OperationsError::registry())?;
+    agent_service::emergency_allowed(&state.registry, node_id)?;
+    let target = load_targets(&state.registry)?
+        .into_iter()
+        .find(|target| target.node_id == node_id)
+        .ok_or(OperationsError::registry())?;
     let credentials = resolve_credentials(&state, &target, &headers, credentials)?;
     force_restart(state, node_id, credentials, false).await
 }
@@ -542,10 +582,14 @@ fn run_privileged_command(
     invocation: &str,
 ) -> Result<(), OperationsError> {
     let session = ssh_connect(target, &credentials, cancellation)?;
-    run_privileged_on(&session,credentials,invocation)
+    run_privileged_on(&session, credentials, invocation)
 }
 
-fn run_privileged_on(session: &Session, mut credentials: Credentials, invocation: &str) -> Result<(),OperationsError> {
+fn run_privileged_on(
+    session: &Session,
+    mut credentials: Credentials,
+    invocation: &str,
+) -> Result<(), OperationsError> {
     session.set_timeout(50_000);
     let command = if credentials.username == "root" {
         invocation.to_owned()
@@ -652,7 +696,13 @@ pub(crate) fn health_targets(
                 .map(|target| {
                     let connected = (target.connection_mode == ssh_transport::Mode::Ssh)
                         .then(|| ssh_transport::status(&target)["status"] == "connected");
-                    (target.node_id, target.hostname, target.host, target.port, connected)
+                    (
+                        target.node_id,
+                        target.hostname,
+                        target.host,
+                        target.port,
+                        connected,
+                    )
                 })
                 .collect()
         })
@@ -737,7 +787,7 @@ fn release_root() -> Result<PathBuf, OperationsError> {
 
 async fn reported_agent_mode(pool: &PgPool, node_id: Uuid) -> Result<bool, OperationsError> {
     #[cfg(target_os = "linux")]
-    agent_service::require_running(pool,node_id).await?;
+    agent_service::require_running(pool, node_id).await?;
     let row = sqlx::query("SELECT n.last_seen, m.metrics->'privilege'->>'mode' AS mode, m.metrics->'privilege'->>'uid' AS uid FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.id=$1")
         .bind(node_id).fetch_optional(pool).await.map_err(|_| OperationsError::busy())?
         .ok_or(OperationsError::bad_request("节点尚未注册"))?;
@@ -785,7 +835,9 @@ async fn update_agent(
     let binary = root.join("target/release/easymanage-agent");
     let script = release_fleet_script(&root);
     check_release_file(&binary)?;
-    if target.connection_mode != ssh_transport::Mode::Ssh { check_private_file(&script)?; }
+    if target.connection_mode != ssh_transport::Mode::Ssh {
+        check_private_file(&script)?;
+    }
     let release_hash = hex::encode(Sha256::digest(
         std::fs::read(&binary).map_err(|_| OperationsError::registry())?,
     ));
@@ -822,16 +874,27 @@ async fn update_agent(
         if target.connection_mode == ssh_transport::Mode::Ssh {
             let stage = machines::update_over_ssh(&target, &binary, full)?;
             if full {
-                machines::finish_full_update(&target, credentials.ok_or(OperationsError::registry())?, stage.as_deref().ok_or(OperationsError::registry())?, &release_hash, &cancellation)?;
+                machines::finish_full_update(
+                    &target,
+                    credentials.ok_or(OperationsError::registry())?,
+                    stage.as_deref().ok_or(OperationsError::registry())?,
+                    &release_hash,
+                    &cancellation,
+                )?;
             }
         } else {
             run_deployment(&script, &root, node_id, action)?;
             if full {
                 // Updating an existing Full service must not re-promote Basic,
                 // copy its SQLite outbox, or rewrite its system configuration.
-                let stage=target.agent_home.join("bin");
-                machines::finish_full_update(&target,credentials.ok_or(OperationsError::registry())?,
-                    stage.to_str().ok_or(OperationsError::registry())?,&release_hash,&cancellation)?;
+                let stage = target.agent_home.join("bin");
+                machines::finish_full_update(
+                    &target,
+                    credentials.ok_or(OperationsError::registry())?,
+                    stage.to_str().ok_or(OperationsError::registry())?,
+                    &release_hash,
+                    &cancellation,
+                )?;
                 run_deployment(&script, &root, node_id, "record-full")?;
             }
         }
@@ -1103,10 +1166,20 @@ fn validate_credentials(credentials: &Credentials) -> Result<(), OperationsError
         || (credentials.password.is_empty() && credentials.private_key.is_empty())
         || (!credentials.password.is_empty() && !credentials.private_key.is_empty())
         || credentials.private_key.len() > 12 * 1024
-        || (!credentials.private_key.is_empty() && (!credentials.private_key.starts_with("-----BEGIN ") || credentials.private_key.contains('\0')))
-        || [&*credentials.password, &*credentials.sudo_password, &*credentials.passphrase].iter().any(|value| value.len() > 1024 || value.bytes().any(|byte| b"\r\n\0".contains(&byte)))
+        || (!credentials.private_key.is_empty()
+            && (!credentials.private_key.starts_with("-----BEGIN ")
+                || credentials.private_key.contains('\0')))
+        || [
+            &*credentials.password,
+            &*credentials.sudo_password,
+            &*credentials.passphrase,
+        ]
+        .iter()
+        .any(|value| value.len() > 1024 || value.bytes().any(|byte| b"\r\n\0".contains(&byte)))
     {
-        return Err(OperationsError::bad_request("管理员用户名、密码或 SSH 私钥格式不正确"));
+        return Err(OperationsError::bad_request(
+            "管理员用户名、密码或 SSH 私钥格式不正确",
+        ));
     }
     Ok(())
 }
@@ -1145,10 +1218,18 @@ fn target_and_lease(
             StatusCode::NOT_FOUND,
             "此节点尚未配置可信 SSH 运维目标",
         ))?;
-    Ok((target,acquire_node_lease(&state.limits,node_id,elevation,true)?))
+    Ok((
+        target,
+        acquire_node_lease(&state.limits, node_id, elevation, true)?,
+    ))
 }
 
-fn acquire_node_lease(shared: &Arc<Mutex<Limits>>,node_id: Uuid,elevation: bool,count_attempt: bool) -> Result<Lease,OperationsError> {
+fn acquire_node_lease(
+    shared: &Arc<Mutex<Limits>>,
+    node_id: Uuid,
+    elevation: bool,
+    count_attempt: bool,
+) -> Result<Lease, OperationsError> {
     let mut limits = shared.lock().map_err(|_| OperationsError::busy())?;
     let now = Instant::now();
     while limits
@@ -1160,27 +1241,30 @@ fn acquire_node_lease(shared: &Arc<Mutex<Limits>>,node_id: Uuid,elevation: bool,
     }
     if limits.active.values().sum::<usize>() >= 8
         || limits.elevating.contains(&node_id)
-        || (elevation && limits.active.get(&node_id).copied().unwrap_or_default()>0)
+        || (elevation && limits.active.get(&node_id).copied().unwrap_or_default() > 0)
         || limits.active.get(&node_id).copied().unwrap_or_default() >= 2
         || (count_attempt && limits.attempts.len() >= 30)
-        || (count_attempt && limits
-            .attempts
-            .iter()
-            .filter(|(_, id)| *id == node_id)
-            .count()
-            >= 6)
+        || (count_attempt
+            && limits
+                .attempts
+                .iter()
+                .filter(|(_, id)| *id == node_id)
+                .count()
+                >= 6)
     {
         return Err(OperationsError::busy());
     }
-    if count_attempt { limits.attempts.push_back((now, node_id)); }
+    if count_attempt {
+        limits.attempts.push_back((now, node_id));
+    }
     *limits.active.entry(node_id).or_default() += 1;
     if elevation {
         limits.elevating.insert(node_id);
     }
     Ok(Lease {
-            limits: Arc::clone(shared),
-            node_id,
-            elevation,
+        limits: Arc::clone(shared),
+        node_id,
+        elevation,
     })
 }
 
@@ -1257,7 +1341,7 @@ async fn elevate(
     validate_origin(&headers, &uri)?;
     let (target, lease) = target_and_lease(&state, node_id, true)?;
     #[cfg(target_os = "linux")]
-    agent_service::require_running(&state.pool,node_id).await?;
+    agent_service::require_running(&state.pool, node_id).await?;
     let credentials = resolve_credentials(&state, &target, &headers, credentials)?;
     if !target.elevation_available() {
         return Err(OperationsError::bad_request(
@@ -1355,7 +1439,11 @@ async fn manage_user(
         groups,
         confirmation,
     };
-    let credentials = Credentials { username, password, ..Default::default() };
+    let credentials = Credentials {
+        username,
+        password,
+        ..Default::default()
+    };
     validate_credentials(&credentials)?;
     if !valid_managed_username(&credentials.username) {
         return Err(OperationsError::bad_request(
@@ -1679,8 +1767,9 @@ async fn send_event(socket: &mut WebSocket, event: TerminalEvent) -> bool {
         TerminalEvent::Error(message) => json!({ "type": "error", "message": message }),
         TerminalEvent::Closed => json!({ "type": "closed" }),
     };
-    let message=message.to_string();
-    easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::WebSocket).submit(message.len());
+    let message = message.to_string();
+    easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::WebSocket)
+        .submit(message.len());
     matches!(
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -1698,9 +1787,10 @@ async fn receive_terminal_credentials(
 ) -> Result<(Credentials, (u32, u32)), OperationsError> {
     let authentication = match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(frame)))) => {
-            easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::WebSocket).receive(frame.len());
+            easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::WebSocket)
+                .receive(frame.len());
             serde_json::from_str::<BrowserMessage>(&frame).ok()
-        },
+        }
         _ => None,
     };
     let Some(BrowserMessage::Auth {
@@ -1714,7 +1804,11 @@ async fn receive_terminal_credentials(
             "请在连接后 15 秒内提交 SSH 用户名和密码",
         ));
     };
-    let credentials = Credentials { username, password, ..Default::default() };
+    let credentials = Credentials {
+        username,
+        password,
+        ..Default::default()
+    };
     validate_credentials(&credentials)?;
     audit(
         &state.pool,
@@ -1733,8 +1827,10 @@ async fn terminal_socket(
     target: Target,
     lease: Lease,
 ) {
-    let counters=easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::WebSocket);
-    let mut network_attempt=counters.begin();let _network_connection=counters.connection();
+    let counters =
+        easymanage_runtime::network::counter(easymanage_protocol::NetworkGroup::WebSocket);
+    let mut network_attempt = counters.begin();
+    let _network_connection = counters.connection();
     let node_id = target.node_id;
     let (credentials, dimensions) =
         match receive_terminal_credentials(&mut socket, &state, node_id).await {
@@ -2016,18 +2112,23 @@ mod tests {
     #[test]
     fn administrator_authentication_accepts_keys_without_weakening_password_validation() {
         use super::*;
-        for value in [json!({"username":"admin","password":"fixture-password"}),
+        for value in [
+            json!({"username":"admin","password":"fixture-password"}),
             json!({"username":"admin","private_key":"-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n-----END OPENSSH PRIVATE KEY-----","passphrase":"fixture","sudo_password":"other-fixture"}),
-            json!({"username":"root","private_key":"-----BEGIN RSA PRIVATE KEY-----\nfixture"})] {
+            json!({"username":"root","private_key":"-----BEGIN RSA PRIVATE KEY-----\nfixture"}),
+        ] {
             let credentials: Credentials = serde_json::from_value(value).unwrap();
             assert!(validate_credentials(&credentials).is_ok());
         }
-        for value in [json!({}), json!({"username":"admin","use_saved":true}),
+        for value in [
+            json!({}),
+            json!({"username":"admin","use_saved":true}),
             json!({"username":"admin","password":"fixture","private_key":"-----BEGIN key"}),
             json!({"username":"admin","private_key":"ssh-ed25519 not-a-private-key"}),
             json!({"username":"admin","private_key":"-----BEGIN key","sudo_password":"injection\n"}),
             json!({"username":"admin","password":"x".repeat(1025)}),
-            json!({"username":"admin","private_key":format!("-----BEGIN {}", "x".repeat(12*1024))})] {
+            json!({"username":"admin","private_key":format!("-----BEGIN {}", "x".repeat(12*1024))}),
+        ] {
             let credentials: Credentials = serde_json::from_value(value).unwrap();
             assert!(validate_credentials(&credentials).is_err());
         }
@@ -2038,27 +2139,32 @@ mod tests {
 
     #[test]
     fn node_mutations_are_exclusive_and_drop_releases_the_lease() {
-        let limits=Arc::new(Mutex::new(Limits::default()));let id=Uuid::new_v4();
-        let read=acquire_node_lease(&limits,id,false,true).unwrap();
-        let second_read=acquire_node_lease(&limits,id,false,true).unwrap();
-        assert!(acquire_node_lease(&limits,id,true,true).is_err());
-        drop(read);drop(second_read);
-        let mutation=acquire_node_lease(&limits,id,true,false).unwrap();
-        assert!(acquire_node_lease(&limits,id,false,true).is_err());
-        assert!(acquire_node_lease(&limits,id,true,true).is_err());
+        let limits = Arc::new(Mutex::new(Limits::default()));
+        let id = Uuid::new_v4();
+        let read = acquire_node_lease(&limits, id, false, true).unwrap();
+        let second_read = acquire_node_lease(&limits, id, false, true).unwrap();
+        assert!(acquire_node_lease(&limits, id, true, true).is_err());
+        drop(read);
+        drop(second_read);
+        let mutation = acquire_node_lease(&limits, id, true, false).unwrap();
+        assert!(acquire_node_lease(&limits, id, false, true).is_err());
+        assert!(acquire_node_lease(&limits, id, true, true).is_err());
         drop(mutation);
-        assert!(acquire_node_lease(&limits,id,true,true).is_ok());
+        assert!(acquire_node_lease(&limits, id, true, true).is_ok());
     }
 
     #[test]
     fn registry_edit_lease_does_not_double_charge_existing_ssh_attempt_budget() {
-        let limits=Arc::new(Mutex::new(Limits::default()));let id=Uuid::new_v4();
-        for _ in 0..6 {drop(acquire_node_lease(&limits,id,true,true).unwrap());}
-        assert!(acquire_node_lease(&limits,id,true,true).is_err());
-        let edit=acquire_node_lease(&limits,id,true,false).unwrap();
-        assert_eq!(limits.lock().unwrap().attempts.len(),6);
+        let limits = Arc::new(Mutex::new(Limits::default()));
+        let id = Uuid::new_v4();
+        for _ in 0..6 {
+            drop(acquire_node_lease(&limits, id, true, true).unwrap());
+        }
+        assert!(acquire_node_lease(&limits, id, true, true).is_err());
+        let edit = acquire_node_lease(&limits, id, true, false).unwrap();
+        assert_eq!(limits.lock().unwrap().attempts.len(), 6);
         drop(edit);
-        assert!(acquire_node_lease(&limits,id,true,true).is_err());
+        assert!(acquire_node_lease(&limits, id, true, true).is_err());
     }
 
     #[test]

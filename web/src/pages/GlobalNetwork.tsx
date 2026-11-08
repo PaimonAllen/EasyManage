@@ -1,5 +1,5 @@
 import { NodePanel } from "../components/NodePanel";
-import { useMemo, useState } from "react";
+import { lazy, Suspense, useMemo, useState } from "react";
 import { CollectionNotes, NodeStatus, SnapshotAge } from "../components/NodeStatus";
 import { PageHeading } from "../components/PageHeading";
 import { NodeCollectionToggle, useNodeCollection } from "../components/NodeCollectionControl";
@@ -7,6 +7,7 @@ import { analyzeProxyPorts } from "../lib/proxyPorts";
 import type { NodeSummary, ProxyService } from "../types/monitoring";
 
 import { inventoryFresh } from "../lib/collection";
+const ProxyAnalysis=lazy(()=>import("../components/ProxyAnalysis"));
 
 function listenerScope(addresses: string[]) {
   if (!addresses.length) return "未知 / 无权限读取";
@@ -60,7 +61,8 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
           : { tone: "unknown", label: visibleNodes.length>0&&!monitoredNodes.length?"代理监控关闭或等待开启":"无可见监听" };
 
   return <>
-    <PageHeading eyebrow="Proxy observability" title="Global Network · 代理" description="按服务器和用户查看 Clash / Mihomo、sing-box、V2Ray 等代理服务的只读运行观测" />
+    <PageHeading eyebrow="Proxy observability" title="Global Network · 代理" description="平台代理 YAML 分析、24 小时可用性与手动多机构 IP 评分；保留按服务器和用户查看代理运行观测" />
+    <Suspense fallback={<p className="hint">正在加载平台代理分析…</p>}><ProxyAnalysis/></Suspense>
     <section className="page-content">
       {settingsError&&<p className="form-error" role="alert">{settingsError}</p>}
       <article className="data-panel">

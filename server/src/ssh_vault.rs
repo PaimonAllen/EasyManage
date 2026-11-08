@@ -650,23 +650,53 @@ mod tests {
         let fixture = Fixture::new();
         let transport_token = fixture.save();
         let saved = load(&fixture.registry, &fixture.target).unwrap();
-        let credentials = Credentials { username: "fixture-admin".into(), password: Zeroizing::new("fixture-password".into()), ..Default::default() };
+        let credentials = Credentials {
+            username: "fixture-admin".into(),
+            password: Zeroizing::new("fixture-password".into()),
+            ..Default::default()
+        };
         let admin_cookie = save_admin(&fixture.registry, &fixture.target, &credentials).unwrap();
         let mut headers = HeaderMap::new();
         headers.append("cookie", "theme=dark; unrelated=fixture".parse().unwrap());
-        headers.append("cookie", format!("em_ssh_{}={transport_token}", fixture.target.node_id.simple()).parse().unwrap());
-        headers.append("cookie", admin_cookie.split(';').next().unwrap().parse().unwrap());
+        headers.append(
+            "cookie",
+            format!(
+                "em_ssh_{}={transport_token}",
+                fixture.target.node_id.simple()
+            )
+            .parse()
+            .unwrap(),
+        );
+        headers.append(
+            "cookie",
+            admin_cookie.split(';').next().unwrap().parse().unwrap(),
+        );
         assert_eq!(headers.get_all("cookie").iter().count(), 3);
-        assert!(!headers.get("cookie").unwrap().to_str().unwrap().contains("em_admin_"));
+        assert!(
+            !headers
+                .get("cookie")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("em_admin_")
+        );
         assert!(authorized(&saved, &fixture.target, &headers));
-        assert!(admin_available(&fixture.registry, &fixture.target, &headers));
+        assert!(admin_available(
+            &fixture.registry,
+            &fixture.target,
+            &headers
+        ));
         let mut other = fixture.target.clone();
         other.node_id = Uuid::new_v4();
         assert!(!authorized(&saved, &other, &headers));
         assert!(!admin_available(&fixture.registry, &other, &headers));
         headers.remove("cookie");
         assert!(!authorized(&saved, &fixture.target, &headers));
-        assert!(!admin_available(&fixture.registry, &fixture.target, &headers));
+        assert!(!admin_available(
+            &fixture.registry,
+            &fixture.target,
+            &headers
+        ));
     }
 
     #[test]

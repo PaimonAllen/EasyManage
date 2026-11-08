@@ -80,3 +80,21 @@ switch, default enabled. It never stops real proxies or modifies their settings,
 accounts or history. The foreign key takes a brief table lock, bounded by a
 2-second lock timeout; apply only during an approved platform update, before
 updating Agents. Older Agent report/control peers omit unsupported policy flags.
+
+`0024_proxy_lab_queue.sql` removes the exclusive enabled-profile index, enables
+existing proxy imports and records known source filenames. The controller checks
+all enabled profiles sequentially; no Agent or metrics tables are modified.
+It uses a two-second lock timeout. Stop the new controller before running
+`deploy/database/rollback-proxy-lab-queue.sql` to restore the prior queue policy.
+
+`0025_local_network.sql` adds the independent, compact round table for the
+platform's direct-egress HTTPS checks to 20 preset domestic websites. It does
+not change imported proxy profiles or Agent tables. The timestamp primary key
+supports three-minute slots and seven-day retention. The additive migration
+uses a two-second lock timeout.
+
+`0026_proxy_monitoring.sql` stores the platform network probe master switch and
+the local-website source switch in a single row. It leaves existing per-profile
+choices and all observations intact. Epochs prevent cancelled work from being
+saved after rapid pause/resume operations. The default preserves current running
+behavior, and settings survive platform/database restarts.

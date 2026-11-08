@@ -14,6 +14,7 @@ mod network;
 mod operations;
 mod performance;
 mod permission_reviews;
+mod proxy_lab;
 mod read_cache;
 mod usage_history;
 
@@ -157,6 +158,7 @@ async fn run() -> Result<()> {
     .merge(network::router(pool.clone()))
     .merge(documents::router(pool.clone()))
     .merge(external_platforms::router(pool.clone()))
+    .merge(proxy_lab::router(pool.clone(), initialized.clone())?)
     .merge(usage_history::router(&pool))
     .merge(performance::router(pool, performance_monitor))
     .merge(guide::router(&config.web_root)?)

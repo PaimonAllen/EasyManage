@@ -64,7 +64,7 @@ export function MachineManagement({ onRefresh, externalPlatforms=[], externalErr
       <progress max={100} value={progress.progress}/><p className="hint">流程日志不含密码、注册密钥或原始 SSH 输出。关闭/刷新页面不会取消服务端任务；刷新会丢失本页的临时日志访问凭据，请以机器心跳核验。</p>
       <div className="deployment-log" role="log" aria-live="polite">{progress.events.map((event,index)=><div key={index}><time>{formatDate(event.at)}</time> {event.message}</div>)}</div>
     </section>}
-    <details className="machine-list" open><summary>查看受管机器与已删除机器（{status?.machines.length??0}）</summary>
+    <details className="machine-list"><summary>查看受管机器与已删除机器（{status?.machines.length??0}）</summary>
       <div className="table-scroll"><table><thead><tr><th>机器</th><th>SSH 地址 / 用户</th><th>状态</th><th>操作</th></tr></thead><tbody>
         {status?.machines.map(machine=><tr key={machine.node_id}><td><strong>{machine.display_name||machine.hostname}</strong><small className="block">{machine.note||machine.hostname}</small></td>
           <td>{machine.host?`${machine.host}:${machine.port}`:"未配置可信目标"}<small className="block">{machine.username}</small></td>

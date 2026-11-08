@@ -171,6 +171,9 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     require(request("/api/v1/health/ready")[0] == 200, "temporary database migrations and readiness")
     status, dashboard = request("/")
     require(status == 200 and "isolated-smoke-dashboard" in dashboard, "dashboard static content without login token")
+    for path in ["/proxy-history?days=7", "/proxy-history/?days=1"]:
+        status, standalone = request(path)
+        require(status == 200 and "isolated-smoke-dashboard" in standalone,"standalone proxy history entry returns the real HTML entry with and without a trailing slash")
     status, nodes = request("/api/v1/nodes")
     require(status == 200 and nodes["nodes"] == [], "node listing without dashboard authentication")
     network_before=request('/api/v1/platform-network')[1]
@@ -1149,6 +1152,8 @@ def smoke(args):
                     "agent_sha256": "a" * 64, "server_url": base_url, "ca_sha256": hashlib.sha256(ca_certificate.read_bytes()).hexdigest()}]}))
                 registry.chmod(0o600)
                 server_env = env | {"EASYMANAGE_ENV_FILE": str(empty_env), "EASYMANAGE_DISK_SCAN_STORAGE_PATH": str(root / "storage-guard"), "DATABASE_URL": "postgresql://smoke@127.0.0.1:55432/easymanage_smoke",
+                    "EASYMANAGE_PROXY_LAB_STATE_DIR":str(root / "proxy-lab"),
+                    "EASYMANAGE_LOCAL_NETWORK_ENABLED":"false",
                     "EASYMANAGE_ENROLLMENT_TOKEN": enrollment, "EASYMANAGE_BIND": "127.0.0.1:58443", "EASYMANAGE_DATABASE_MAX_CONNECTIONS": "2",
                     "EASYMANAGE_TLS_CERTIFICATE": str(certificate), "EASYMANAGE_TLS_PRIVATE_KEY": str(key), "EASYMANAGE_WEB_ROOT": str(web),
                     "EASYMANAGE_OPERATIONS_TARGETS": str(registry), "RUST_LOG": "warn", "TOKIO_WORKER_THREADS": "2"}
@@ -1169,6 +1174,8 @@ def smoke(args):
                     from resource_upgrade_smoke import exercise as exercise_upgrade
                     exercise_upgrade(args.previous_server_binary,args.server_binary,root,server_env,base_url,
                         ssl.create_default_context(cafile=str(ca_certificate)),enrollment,log,require)
+                from proxy_lab_smoke import prepare as prepare_proxy_lab
+                server_env['EASYMANAGE_PROXY_CORE_BINARY']=str(prepare_proxy_lab(root))
                 server = subprocess.Popen([str(args.server_binary.resolve())], cwd=root, env=server_env, stdout=log, stderr=subprocess.STDOUT)
                 context = ssl.create_default_context(cafile=str(ca_certificate))
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
@@ -1188,6 +1195,16 @@ def smoke(args):
                 saved_document = exercise_documents(base_url, context, require)
                 from external_platforms_smoke import exercise as exercise_external_platforms
                 saved_external_platforms = exercise_external_platforms(base_url, context, require)
+                from proxy_lab_smoke import exercise as exercise_proxy_lab
+                saved_proxy_lab=exercise_proxy_lab(root,base_url,context,require)
+                from local_network_smoke import exercise as exercise_local_network
+                saved_local_network=exercise_local_network(base_url,context,require)
+                if args.proxy_lab_baseline:
+                    from proxy_lab_smoke import rollback as rollback_proxy_lab,verify as verify_proxy_lab
+                    server=rollback_proxy_lab(server,args.server_binary,args.proxy_lab_baseline,root,server_env,base_url,context,log,require)
+                    verify_proxy_lab(base_url,context,saved_proxy_lab,require)
+                from proxy_monitoring_smoke import exercise as exercise_monitoring_controls
+                saved_monitoring_controls=exercise_monitoring_controls(root,base_url,context,require)
                 if args.performance_baseline:
                     from performance_benchmark import exercise as exercise_performance
                     exercise_performance(args.performance_baseline, args.server_binary, root, server_env,
@@ -1300,6 +1317,9 @@ def smoke(args):
                 with opener.open(base_url + "/api/v1/collection-settings", timeout=3) as response:
                     before_restart = json.load(response)["policy"]
                 stop_process(server)
+                # Enable the real collector only after CRUD/no-network assertions;
+                # its independent traffic must not alter unrelated counter tests.
+                server_env["EASYMANAGE_LOCAL_NETWORK_ENABLED"]="true"
                 server = subprocess.Popen([str(args.server_binary.resolve())], cwd=root, env=server_env, stdout=log, stderr=subprocess.STDOUT)
                 deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
@@ -1325,6 +1345,14 @@ def smoke(args):
                         and persisted_pause['monitoring_applied_revision']==1,
                         'monitoring pause and its acknowledgement survive database recovery and platform restart')
                 print("PASS isolated integration smoke completed; synthetic fixtures and optional private-namespace collection only", flush=True)
+                from proxy_lab_smoke import verify as verify_proxy_lab
+                verify_proxy_lab(base_url,context,saved_proxy_lab,require)
+                from local_network_smoke import verify as verify_local_network
+                verify_local_network(base_url,context,saved_local_network,require)
+                from proxy_monitoring_smoke import verify as verify_monitoring_controls
+                verify_monitoring_controls(base_url,context,saved_monitoring_controls,require)
+                from local_network_smoke import verify_sampler
+                verify_sampler(base_url,context,require)
             except Exception:
                 log.flush()
                 log.seek(0)
@@ -1342,6 +1370,7 @@ if __name__ == "__main__":
     parser.add_argument("--server-binary", type=Path, required=True)
     parser.add_argument("--performance-baseline",type=Path,help="Compare synthetic report payload/CPU/WAL against a previous binary in private databases")
     parser.add_argument("--previous-server-binary",type=Path,help="Optional schema-16 binary to test private forward migration and emergency rollback")
+    parser.add_argument("--proxy-lab-baseline",type=Path,help="Optional schema-22 binary to test private proxy analysis rollback and re-upgrade")
     parser.add_argument("--agent-binary", type=Path)
     parser.add_argument("--machine-onboarding", action="store_true", help="Opt-in SSH/SCP fixture with mocked systemd and a real installed Agent; temporary Paramiko venv required")
     parser.add_argument("--machine-update",action="store_true",help="Focused real SSH update and nonce/hash receipt while remote output stays open")

@@ -4,7 +4,10 @@ import "./styles.css";
 
 // History is a standalone entry: mounting it never starts App/useFleet or the
 // live metrics, SSH-target and dashboard history polling hooks.
-const Page=window.location.pathname.replace(/\/$/,"")==="/usage-history"
+const path=window.location.pathname.replace(/\/$/,"");
+const Page=path==="/proxy-history"
+  ?lazy(()=>import("./pages/ProxyHistory"))
+  :path==="/usage-history"
   ?lazy(()=>import("./pages/UsageHistory"))
   :lazy(()=>import("./app/App").then(module=>({default:module.App})));
 

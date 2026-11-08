@@ -43,6 +43,8 @@ pub fn router(state: AppState) -> Router {
         ServeDir::new(&state.config.web_root).not_found_service(ServeFile::new(index.clone()));
 
     Router::new()
+        .route_service("/proxy-history", ServeFile::new(index.clone()))
+        .route_service("/proxy-history/", ServeFile::new(index.clone()))
         .route_service("/usage-history", ServeFile::new(index.clone()))
         .route_service("/usage-history/", ServeFile::new(index))
         .route("/api/v1/health/live", get(live))
@@ -289,33 +291,51 @@ async fn report_metrics(
 ) -> Result<Json<AgentReportResponse>, ApiError> {
     if report.reuse_inventory.is_some() {
         if report.protocol_version != easymanage_protocol::INVENTORY_CACHE_PROTOCOL_VERSION {
-            return Err(ApiError::bad_request("unsupported inventory cache protocol"));
+            return Err(ApiError::bad_request(
+                "unsupported inventory cache protocol",
+            ));
         }
     } else if report.reuse_software_inventory {
         if report.protocol_version != easymanage_protocol::SOFTWARE_CACHE_PROTOCOL_VERSION {
             return Err(ApiError::bad_request("unsupported compact report protocol"));
         }
-    } else { verify_protocol(report.protocol_version)?; }
+    } else {
+        verify_protocol(report.protocol_version)?;
+    }
     let provided_token = header_value(&headers, AGENT_TOKEN_HEADER)?;
     authenticate_agent(&state.pool, report.node_id, provided_token, false).await?;
 
     // One node's cache and latest snapshot must advance together, including catch-up.
     let mut transaction = state.pool.begin().await.map_err(ApiError::database)?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-        .bind(report.node_id.to_string()).execute(&mut *transaction).await.map_err(ApiError::database)?;
+        .bind(report.node_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
     let mut metrics_json = serde_json::to_value(&report.metrics)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let inventory_json = easymanage_protocol::report_inventory::take(&mut metrics_json);
     if let Some(key) = &report.reuse_inventory {
         if !easymanage_protocol::report_inventory::valid_digest(key)
-            || !easymanage_protocol::report_inventory::empty(&inventory_json) {
-            return Err(ApiError::bad_request("conflicting cached inventory representation"));
+            || !easymanage_protocol::report_inventory::empty(&inventory_json)
+        {
+            return Err(ApiError::bad_request(
+                "conflicting cached inventory representation",
+            ));
         }
         let cached: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM node_snapshot_inventory WHERE node_id=$1 AND digest=$2)")
-            .bind(report.node_id).bind(key).fetch_one(&mut *transaction).await.map_err(ApiError::database)?;
+            "SELECT EXISTS(SELECT 1 FROM node_snapshot_inventory WHERE node_id=$1 AND digest=$2)",
+        )
+        .bind(report.node_id)
+        .bind(key)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ApiError::database)?;
         if !cached {
-            return Err(ApiError { status: StatusCode::CONFLICT, message: "inventory required".into() });
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "inventory required".into(),
+            });
         }
     }
     // Cached cold fields were validated when stored; don't fetch/deserialize them on every heartbeat.
@@ -581,7 +601,15 @@ async fn report_metrics(
     .bind(report.node_id)
     .bind(report.metrics.collected_at)
     .bind(metrics_json)
-    .bind(report.metrics.agent_control.as_ref().map(serde_json::to_value).transpose().map_err(|error|ApiError::internal(error.to_string()))?)
+    .bind(
+        report
+            .metrics
+            .agent_control
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| ApiError::internal(error.to_string()))?,
+    )
     .execute(&mut *transaction)
     .await
     .map_err(ApiError::database)?;
@@ -592,7 +620,8 @@ async fn report_metrics(
             .execute(&mut *transaction).await.map_err(ApiError::database)?;
         if changed.rows_affected() > 0 {
             crate::permission_reviews::invalidate_changed(&mut transaction, report.node_id)
-                .await.map_err(ApiError::database)?;
+                .await
+                .map_err(ApiError::database)?;
         }
     }
 
@@ -756,13 +785,17 @@ async fn list_nodes(
     Query(view): Query<NodeView>,
 ) -> Result<Response, ApiError> {
     let software = view.include_software.unwrap_or(true);
-    let cached = NODE_VIEWS[usize::from(software)].get(
-        load_node_view(&state, software), |view| view.body.len()
-    ).await?;
+    let cached = NODE_VIEWS[usize::from(software)]
+        .get(load_node_view(&state, software), |view| view.body.len())
+        .await?;
     let unchanged = headers
         .get("if-none-match")
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|value| value.trim().as_bytes() == cached.etag.as_bytes()));
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|value| value.trim().as_bytes() == cached.etag.as_bytes())
+        });
     let mut response = if unchanged {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
@@ -770,11 +803,12 @@ async fn list_nodes(
     };
     response.headers_mut().insert("etag", cached.etag);
     response.headers_mut().insert(
-        "cache-control", HeaderValue::from_static("private, no-cache"),
+        "cache-control",
+        HeaderValue::from_static("private, no-cache"),
     );
-    response.headers_mut().insert(
-        "content-type", HeaderValue::from_static("application/json"),
-    );
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
     Ok(response)
 }
 
@@ -812,7 +846,8 @@ async fn load_node_view(state: &AppState, software: bool) -> Result<NodeViewBody
     body.extend_from_slice(&bytes);
     body.push(b'}');
     Ok(NodeViewBody {
-        etag: HeaderValue::from_str(&etag).map_err(|error| ApiError::internal(error.to_string()))?,
+        etag: HeaderValue::from_str(&etag)
+            .map_err(|error| ApiError::internal(error.to_string()))?,
         body: Bytes::from(body),
     })
 }
@@ -1030,9 +1065,17 @@ fn map_node(row: &PgRow, online_cutoff: chrono::DateTime<Utc>) -> Result<NodeSum
         .map_err(|error| ApiError::internal(error.to_string()))?;
 
     Ok(NodeSummary {
-        agent_service_state: row.try_get("agent_service_state").map_err(ApiError::database)?,
-        agent_service_desired_stopped: row.try_get::<Option<bool>,_>("agent_service_desired_stopped").map_err(ApiError::database)?.unwrap_or(false),
-        agent_service_revision: row.try_get::<Option<i64>,_>("agent_service_revision").map_err(ApiError::database)?.unwrap_or(0) as u64,
+        agent_service_state: row
+            .try_get("agent_service_state")
+            .map_err(ApiError::database)?,
+        agent_service_desired_stopped: row
+            .try_get::<Option<bool>, _>("agent_service_desired_stopped")
+            .map_err(ApiError::database)?
+            .unwrap_or(false),
+        agent_service_revision: row
+            .try_get::<Option<i64>, _>("agent_service_revision")
+            .map_err(ApiError::database)?
+            .unwrap_or(0) as u64,
         monitoring_paused,
         monitoring_revision,
         monitoring_applied_revision,
@@ -1056,8 +1099,14 @@ fn map_node(row: &PgRow, online_cutoff: chrono::DateTime<Utc>) -> Result<NodeSum
             .map_err(|_| ApiError::internal("invalid cpu_physical_cores"))?,
         agent_version: row.try_get("agent_version").map_err(ApiError::database)?,
         last_seen,
-        online: !row.try_get::<Option<bool>,_>("agent_service_desired_stopped").map_err(ApiError::database)?.unwrap_or(false)
-            && row.try_get::<Option<String>,_>("agent_service_state").map_err(ApiError::database)?.is_none_or(|state|state=="running")
+        online: !row
+            .try_get::<Option<bool>, _>("agent_service_desired_stopped")
+            .map_err(ApiError::database)?
+            .unwrap_or(false)
+            && row
+                .try_get::<Option<String>, _>("agent_service_state")
+                .map_err(ApiError::database)?
+                .is_none_or(|state| state == "running")
             && !monitoring_paused
             && last_seen >= online_cutoff
             && (monitoring_revision == 0

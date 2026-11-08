@@ -42,3 +42,17 @@ sudo systemctl restart postgresql@18-main.service
 Schema 22 将低频清单保存在 `node_snapshot_inventory`，实时快照只更新较小的指标 JSON；`metrics_snapshot` 提供合并后的只读视图。升级保留原节点、历史、人工复核、权限和采样时间。新旧 Agent 均可向新平台上报；协议 3 仅在服务端确认缓存后启用，缓存丢失时完整重传，旧平台会拒绝缓存引用并触发兼容重传。紧急回退先停平台，执行 `rollback-inventory-cache.sql`，再恢复旧程序；它会合并回原字段，不删除历史。
 
 新 Agent 的 SQLite 队列共享清单内容，但保持每份历史快照的版本和持久确认；旧格式队列仍可读取。回退 Agent 前应先让新版本排空队列，或恢复安装器保留的一致备份；不能让旧程序直接读取尚含新版引用的队列。
+
+Schema 23 为平台代理分析新增独立 `proxy_lab_*` 表，不修改 Agent 或现有监控表。代理定义仅存 AES-GCM 密文，必须单独备份平台私有主密钥；可用性每轮一行，保留 26 小时。紧急回退先停新平台，执行 `rollback-proxy-lab.sql`，再恢复旧程序；脚本保留新表数据，只撤销迁移版本记录，再升级可继续使用原配置和历史。
+
+Schema 24 移除代理配置的单启用限制，将既有导入全部加入顺序队列，并保存已记录的导入文件名。覆盖内容保留显示名，改名单独执行。回退先停平台，执行 `rollback-proxy-lab-queue.sql`；它恢复单配置策略，保留配置、密文、名称和历史。重复配置合并脚本 `merge-identical-proxy-profiles.sql` 仅接受完全相同的内容；先停止平台并备份，再重映射节点历史、合并最近评分，最后删除重复项。不能直接删除重复配置后再尝试恢复历史。
+
+`rollback-local-network.sql` removes only migration 25's version marker while
+preserving its independent observations. Stop the new platform before running
+it when reverting to an older binary; reapplying migration 25 is idempotent.
+
+Schema 26 adds the persistent platform network monitoring switches without
+changing individual YAML preferences or Agent settings. For emergency rollback,
+stop the platform and run `rollback-proxy-monitoring.sql` before reverting to an
+older binary. The script retains controls and history; older binaries cannot
+enforce the new master pause. Reapplying migration 26 restores the saved choices.

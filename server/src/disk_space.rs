@@ -313,7 +313,13 @@ async fn entries(
     let mut direct = json!({});
     for key in ["allocated", "apparent", "files"] {
         let children: i64 = totals.try_get(key).map_err(|_| db_error())?;
-        direct[key] = json!(directory[key].as_i64().unwrap_or(0).saturating_sub(children).max(0));
+        direct[key] = json!(
+            directory[key]
+                .as_i64()
+                .unwrap_or(0)
+                .saturating_sub(children)
+                .max(0)
+        );
     }
     let statement = format!(
         "SELECT to_jsonb(e)-'scan_id' FROM disk_space_directories e WHERE scan_id=$1 AND parent=$2 AND ($3='' OR POSITION(lower($3) IN lower(name))>0) ORDER BY {order} {direction},id ASC LIMIT 250 OFFSET $4"
@@ -571,10 +577,8 @@ fn validate_entry(node: &Value, root: &str, scope: &str) -> Result<u64, Operatio
     {
         return Err(invalid());
     }
-    if !matches!(
-        node["kind"].as_str(),
-        Some("directory")
-    ) || node["incomplete"].as_bool().is_none()
+    if !matches!(node["kind"].as_str(), Some("directory"))
+        || node["incomplete"].as_bool().is_none()
         || node["mtime"].as_i64().is_none()
         || ["allocated", "apparent", "files", "directories"]
             .iter()

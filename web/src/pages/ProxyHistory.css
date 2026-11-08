@@ -1,0 +1,23 @@
+.proxy-history main{max-width:1400px;margin:0 auto;padding:28px 20px 64px;}
+.proxy-history__heading,.proxy-history__filters,.proxy-history__summary{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+.proxy-history__heading{justify-content:space-between;margin-bottom:24px;}
+.proxy-history__heading h1{margin:0 0 10px;}
+.proxy-history__heading p{color:var(--muted);}
+.proxy-history__filters{align-items:end;margin:20px 0;}
+.proxy-history__filters label{display:grid;gap:7px;flex:1 1 200px;min-width:0;}
+.proxy-history__filters select{width:100%;}
+.proxy-history__summary{justify-content:space-between;padding:20px 0;}
+.proxy-history__summary span{display:grid;gap:7px;color:var(--muted);}
+.proxy-history__summary strong{color:var(--text);font-size:1.1rem;}
+.proxy-history__charts,.proxy-history__logs{margin-top:24px;padding:20px;}
+.proxy-history__charts h2,.proxy-history__logs h2{margin:0 0 10px;}
+.proxy-history__day{padding:16px 0;border-bottom:1px solid var(--border);min-width:0;}
+.proxy-history__day>div:first-child{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px;}
+.proxy-history__day>div:first-child span{color:var(--muted);}
+.proxy-history__entry{border-top:1px solid var(--border);padding:14px 0;}
+.proxy-history__entry summary{cursor:pointer;display:flex;align-items:center;gap:15px;flex-wrap:wrap;}
+.proxy-history__entry summary::before{content:'▸';color:var(--muted);}
+.proxy-history__entry[open]>summary::before{content:'▾';}
+.proxy-history__entry>div{padding:12px 10px 0;overflow-wrap:anywhere;}
+.proxy-history__entry time{font-variant-numeric:tabular-nums;}
+@media(max-width:650px){.proxy-history main{padding:20px 10px;}.proxy-history__charts,.proxy-history__logs{padding:12px;}.proxy-history__day .proxy-availability{height:44px;}.proxy-history__entry summary{gap:8px;}}

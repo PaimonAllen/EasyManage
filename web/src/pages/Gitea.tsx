@@ -44,7 +44,7 @@ export function Gitea() {
         <header className="panel-header"><div><h2>Gitea 账户状态</h2><p>只读账户清单 · 每 5 分钟刷新 · {accounts ? `采集于 ${formatDate(accounts.generated_at)}` : "正在读取…"}</p></div>
           <span className={accounts?.scope === "complete" ? "positive" : "muted"}>{accounts?.scope === "complete" ? "完整核验" : accounts?.scope === "partial" ? "部分核验" : accounts?.scope === "public" ? "公开可见" : "未核验"}</span></header>
         {accountError && <div className="alert" role="alert">{accountError}</div>}
-        {accounts && <p className={accounts.scope === "complete" ? "hint" : "alert"}>{accounts.message}</p>}
+        {accounts && <p className={accounts.scope === "complete" ? "hint" : accounts.scope === "unavailable" ? "alert" : "alert alert--warning"}>{accounts.message}</p>}
         <GiteaAccountSummary accounts={accounts}/>
         <div className="table-scroll"><table><thead><tr><th>账户</th><th>角色</th><th>状态</th><th>建立时间</th><th>最后登录</th></tr></thead><tbody>
           {accounts?.users.map((user) => <tr key={user.id}>

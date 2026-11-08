@@ -230,7 +230,9 @@ mod tests {
     #[test]
     fn platform_update_accepts_saved_or_key_authentication_without_dropping_the_candidate() {
         use super::*;
-        let request: UpdatePlatformRequest = serde_json::from_value(json!({"use_saved":true,"candidate_sha256":"a".repeat(64)})).unwrap();
+        let request: UpdatePlatformRequest =
+            serde_json::from_value(json!({"use_saved":true,"candidate_sha256":"a".repeat(64)}))
+                .unwrap();
         assert!(request.credentials.use_saved);
         assert!(valid_digest(&request.candidate_sha256));
         let request: UpdatePlatformRequest = serde_json::from_value(json!({"username":"fixture","private_key":"-----BEGIN key","sudo_password":"fixture","candidate_sha256":"b".repeat(64)})).unwrap();
