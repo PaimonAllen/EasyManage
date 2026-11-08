@@ -6,6 +6,7 @@ mod block_devices;
 mod collector;
 mod cpu_frequency;
 mod hardware;
+mod interface_connections;
 pub(super) mod inventory;
 mod mounts;
 mod network_capacity;

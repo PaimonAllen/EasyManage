@@ -8,8 +8,9 @@ import {
 } from "../components/NodeStatus";
 import { PageHeading } from "../components/PageHeading";
 import { formatBytes, formatRate } from "../lib/format";
-import type { NodeSummary, OverlayNetworkStatus } from "../types/monitoring";
+import type { NetworkInterface, NodeSummary, OverlayNetworkStatus } from "../types/monitoring";
 import { localOverlayNetworks } from "../lib/overlayNetworks";
+import { interfaceConnectionNames } from "../lib/networkConnections";
 
 const overlayProviders = ["tailscale", "zerotier"] as const;
 
@@ -17,6 +18,15 @@ import { inventoryFresh } from "../lib/collection";
 
 function interfaceKind(kind: string) {
   return ({ ethernet: "有线", wifi: "Wi-Fi", tailscale: "Tailscale", zerotier: "ZeroTier", vlan: "VLAN" } as Record<string, string>)[kind] ?? kind;
+}
+
+export function InterfaceConnectionNames({ item, overlays, fresh }: {
+  item: NetworkInterface; overlays: OverlayNetworkStatus[]; fresh: boolean;
+}) {
+  return <>{interfaceConnectionNames(item, overlays).map(({ label, name }) => <small
+    key={`${label}-${name}`} className={`network-connection-name${fresh ? "" : " muted"}`}
+    title={fresh ? "已连接名称 · 按扩展清单周期更新" : "历史清单，当前连接尚未确认"}
+  >{fresh ? "" : "上次 "}{label}：{name}</small>)}</>;
 }
 
 function overlayLabel(status?: OverlayNetworkStatus) {
@@ -168,6 +178,7 @@ export function Network({ nodes }: { nodes: NodeSummary[] }) {
                           <td>
                             <strong>{item.name}</strong>
                             <small>{item.kind ? interfaceKind(item.kind) : "未知类型"}</small>
+                            <InterfaceConnectionNames item={item} overlays={overlays} fresh={fresh} />
                           </td>
                           <td>
                             {isOverlay ? (

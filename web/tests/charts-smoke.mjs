@@ -134,7 +134,21 @@ try {
   const gpuEditor=renderToStaticMarkup(React.createElement(GpuComparison));
   assert.ok(gpuEditor.includes('GPU 性能对比')&&gpuEditor.includes('重新读取'));
   console.log('PASS GPU reference preserves supplied tables and Markdown formatting, excludes executable HTML/URLs and keeps links separate from the editor');
-  const { Network, OverlayHealthCard, OverlayLocalDetails } = await server.ssrLoadModule("/src/pages/Network.tsx");
+  const { Network, OverlayHealthCard, OverlayLocalDetails, InterfaceConnectionNames } = await server.ssrLoadModule("/src/pages/Network.tsx");
+  const connectedWifi = { name:"wlan0",kind:"wifi",state:"up",addresses:[],wifi_ssid:"Office <WiFi>",connection_name:"Office profile" };
+  const connectionNames = (item, fresh = true, overlays = []) => renderToStaticMarkup(React.createElement(InterfaceConnectionNames,{item,fresh,overlays}));
+  const wifiNames = connectionNames(connectedWifi);
+  assert.ok(wifiNames.includes('Wi-Fi：Office &lt;WiFi&gt;') && wifiNames.includes('连接：Office profile'));
+  assert.ok(connectionNames({...connectedWifi,wifi_ssid:"wlan0",connection_name:"wlan0"}).includes('Wi-Fi：wlan0'));
+  assert.equal(connectionNames({...connectedWifi,state:"down"}), '');
+  assert.equal(connectionNames({...connectedWifi,wifi_ssid:undefined,connection_name:undefined}), '');
+  assert.equal((connectionNames({...connectedWifi,connection_name:connectedWifi.wifi_ssid}).match(/<small/g)??[]).length, 1);
+  assert.ok(connectionNames(connectedWifi,false).includes('上次 Wi-Fi：'));
+  const wiredNames = connectionNames({...connectedWifi,kind:"ethernet",wifi_ssid:null,connection_name:"Wired LAN"});
+  assert.ok(wiredNames.includes('连接：Wired LAN') && !wiredNames.includes('Wi-Fi：'));
+  const virtualNames = connectionNames({...connectedWifi,name:"zt-one",kind:"zerotier",connection_name:"zt-one"},true,[{provider:"zerotier",state:"healthy",networks:[{interface:"zt-one",name:"Team VLAN"},{interface:"zt-other",name:"Other VLAN"}]}]);
+  assert.ok(virtualNames.includes('网络：Team VLAN') && !virtualNames.includes('Other VLAN') && !virtualNames.includes('连接：zt-one'));
+  console.log('PASS NIC labels show active Wi-Fi SSIDs, wired profiles and matching virtual networks; old Agents, disconnected links and stale snapshots remain honest');
   const networkFixture = { id: "route-one", hostname: "Route machine", online: true, metrics: {
     inventory_collected_at: new Date().toISOString(), routes: [{ destination: "198.51.100.0/24", gateway: "198.51.100.1", interface: "fixture0", metric: 100 }],
   } };

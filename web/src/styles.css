@@ -2088,3 +2088,9 @@ select:disabled {
 .user-collection-control input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
 .user-collection-control input:disabled { cursor: wait; }
 .network-resource-table { min-width: 1250px; }
+.network-connection-name {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-width: 26rem;
+}
+.network-connection-name:not(.muted) { color: inherit; }

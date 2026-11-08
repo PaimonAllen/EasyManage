@@ -109,7 +109,7 @@ impl ExtendedInventory {
             overlay_networks::collect(),
         );
         // /proc file traversal is synchronous and must not block report/shutdown tasks.
-        let inventory = tokio::task::spawn_blocking(move || {
+        let mut inventory = tokio::task::spawn_blocking(move || {
             Self::from_sources(
                 accounts,
                 sessions,
@@ -140,6 +140,8 @@ impl ExtendedInventory {
             programming_tools: Vec::new(),
             issues: vec![issue("inventory", "扩展信息采集任务失败")],
         });
+        // Connection names share the cold inventory cadence, never the live loop.
+        super::interface_connections::enrich(&mut inventory.interfaces).await;
         Self {
             overlay_networks,
             ..inventory
@@ -820,6 +822,8 @@ fn parse_interfaces(data: &str) -> io::Result<Vec<NetworkInterface>> {
                     .and_then(Value::as_u64)
                     .and_then(|value| u32::try_from(value).ok()),
                 master: value["master"].as_str().map(str::to_owned),
+                connection_name: None,
+                wifi_ssid: None,
             })
         })
         .collect())
@@ -882,6 +886,8 @@ fn fallback_interfaces() -> Vec<NetworkInterface> {
                     .and_then(|value| value.trim().parse().ok()),
                 vlan_id: None,
                 master: None,
+                connection_name: None,
+                wifi_ssid: None,
             }
         })
         .collect()

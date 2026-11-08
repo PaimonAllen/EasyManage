@@ -259,7 +259,9 @@ def exercise_api(base_url, context, enrollment_token, node_id):
                              "total_bytes": 1200},
         "privilege": {"mode": "basic", "username": "smoke", "uid": 1000},
         "users": [{"username": "root", "uid": 0, "gid": 0, "home": "/root", "shell": "/bin/bash", "groups": ["root"], "sessions": 1, "session_sources": ["logind", "ssh"], "session_evidence": {"terminal_records": 0, "logind_sessions": 1, "ssh_processes": 1}, "process_count": None, "locked": None, "account_status": "normal"}],
-        "interfaces": [], "overlay_networks": [{"provider": "tailscale", "state": "healthy", "detail": "fixture", "networks": []}],
+        "interfaces": [{"name": "wlan-fixture", "kind": "wifi", "state": "up", "addresses": ["192.0.2.3/24"],
+                        "connection_name": "Office profile", "wifi_ssid": "Office:WiFi"}],
+        "overlay_networks": [{"provider": "tailscale", "state": "healthy", "detail": "fixture", "networks": []}],
         "routes": [], "proxy_services": [], "collection_issues": [],
         "inventory_collected_at": collected.isoformat(),
     }
@@ -341,6 +343,9 @@ def exercise_api(base_url, context, enrollment_token, node_id):
             and node["metrics"]["overlay_networks"][0]["provider"] == "tailscale"
             and parse_timestamp(node["metrics"]["disk_collected_at"]) == collected,
             "CPU/memory/disk/network/GPU/user payload round trip")
+    require(node['metrics']['interfaces'][0]['connection_name'] == 'Office profile'
+            and node['metrics']['interfaces'][0]['wifi_ssid'] == 'Office:WiFi',
+            'active Wi-Fi SSID and connection name survive HTTPS and database inventory round trip')
     require(node['metrics']['host_security']['interval_seconds']==3600
             and parse_timestamp(node['metrics']['host_security']['collected_at'])==collected-timedelta(minutes=30)
             and node['metrics']['host_security']['apparmor_enabled'] is True,

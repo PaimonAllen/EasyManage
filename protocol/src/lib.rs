@@ -125,6 +125,11 @@ pub struct NetworkInterface {
     pub mtu: Option<u32>,
     pub vlan_id: Option<u32>,
     pub master: Option<String>,
+    /// Active connection label only; never includes credentials or saved profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wifi_ssid: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

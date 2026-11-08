@@ -63,6 +63,8 @@ export interface NetworkInterface {
   mtu: number | null;
   vlan_id: number | null;
   master: string | null;
+  connection_name?: string | null;
+  wifi_ssid?: string | null;
 }
 export interface OverlayMembership {
   network_id: string;
