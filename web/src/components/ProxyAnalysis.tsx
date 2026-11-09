@@ -1,7 +1,7 @@
 import {lazy,Suspense,memo,useCallback,useEffect,useMemo,useRef,useState} from "react";
 import {fetchProxyLab,fetchProxyDetails,fetchProxySources,importProxyProfile,renameProxyProfile,deleteProxyProfile,scoreProxyNodes,fetchReputationJob,saveManualReputation,
   LOCAL_NETWORK_PROFILE,type ProxyProbeSite,type ProxyLabStatus,type ProxyLabDetail,type ProxyLabNode,type ProxyProfile,type ReputationProvider,type ReputationJob,type LocalProxySource} from "../api/proxyLab";
-import {availabilityBuckets,availabilityView,nodeEgress,nodeRegion,reputationMean,currentScore} from "../lib/proxyAvailability";
+import {availabilityBuckets,availabilityView,pendingAvailabilitySlot,nodeEgress,nodeRegion,reputationMean,currentScore} from "../lib/proxyAvailability";
 import {formatDate} from "../lib/format";
 import "./proxyAnalysis.css";
 import ProxyMonitoring,{type MonitoringChange} from "./ProxyMonitoring";
@@ -27,15 +27,18 @@ function availabilityTimes(start:string){
   if(timeLabels.size>=4)timeLabels.delete(timeLabels.keys().next().value!);
   timeLabels.set(start,groups);return groups;
 }
-export const ProxyAvailabilityBar=memo(function ProxyAvailabilityBar({history,start,label="过去24小时可用性"}:{history:string;start:string;label?:string}){
+export const ProxyAvailabilityBar=memo(function ProxyAvailabilityBar({history,start,label="过去24小时可用性",checkingAt=null}:{history:string;start:string;label?:string;checkingAt?:string|null}){
   const times=availabilityTimes(start);
-  return <div className="proxy-availability" role="img" aria-label={`${label}：竖向大格背景汇总15分钟，内部从上到下堆叠5条横向小格，各代表3分钟；绿色正常，黄色缓慢或混合，红色故障，灰色无有效观测`}>
+  const checkingIndex=checkingAt?Math.floor((Date.parse(checkingAt)-Date.parse(start))/180_000):-1;
+  const checking=checkingIndex>=0&&checkingIndex<480;
+  return <div className="proxy-availability" role="img" aria-label={`${label}：竖向大格背景汇总15分钟，内部从上到下堆叠5条横向小格，各代表3分钟；绿色正常，黄色缓慢或混合，红色故障，灰色无有效观测${checking?"；闪烁星号表示本轮检测中，等待结果":""}`}>
     {availabilityBuckets(history).map(bucket=>{const time=times[bucket.index];
       const samples=bucket.samples.map((sample,index)=>`${time.points[index]}：${sample.label}`).join("\n");
       const colors=bucket.samples.map((sample,index)=>`var(--proxy-sample-${sample.state}) ${index*20}% ${(index+1)*20}%`).join(",");
       return <span key={bucket.index} className={`proxy-availability__slot proxy-availability__slot--${bucket.state}${bucket.known>0&&bucket.known<5?" proxy-availability__slot--partial":""}`}
-        title={`${time.from} 起 15 分钟：可用 ${bucket.up} 次，故障 ${bucket.down} 次，未知 ${bucket.unknown} 次\n从上到下，每小格 3 分钟：\n${samples}`} aria-hidden="true">
+        title={`${time.from} 起 15 分钟：可用 ${bucket.up} 次，故障 ${bucket.down} 次，未知 ${bucket.unknown} 次\n从上到下，每小格 3 分钟：\n${samples}${checking&&Math.floor(checkingIndex/5)===bucket.index?"\n✱ 本轮检测中，等待结果":""}`} aria-hidden="true">
         <span className="proxy-availability__samples" style={{backgroundImage:`linear-gradient(to bottom,${colors})`}}/>
+        {checking&&Math.floor(checkingIndex/5)===bucket.index&&<span className="proxy-availability__checking" style={{top:`${(checkingIndex%5)*20+10}%`}}>✱</span>}
       </span>;})}
   </div>;
 });
@@ -134,6 +137,7 @@ export default function ProxyAnalysis(){
   const controls=<ProxyMonitoring status={status}profile={profile}local={selected===LOCAL_NETWORK_PROFILE}onChanged={monitoringChanged}/>;
   const disabled=busy||Boolean(jobId)||Boolean(status?.score_busy)||status?.monitoring?.enabled===false;
   const row=(node:ViewedNode)=>{const mean=reputationMean(node);const location=nodeRegion(node);const series=availabilityView(node,chartMode);const stale=series.last_check&&Date.now()-Date.parse(series.last_check)>4*60_000;
+    const checkingAt=pendingAvailabilitySlot(status?.round,series.last_check,Boolean(status?.checking&&status.monitoring?.enabled!==false&&node.profileEnabled&&!node.unsupported&&checkingProfiles.some(p=>p.id===node.profileId)&&!(chartMode==="node_link"&&series.latest?.state==="unsupported")));
     const region=FOCUS.find(r=>r.id===location.region)?.name??(location.region==="OTHER"?"其他地区":location.region);
     return <div className="proxy-lab-node" key={node.id}>
       <div className="proxy-lab-node__heading"><label><input type="checkbox" checked={chosen.includes(node.id)} disabled={disabled} onChange={()=>choose(node.id)}/><strong>{node.name}</strong><span className="proxy-node-profile">所属配置：{node.profileName}{status?.monitoring?.enabled===false?" · 总开关暂停":node.profileEnabled?"":" · 已暂停"}</span></label>
@@ -143,7 +147,7 @@ export default function ProxyAnalysis(){
         <span className={stale?"muted":series.latest?.state==="down"?"negative":""}>{stale?"历史观测 · ":""}{series.latest?.latency_ms!=null?`${series.latest.latency_ms} ms`:series.latest?.state==="down"?"本次不可用":series.latest?.state==="unsupported"?"暂不支持":series.latest?.state==="unknown"?"检测未确认":"等待检测"}</span>
         <span>IP 参考均分 {mean?`${mean.value.toFixed(0)} / 100 · ${mean.count} 个来源`:"—"}</span>
       </div>
-      <ProxyAvailabilityBar history={series.history} start={node.windowStart}/>
+      <ProxyAvailabilityBar history={series.history} start={node.windowStart} checkingAt={checkingAt}/>
       <div className="proxy-lab-node__times"><span>24 小时前</span><span>{series.last_check?`最近 ${formatDate(series.last_check)}`:"尚无此类历史，不补齐为正常"}</span><span>现在</span></div>
       {chartMode==="https"&&<>
         {(node.legacy_samples??0)>0&&<p className="hint">24 小时记录包含 {node.legacy_samples} 次旧规则检测，历史保留原判定；新样本使用 10 个主流来源和失败复核规则。</p>}

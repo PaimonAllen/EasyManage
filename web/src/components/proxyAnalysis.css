@@ -8,3 +8,7 @@
 .local-network__http-warning{color:var(--amber)}
 
 .proxy-monitoring{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.proxy-monitoring__switch{display:inline-flex;align-items:center;gap:8px;white-space:nowrap}.proxy-monitoring__track{display:inline-block;position:relative;width:30px;height:16px;border-radius:10px;background:var(--muted);opacity:.7}.proxy-monitoring__track::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:var(--surface)}.proxy-monitoring__switch[aria-checked="true"] .proxy-monitoring__track{background:var(--cyan);opacity:1}.proxy-monitoring__switch[aria-checked="true"] .proxy-monitoring__track::after{transform:translateX(14px)}.proxy-monitoring__paused{color:var(--amber)}
+.proxy-availability__slot{position:relative}
+.proxy-availability__checking{position:absolute;right:0;z-index:1;display:grid;place-items:center;width:14px;height:12px;transform:translateY(-50%);color:#ffe37d;font-size:16px;font-weight:900;line-height:1;text-shadow:0 1px 2px #000,1px 0 2px #000,-1px 0 2px #000;pointer-events:none;animation:proxy-checking-blink 1.4s ease-in-out infinite}
+@keyframes proxy-checking-blink{0%,100%{opacity:1}50%{opacity:.2}}
+@media(prefers-reduced-motion:reduce){.proxy-availability__checking{animation:none}}

@@ -133,7 +133,6 @@ function DeviceCard({ device, disks, showBoot }: { device: BlockDevice; disks: D
         {positioned && remainder > 0 && <span><i className="partition-map__free" />未分配 / 保留 · {formatBytes(remainder)}</span>}
       </div>
       {!positioned && <p className="storage-device__note">分区起点不可读取，图中仅按容量排列，不表示真实磁盘位置。</p>}
-      {trailingFreePercent > 0 && trailingFreePercent < 2 && <p className="storage-device__note">末端极小的未分配 / 保留区域可能按最小可见宽度显示；实际容量以图例数字为准。</p>}
     </> : <p className="storage-device__note">未识别到直接分区；可能整盘使用或存在未识别布局，不能据此判断空间可用。</p>}
     <details className="storage-device-details">
       <summary>设备与分区详情{device.children.length > 0 && <span>· {device.children.length} 个下属设备</span>}</summary>

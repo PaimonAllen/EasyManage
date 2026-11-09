@@ -79,6 +79,7 @@ export function Storage({ nodes }: { nodes: NodeSummary[] }) {
                     <SnapshotAge node={node} inventory />
                   </span>
                 </p>
+                <p className="storage-device__note">末端极小的未分配 / 保留区域可能按最小可见宽度显示；实际容量以图例数字为准。</p>
               </div>
               <div className="compact-stat">
                 <span>Swap 使用</span>

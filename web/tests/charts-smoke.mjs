@@ -27,6 +27,22 @@ try {
   const proxyBar=renderToStaticMarkup(React.createElement(proxyComponents.ProxyAvailabilityBar,{history:hist,start:new Date().toISOString()}));
   assert.equal((proxyBar.match(/proxy-availability__slot /g)??[]).length,96);
   assert.ok(proxyBar.includes('slot--partial')&&proxyBar.includes('slot--unknown')&&proxyBar.includes('slot--mixed'));
+  const checkingNow=Date.parse('2026-11-09T09:00:10Z');
+  const checkingRound={started_at:'2026-11-09T09:00:01Z',finished_at:null};
+  const checkingAt=availability.pendingAvailabilitySlot(checkingRound,'2026-11-09T08:57:00Z',true,checkingNow);
+  assert.equal(checkingAt,'2026-11-09T09:00:00.000Z');
+  assert.equal(availability.pendingAvailabilitySlot(checkingRound,checkingAt,true,checkingNow),null);
+  assert.equal(availability.pendingAvailabilitySlot({...checkingRound,finished_at:'2026-11-09T09:00:09Z'},null,true,checkingNow),null);
+  assert.equal(availability.pendingAvailabilitySlot(checkingRound,null,false,checkingNow),null);
+  assert.equal(availability.pendingAvailabilitySlot(checkingRound,null,true,checkingNow+180_000),null);
+  assert.equal(availability.pendingAvailabilitySlot(undefined,null,true,checkingNow),null);
+  const checkingStart=new Date(Date.parse(checkingAt)-479*180_000).toISOString();
+  const checkingBar=renderToStaticMarkup(React.createElement(proxyComponents.ProxyAvailabilityBar,{history:hist,start:checkingStart,checkingAt}));
+  assert.equal((checkingBar.match(/class="proxy-availability__checking"/g)??[]).length,1);
+  assert.ok(checkingBar.includes('style="top:90%"')&&checkingBar.includes('本轮检测中，等待结果'));
+  assert.equal((checkingBar.match(/proxy-availability__slot /g)??[]).length,96);
+  assert.ok(!proxyBar.includes('proxy-availability__checking'));
+  console.log('PASS pending rounds mark the current three-minute sample with one star; saved, completed, paused and stale rounds have no marker');
   const probeSites=['Google','YouTube','Google Scholar','Facebook','Wikipedia','Reddit'].map(name=>({name,url:'https://example.org/',expected:'200'}));
   const probeNode={latest:{policy:3,sites:[17,18,19,20,21,-1],state:'up',latency_ms:19,detail:''}};
   const probeMarkup=renderToStaticMarkup(React.createElement(proxyComponents.ProxyProbeResults,{node:probeNode,sites:probeSites}));
@@ -529,7 +545,7 @@ try {
   }));
   assert.match(nearFull, /class="partition-map__trailing-free" style="width:0\.3%" aria-hidden="true"/,
     "tiny trailing unallocated space gets a visible region and separator");
-  assert.ok(nearFull.includes("实际容量以图例数字为准"));
+  assert.ok(!nearFull.includes("实际容量以图例数字为准"), "individual disks do not repeat the server-level note");
   const completelyAllocated = renderToStaticMarkup(React.createElement(BlockDeviceMap, {
     devices: [{ ...devices[0], children: [{ ...partition, size_bytes: 1000 }] }], disks: [],
   }));
@@ -573,6 +589,10 @@ try {
   }] }));
   assert.match(storagePage, /<span class="storage-snapshot-ages"><span class="snapshot-age[^"]*"[^>]*>磁盘采集于 [\s\S]*?<\/span><span class="snapshot-age[^"]*"[^>]*>尚未收到清单快照<\/span><\/span>/,
     "disk and inventory snapshot times share one inline row");
+  assert.equal((storagePage.match(/实际容量以图例数字为准/g) ?? []).length, 1);
+  assert.ok(storagePage.indexOf("实际容量以图例数字为准") > storagePage.indexOf("storage-snapshot-ages")
+    && storagePage.indexOf("实际容量以图例数字为准") < storagePage.indexOf("磁盘与分区拓扑"),
+    "the shared note appears once after server statistics and sample times, before disk cards");
   assert.ok(css.includes('.storage-snapshot-ages {\n  display: inline-flex;'));
   const topologyHeading = storagePage.indexOf("磁盘与分区拓扑");
   const expandAll = storagePage.indexOf(">全部展开</button>");

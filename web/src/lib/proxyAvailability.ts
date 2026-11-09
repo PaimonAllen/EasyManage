@@ -1,4 +1,13 @@
 import type {ProxyAvailabilitySeries,ProxyLabNode,ReputationScore} from "../api/proxyLab";
+// Existing round status identifies work awaiting a saved result, without new probes or polling.
+export function pendingAvailabilitySlot(round:{started_at:string|null;finished_at:string|null}|undefined,lastCheck:string|null,enabled:boolean,now=Date.now()):string|null{
+  if(!enabled||!round?.started_at||round.finished_at)return null;
+  const started=Date.parse(round.started_at);
+  if(!Number.isFinite(started)||started>now+5_000||now-started>=180_000)return null;
+  const slot=Math.floor(started/180_000)*180_000;
+  if(lastCheck&&Date.parse(lastCheck)>=slot)return null;
+  return new Date(slot).toISOString();
+}
 function availabilitySample(code:string){
   switch(code){
     case "u":return {code,state:"up",label:"正常"};

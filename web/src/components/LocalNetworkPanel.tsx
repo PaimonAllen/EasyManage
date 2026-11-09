@@ -2,13 +2,14 @@ import {useEffect,useMemo,useState,type ReactNode} from "react";
 import {fetchLocalNetwork,type LocalNetworkData,type LocalNetworkSite} from "../api/proxyLab";
 import {ProxyAvailabilityBar} from "./ProxyAnalysis";
 import {localHttpStatus,localNetworkState,localHttpFallback} from "../lib/localNetwork";
+import {pendingAvailabilitySlot} from "../lib/proxyAvailability";
 import {formatDate} from "../lib/format";
 const errorMessage=(e:unknown)=>e instanceof Error?e.message:"本机网络检测暂不可用";
-export function LocalWebsiteCard({site,start}:{site:LocalNetworkSite;start:string}){
+export function LocalWebsiteCard({site,start,checkingAt=null}:{site:LocalNetworkSite;start:string;checkingAt?:string|null}){
   const latest=site.latest;const limited=latest?.http_status!=null&&latest.http_status>=400;
   return <article className="proxy-lab-node"><div className="proxy-lab-node__heading"><strong><a href={site.url}target="_blank"rel="noopener noreferrer">{site.name} ↗</a></strong><div className="proxy-lab-node__actions"><span className="muted">{new URL(site.url).hostname} · 本机直连 HTTPS</span><a className="button button--small button--secondary" href={`/proxy-history?source=local&node=${encodeURIComponent(site.id)}&days=7`}target="_blank"rel="noopener noreferrer">测试历史 ↗</a></div></div>
     <div className="proxy-lab-node__metrics"><span>网络可用率 {site.availability_percent==null?"—":`${site.availability_percent.toFixed(1)}%`}<small> · 覆盖 {site.coverage_percent.toFixed(1)}% · {site.observed_samples}/{site.expected_samples} 次</small></span><span className={latest?.state==="down"?"negative":""}>{localNetworkState(latest?.state)}{latest?.latency_ms!=null?` · ${latest.latency_ms} ms`:""}</span><span className={limited?"local-network__http-warning":"muted"}>{localHttpStatus(latest?.http_status)}</span></div>
-    <ProxyAvailabilityBar history={site.history}start={start}/><div className="proxy-lab-node__times"><span>24 小时前</span><span>{site.last_check?`最近 ${formatDate(site.last_check)}`:"尚无检测记录"}</span><span>现在</span></div>
+    <ProxyAvailabilityBar history={site.history}start={start}checkingAt={checkingAt}/><div className="proxy-lab-node__times"><span>24 小时前</span><span>{site.last_check?`最近 ${formatDate(site.last_check)}`:"尚无检测记录"}</span><span>现在</span></div>
     {latest?.http_fallback&&<p className="hint">{localHttpFallback(latest.http_fallback)}</p>}{latest?.detail&&<p className="hint">{latest.detail}</p>}
   </article>;
 }
@@ -31,5 +32,5 @@ export default function LocalNetworkPanel({selector,controls,monitoringRevision}
     {data&&!data.enabled&&<p className="hint local-network__http-warning">本机网络检测已暂停，当前仅展示保留的历史记录。</p>}
     {(error||round?.error)&&<p className="form-error"role="alert">{error||round?.error}</p>}
   </article><div className="proxy-lab-toolbar"><label>筛选网站<input value={search}onChange={e=>setSearch(e.target.value)}placeholder="按网站名称或域名筛选"/></label><label>排序<select value={order}onChange={e=>setOrder(e.target.value)}><option value="name">网站名称</option><option value="availability">24 小时网络可用率</option><option value="latency">最近响应耗时</option></select></label></div>
-  <article className="data-panel"><header className="panel-header"><h2>网站稳定性 <small>{sites?.length??0} 个网站</small></h2></header>{sites?.map(site=><LocalWebsiteCard key={site.id}site={site}start={data!.window_start}/>)}{!data&&<p className="table-empty">正在读取网站检测记录…</p>}{data&&!sites?.length&&<p className="table-empty">没有匹配的网站。</p>}</article></section>;
+  <article className="data-panel"><header className="panel-header"><h2>网站稳定性 <small>{sites?.length??0} 个网站</small></h2></header>{sites?.map(site=><LocalWebsiteCard key={site.id}site={site}start={data!.window_start}checkingAt={pendingAvailabilitySlot(round,site.last_check,Boolean(data?.enabled))}/>)}{!data&&<p className="table-empty">正在读取网站检测记录…</p>}{data&&!sites?.length&&<p className="table-empty">没有匹配的网站。</p>}</article></section>;
 }
