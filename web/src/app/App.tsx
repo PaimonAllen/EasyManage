@@ -165,6 +165,14 @@ export function App() {
           <strong>EasyManage</strong>
         </a>
         <div className="topbar__right">
+          <div className="advanced-tools" role="group" aria-label="高级分析功能（预留）">
+            {["性能分析", "网络分析", "系统分析"].map((label) => (
+              <button key={label} className="advanced-tools__button" type="button" disabled
+                title={`${label} · 功能预留，暂未开放`} aria-label={`${label}（暂未开放）`}>
+                {label}
+              </button>
+            ))}
+          </div>
           <span className="network-scope">内网基础设施平台</span>
           <span
             className={`live-indicator ${fleet.error ? "live-indicator--error" : ""}`}
