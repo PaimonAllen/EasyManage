@@ -162,12 +162,13 @@ async fn list(State(state): State<SettingsState>) -> Result<Json<Value>, Respons
     let policy = state.settings.current();
     let items: Vec<_> = COLLECTION_ITEMS.iter().map(|(key,title,description,min,max,default)|
         json!({"key":key,"title":title,"description":description,"minimum":min,"maximum":max,"default_seconds":default})).collect();
-    let nodes = sqlx::query("SELECT n.id,COALESCE(NULLIF(n.display_name,''),n.hostname) AS hostname,n.last_seen,m.metrics->'collection_policy' AS applied_policy FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.deleted_at IS NULL ORDER BY n.hostname")
+    let nodes = sqlx::query("SELECT n.id,COALESCE(NULLIF(n.display_name,''),n.hostname) AS hostname,n.last_seen,m.metrics->'collection_policy' AS applied_policy, COALESCE(jsonb_typeof(i.payload->'inventory_samples')='object',FALSE) AS inventory_intervals FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id LEFT JOIN node_snapshot_inventory i ON i.node_id=n.id WHERE n.deleted_at IS NULL ORDER BY n.hostname")
         .fetch_all(&state.pool).await.map_err(database_error)?;
     let agents: Vec<_> = nodes.into_iter().map(|row| -> Result<Value, sqlx::Error> {
         Ok(json!({ "node_id":row.try_get::<uuid::Uuid,_>("id")?,"hostname":row.try_get::<String,_>("hostname")?,
             "last_seen":row.try_get::<chrono::DateTime<chrono::Utc>,_>("last_seen")?,
             "applied_policy":row.try_get::<Option<Value>,_>("applied_policy")?,
+            "inventory_intervals":row.try_get::<bool,_>("inventory_intervals")?,
             "users_enabled":state.settings.users_enabled(row.try_get("id")?),
             "permissions_enabled":state.settings.permissions_enabled(row.try_get("id")?),
             "proxy_enabled":state.settings.proxy_enabled(row.try_get("id")?) }))

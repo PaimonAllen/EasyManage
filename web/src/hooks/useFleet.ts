@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchNodes } from "../api/client";
 import type { NodeListResponse } from "../types/monitoring";
 
-export function useFleet(refreshIntervalMs = 5_000, enabled = true, includeSoftware = false) {
+export function useFleet(refreshIntervalMs: number | null = 5_000, enabled = true, includeSoftware = false) {
   const [data, setData] = useState<NodeListResponse | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -30,6 +30,7 @@ export function useFleet(refreshIntervalMs = 5_000, enabled = true, includeSoftw
       if (!document.hidden) void refresh();
     };
     refreshIfVisible();
+    if (refreshIntervalMs == null) return () => { request.current?.abort(); request.current = null; };
     const timer = window.setInterval(refreshIfVisible, refreshIntervalMs);
     document.addEventListener("visibilitychange", refreshIfVisible);
     return () => {

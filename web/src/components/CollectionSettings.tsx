@@ -45,7 +45,7 @@ export function CollectionSettings() {
     finally { setBusy(false); }
   }
   return <article className="data-panel collection-settings" id="platform-collection-settings">
-    <header className="panel-header"><div><h2>设置 · 采集项目与频率</h2><p>全平台统一配置，单位为秒；配置持久保存，重启不丢失。当前版本 {data?.policy.revision ?? "—"}</p></div></header>
+    <header className="panel-header"><div><h2>设置 · 采集项目与频率</h2><p>全平台统一配置，单位为秒；配置持久保存，重启不丢失。当前版本 {data?.policy.revision ?? "—"} · 设置状态每 30 秒刷新</p></div></header>
     {error && <p className="alert" role="alert">{error}</p>}
     {message && <p className="positive hint" role="status">{message}</p>}
     {data && draft ? <form onSubmit={(event) => void save(event)}>
@@ -55,7 +55,10 @@ export function CollectionSettings() {
           <td className="number">{data.policy[item.key]} 秒</td>
           <td><input aria-label={`${item.title}修改为（秒）`} type="number" required min={item.minimum} max={item.maximum} step={1} disabled={busy} value={Number.isNaN(draft[item.key]) ? "" : draft[item.key]} onChange={(event) => { setDraft({ ...draft, [item.key]: event.target.valueAsNumber }); setDirty(true); setMessage(""); }} /></td>
         </tr>)}
-        <tr><td><strong>软件包清单</strong></td><td>独立缓存；包数据库变化时在下一轮扩展采集中刷新，需新版 Agent</td><td>每小时或安装变更时</td><td className="number">3600 秒</td><td>固定小时缓存</td></tr>
+        <tr><td><strong>用户状态</strong></td><td>账户、登录会话、用户进程统计；独立低频缓存，需新版 Agent</td><td>每 3 分钟</td><td className="number">180 秒</td><td>独立采集周期</td></tr>
+        <tr><td><strong>代理运行监控 / AI Agent 工具</strong></td><td>代理进程与监听、AI Agent 安装和运行状态；不含独立网站可用性检测</td><td>每 5 分钟</td><td className="number">300 秒</td><td>独立采集周期</td></tr>
+        <tr><td><strong>软件包与运行服务</strong></td><td>软件包及服务清单独立小时缓存，需新版 Agent</td><td>每小时</td><td className="number">3600 秒</td><td>固定小时采集</td></tr>
+        <tr><td><strong>编程环境</strong></td><td>编程工具与运行时安装信息；复用原始快照，不重复扫描路径</td><td>每 12 小时</td><td className="number">43200 秒</td><td>独立采集周期</td></tr>
         <tr><td><strong>服务器安全配置</strong></td><td>AppArmor、ASLR、ptrace、Kernel Lockdown；独立缓存，需新版 Agent</td><td>每小时一次</td><td className="number">3600 秒</td><td>固定小时采集</td></tr>
         <tr><td><strong>设备详情</strong></td><td>处理器、主板、内存条、显卡、显示器、磁盘、声卡、物理网卡</td><td>每天一次</td><td className="number">86400 秒</td><td>固定日采集</td></tr>
       </tbody></table></div>
@@ -65,12 +68,12 @@ export function CollectionSettings() {
         <button className="button button--small" type="submit" disabled={busy || !dirty}>{busy ? "保存中…" : "保存并下发"}</button>
       </div>
     </form> : !error && <p className="table-empty">正在加载采集项目…</p>}
-    <p className="hint">“当前值”是平台已保存的配置；各节点是否已应用请看下方状态。间隔越小，频率越高、开销越大。GPU 与磁盘不能短于完整上报间隔；缓存项目在完整上报时检查，到期后才重新采集，实际间隔会向上对齐上报周期。权限检查使用最近一次用户清单。页面刷新频率与实际采集频率不同，重复显示缓存值不算新样本。本设置不安装软件、不改变服务权限、不修改系统目录。</p>
+    <p className="hint">“当前值”是平台已保存的配置；各节点是否已应用请看下方状态。间隔越小，频率越高、开销越大。GPU 与磁盘不能短于完整上报间隔；分项缓存按扩展清单周期检查，到期后才重新采集；实际间隔可能向上对齐扩展清单和完整上报周期。权限检查使用最近一次用户清单。页面刷新频率与实际采集频率不同，重复显示缓存值不算新样本。本设置不安装软件、不改变服务权限、不修改系统目录。</p>
     {data && <><h3 className="hint">节点应用状态</h3><div className="table-scroll"><table><thead><tr><th>节点</th><th>状态</th><th>已应用版本</th><th>最近心跳</th></tr></thead><tbody>
       {data.agents.map((agent) => {
         const online = Date.now() - Date.parse(agent.last_seen) <= 45_000;
-        const applied = policyApplied(agent.applied_policy, data.policy);
-        return <tr key={agent.node_id}><td><strong>{agent.hostname}</strong></td><td className={online && applied ? "positive" : "muted"}>{!online ? "离线 · 等待上线" : !agent.applied_policy ? "需更新 Agent" : applied ? "已应用" : "等待下次完整上报确认"}</td><td>{agent.applied_policy?.revision ?? "不支持 / 未上报"}</td><td>{formatDate(agent.last_seen)}</td></tr>;
+        const applied = policyApplied(agent.applied_policy, data.policy) && agent.inventory_intervals === true;
+        return <tr key={agent.node_id}><td><strong>{agent.hostname}</strong></td><td className={online && applied ? "positive" : "muted"}>{!online ? "离线 · 等待上线" : !agent.applied_policy ? "需更新 Agent" : !agent.inventory_intervals ? "需更新 Agent · 分项低频采集" : applied ? "已应用" : "等待下次完整上报确认"}</td><td>{agent.applied_policy?.revision ?? "不支持 / 未上报"}</td><td>{formatDate(agent.last_seen)}</td></tr>;
       })}
     </tbody></table></div></>}
   </article>;

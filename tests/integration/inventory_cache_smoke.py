@@ -4,7 +4,7 @@ import json
 
 FIELDS = (
     'block_devices', 'hardware_details', 'users', 'interfaces', 'overlay_networks',
-    'routes', 'proxy_services', 'inventory_collected_at', 'running_services',
+    'routes', 'proxy_services', 'inventory_collected_at', 'running_services', 'inventory_samples',
     'host_security', 'permission_audit', 'ai_tools', 'programming_tools',
 )
 

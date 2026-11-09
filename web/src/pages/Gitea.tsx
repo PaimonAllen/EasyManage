@@ -14,7 +14,7 @@ export function Gitea() {
     const refresh = () => void fetchGitea(controller.signal).then((result) => { setData(result); setError(""); })
       .catch((caught: unknown) => { if (!controller.signal.aborted) setError(caught instanceof Error ? caught.message : "Gitea 状态读取失败"); });
     refresh();
-    const timer = window.setInterval(refresh, 20_000);
+    const timer = window.setInterval(refresh, 300_000);
     return () => { controller.abort(); window.clearInterval(timer); };
   }, []);
   useEffect(() => {

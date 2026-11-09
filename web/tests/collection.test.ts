@@ -38,3 +38,13 @@ test("application confirmation checks the actual intervals, not just a revision 
   assert.equal(policyApplied({ ...expected, live_seconds: 1 }, expected), false);
   assert.equal(policyApplied({ ...expected, revision: 2 }, expected), false);
 });
+
+test("independent inventory freshness retains each category's original observation time", () => {
+  const host = node(1);
+  host.metrics!.inventory_samples = { programming: { collected_at: new Date(Date.now()-6*3600_000).toISOString(), interval_seconds: 43200 },
+    ai_tools: { collected_at: new Date(Date.now()-900_000).toISOString(), interval_seconds: 300 } };
+  assert.equal(inventoryFresh(host, "programming"), true);
+  assert.equal(inventoryFresh(host, "ai_tools"), false);
+  assert.equal(inventoryFresh(host, "users"), false);
+  assert.equal(inventoryFresh(host), true);
+});

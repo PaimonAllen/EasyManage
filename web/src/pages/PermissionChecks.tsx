@@ -127,7 +127,7 @@ export function PermissionChecks({ nodes }: { nodes: NodeSummary[] }) {
       finally { window.clearTimeout(timeout); request = null; }
     }
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 30_000);
+    const timer = window.setInterval(() => void refresh(), 300_000);
     const visible = () => { if (!document.hidden) void refresh(); };
     document.addEventListener("visibilitychange", visible);
     return () => { mounted.current = false; request?.abort(); window.clearInterval(timer); document.removeEventListener("visibilitychange", visible); };

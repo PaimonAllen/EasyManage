@@ -394,7 +394,24 @@ pub mod network;
 pub use network::{NetworkActivity, NetworkGroup, NetworkGroupMetric};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InventorySample {
+    pub collected_at: DateTime<Utc>,
+    pub interval_seconds: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct InventorySamples {
+    pub users: Option<InventorySample>,
+    pub software: Option<InventorySample>,
+    pub proxy: Option<InventorySample>,
+    pub ai_tools: Option<InventorySample>,
+    pub programming: Option<InventorySample>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MetricsSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_samples: Option<InventorySamples>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_control: Option<AgentControl>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

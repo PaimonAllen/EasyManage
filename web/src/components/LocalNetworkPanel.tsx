@@ -24,7 +24,7 @@ export default function LocalNetworkPanel({selector,controls,monitoringRevision}
   },[revision,monitoringRevision]);
   const sites=useMemo(()=>data?.nodes.filter(s=>(s.name+" "+s.url).toLowerCase().includes(search.toLowerCase())).sort((a,b)=>order==="availability"?(b.availability_percent??-1)-(a.availability_percent??-1):order==="latency"?(a.latest?.latency_ms??Infinity)-(b.latest?.latency_ms??Infinity):a.name.localeCompare(b.name)),[data,search,order]);
   const round=data?.round;
-  return <section className="page-content proxy-lab" aria-label="本机网络检测"><article className="data-panel"><header className="panel-header"><div><h2>本机网络检测 · 平台出口</h2><p>每 3 分钟直连国内 20 个网站 · 平台层采集 · 七天历史</p></div><a className="button button--small button--secondary"href="/proxy-history?source=local&days=7"target="_blank"rel="noopener noreferrer">七天测试历史 ↗</a></header>
+  return <section className="page-content proxy-lab" aria-label="本机网络检测"><article className="data-panel"><header className="panel-header"><div><h2>本机网络检测 · 平台出口</h2><p>每 3 分钟直连国内 20 个网站 · 状态每 30 秒刷新 · 七天历史</p></div><a className="button button--small button--secondary"href="/proxy-history?source=local&days=7"target="_blank"rel="noopener noreferrer">七天测试历史 ↗</a></header>
     <div className="proxy-lab-toolbar">{selector}{controls}<button className="button button--small button--secondary"onClick={()=>setRevision(n=>n+1)}>刷新状态</button></div>
     <p className="hint">使用平台本机网络直接发起 HTTPS HEAD，验证 DNS、连接及 TLS；HEAD 返回 404、405、501 时，额外用一次 GET 兼容复核，只读取响应头，保留两次状态。不使用已导入的代理节点，遵循本机系统路由，不主动读取或保存正文、不跟随重定向。收到有效 HTTPS/HTTP 响应表示网络可达；403、429 等真实限制仍单独标注。图表反映网络连通性，不代表网站所有业务正常。</p>
     <p className="hint">后台每 3 分钟独立检测全部 20 个网站，每次请求最多 8 秒、单站最多 18 秒；HEAD 连接失败最多重试一次，GET 兼容复核不重试。页面刷新只读取数据库结果。

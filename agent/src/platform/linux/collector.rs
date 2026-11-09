@@ -158,6 +158,7 @@ impl Collector {
                 task.abort();
             }
             self.extended.proxy_services.clear();
+            self.extended.samples.proxy = None;
             self.extended
                 .issues
                 .retain(|issue| issue.component != "proxy");
@@ -247,7 +248,8 @@ impl Collector {
             >= Duration::from_secs(self.policy.extended_seconds)
             && self.extended_task.is_none()
         {
-            self.extended_task = Some(tokio::spawn(ExtendedInventory::collect(
+            self.extended_task = Some(tokio::spawn(ExtendedInventory::collect_due(
+                Some(self.extended.clone()),
                 self.policy.users_enabled.unwrap_or(true),
                 self.policy.proxy_enabled.unwrap_or(true),
             )));
@@ -370,6 +372,7 @@ impl Collector {
         }
         let host_security = self.security.sample(&self.store).await;
         MetricsSnapshot {
+            inventory_samples: Some(self.extended.samples.clone()),
             agent_control: None,
             network_activity: None,
             hardware_details: self.hardware.clone(),

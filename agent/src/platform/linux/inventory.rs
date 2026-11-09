@@ -1,5 +1,6 @@
 use super::ai_tools;
 use super::block_devices;
+use super::inventory_cadence::Plan;
 use super::overlay_networks;
 use super::programming_tools;
 use crate::platform::common::command::read_command;
@@ -24,6 +25,7 @@ const PROXY_LIMIT: usize = 128;
 #[derive(Clone)]
 pub struct ExtendedInventory {
     pub collected_at: DateTime<Utc>,
+    pub samples: easymanage_protocol::InventorySamples,
     pub privilege: AgentPrivilege,
     pub users: Vec<UserStatus>,
     pub block_devices: Vec<BlockDevice>,
@@ -40,6 +42,16 @@ pub struct ExtendedInventory {
 
 impl ExtendedInventory {
     pub async fn collect(users_enabled: bool, proxy_enabled: bool) -> Self {
+        Self::collect_due(None, users_enabled, proxy_enabled).await
+    }
+
+    pub async fn collect_due(
+        previous: Option<Self>,
+        users_enabled: bool,
+        proxy_enabled: bool,
+    ) -> Self {
+        let previous = previous.filter(|old| Some(old.privilege.uid) == effective_uid());
+        let plan = Plan::due(previous.as_ref(), users_enabled, proxy_enabled);
         let (
             accounts,
             sessions,
@@ -54,14 +66,14 @@ impl ExtendedInventory {
         ) = tokio::join!(
             read_command("getent", &["passwd"], INVENTORY_LIMIT),
             async {
-                if users_enabled {
+                if plan.users {
                     read_command("who", &[], 256 * 1024).await
                 } else {
                     Ok(String::new())
                 }
             },
             async {
-                if users_enabled {
+                if plan.users {
                     read_command(
                         "loginctl",
                         &["list-sessions", "--no-legend", "--no-pager"],
@@ -83,19 +95,32 @@ impl ExtendedInventory {
                 &["-j", "-6", "route", "show", "table", "all"],
                 INVENTORY_LIMIT
             ),
-            super::software::collect(),
-            read_command(
-                "systemctl",
-                &[
-                    "list-units",
-                    "--type=service",
-                    "--state=running",
-                    "--no-legend",
-                    "--no-pager",
-                    "--plain"
-                ],
-                256 * 1024
-            ),
+            async {
+                if plan.software || plan.programming {
+                    super::software::collect().await
+                } else {
+                    Ok(String::new())
+                }
+            },
+            async {
+                if plan.software || plan.ai {
+                    read_command(
+                        "systemctl",
+                        &[
+                            "list-units",
+                            "--type=service",
+                            "--state=running",
+                            "--no-legend",
+                            "--no-pager",
+                            "--plain",
+                        ],
+                        256 * 1024,
+                    )
+                    .await
+                } else {
+                    Ok(String::new())
+                }
+            },
             read_command(
                 "lsblk",
                 &[
@@ -110,7 +135,7 @@ impl ExtendedInventory {
         );
         // /proc file traversal is synchronous and must not block report/shutdown tasks.
         let mut inventory = tokio::task::spawn_blocking(move || {
-            Self::from_sources(
+            Self::from_sources_plan(
                 accounts,
                 sessions,
                 logind_sessions,
@@ -120,13 +145,13 @@ impl ExtendedInventory {
                 packages,
                 services,
                 block_devices,
-                users_enabled,
-                proxy_enabled,
+                plan,
             )
         })
         .await
         .unwrap_or_else(|_| Self {
             collected_at: Utc::now(),
+            samples: Default::default(),
             privilege: current_privilege(&HashMap::new()),
             users: Vec::new(),
             block_devices: Vec::new(),
@@ -142,16 +167,22 @@ impl ExtendedInventory {
         });
         // Connection names share the cold inventory cadence, never the live loop.
         super::interface_connections::enrich(&mut inventory.interfaces).await;
-        Self {
-            overlay_networks,
-            ..inventory
-        }
+        plan.merge(
+            Self {
+                overlay_networks,
+                ..inventory
+            },
+            previous,
+            users_enabled,
+            proxy_enabled,
+        )
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "bounded inventory parsers share a single issue accumulator"
     )]
+    #[cfg(test)]
     fn from_sources(
         accounts: io::Result<String>,
         sessions: io::Result<String>,
@@ -165,6 +196,34 @@ impl ExtendedInventory {
         users_enabled: bool,
         proxy_enabled: bool,
     ) -> Self {
+        Self::from_sources_plan(
+            accounts,
+            sessions,
+            logind_sessions,
+            interfaces,
+            routes_v4,
+            routes_v6,
+            packages,
+            services,
+            block_devices,
+            Plan::all(users_enabled, proxy_enabled),
+        )
+    }
+
+    fn from_sources_plan(
+        accounts: io::Result<String>,
+        sessions: io::Result<String>,
+        logind_sessions: io::Result<String>,
+        interfaces: io::Result<String>,
+        routes_v4: io::Result<String>,
+        routes_v6: io::Result<String>,
+        packages: io::Result<String>,
+        services: io::Result<String>,
+        block_devices: io::Result<String>,
+        plan: Plan,
+    ) -> Self {
+        let users_enabled = plan.users;
+        let proxy_enabled = plan.proxy;
         let mut issues = Vec::new();
         let passwd = accounts.unwrap_or_else(|_| {
             issues.push(issue("users", "NSS 账户查询不可用，仅显示可读取的本地账户"));
@@ -255,14 +314,19 @@ impl ExtendedInventory {
         };
         let privilege = current_privilege(&owners);
         let mut ai_processes = HashMap::new();
-        let (proxy_services, ssh_sessions, processes_complete) = process_inventory(
-            &mut users,
-            &owners,
-            &mut ai_processes,
-            &mut issues,
-            users_enabled,
-            proxy_enabled,
-        );
+        let (proxy_services, ssh_sessions, processes_complete) = if plan.processes() {
+            process_inventory(
+                &mut users,
+                &owners,
+                &mut ai_processes,
+                &mut issues,
+                users_enabled,
+                proxy_enabled,
+                plan.ai,
+            )
+        } else {
+            (Vec::new(), HashMap::new(), false)
+        };
         if users_enabled {
             for user in &mut users {
                 let terminal = terminal_sessions
@@ -381,11 +445,19 @@ impl ExtendedInventory {
             .iter()
             .find(|user| user.uid == privilege.uid)
             .map(|user| user.home.as_str());
-        let ai_tools =
-            ai_tools::inventory(&ai_homes, &ai_processes, &running_services, &mut issues);
-        let programming_tools = programming_tools::inventory(agent_home, &software_packages);
+        let ai_tools = if plan.ai {
+            ai_tools::inventory(&ai_homes, &ai_processes, &running_services, &mut issues)
+        } else {
+            Vec::new()
+        };
+        let programming_tools = if plan.programming {
+            programming_tools::inventory(agent_home, &software_packages)
+        } else {
+            Vec::new()
+        };
         Self {
             collected_at: Utc::now(),
+            samples: Default::default(),
             privilege,
             users,
             block_devices,
@@ -402,6 +474,7 @@ impl ExtendedInventory {
     }
 
     pub fn clear_user_status(&mut self) {
+        self.samples.users = None;
         // Base account IDs/home paths remain inputs to the separate permission and
         // tool checks. No groups, sessions, process counts or shell status are retained.
         for user in &mut self.users {
@@ -528,6 +601,7 @@ fn process_inventory(
     issues: &mut Vec<CollectionIssue>,
     users_enabled: bool,
     proxy_enabled: bool,
+    ai_enabled: bool,
 ) -> (Vec<ProxyService>, HashMap<u32, u32>, bool) {
     let Ok(entries) = fs::read_dir("/proc") else {
         issues.push(issue("processes", "/proc 不可读取；进程和代理服务列表未知"));
@@ -587,7 +661,9 @@ fn process_inventory(
         if users_enabled && uid != 0 && matches!(name.as_str(), "sshd" | "sshd-session") {
             *ssh_sessions.entry(uid).or_default() += 1;
         }
-        ai_partial |= record_ai_process(ai_processes, owners, &name, pid, uid);
+        if ai_enabled {
+            ai_partial |= record_ai_process(ai_processes, owners, &name, pid, uid);
+        }
         if !proxy_enabled || !is_proxy(&name) {
             continue;
         }
@@ -618,7 +694,7 @@ fn process_inventory(
             "部分进程不可读取或数量达到上限；进程计数未知，服务列表可能不完整",
         ));
     }
-    if partial || ai_partial {
+    if ai_enabled && (partial || ai_partial) {
         issues.push(issue(
             "ai_tools",
             "进程清单不可完整读取或超过上限；AI 工具运行状态可能不完整",

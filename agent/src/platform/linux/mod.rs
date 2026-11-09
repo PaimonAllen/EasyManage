@@ -8,6 +8,7 @@ mod cpu_frequency;
 mod hardware;
 mod interface_connections;
 pub(super) mod inventory;
+mod inventory_cadence;
 mod mounts;
 mod network_capacity;
 mod network_counters;

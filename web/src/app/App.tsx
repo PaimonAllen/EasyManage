@@ -18,6 +18,7 @@ import { Network } from "../pages/Network";
 import { Storage } from "../pages/Storage";
 import { Users } from "../pages/Users";
 import type { NodeSummary } from "../types/monitoring";
+import { pageRefreshLabel, pageRefreshSeconds } from "../lib/pageRefresh";
 
 const Operations = lazy(() => import("../pages/Operations"));
 const GpuComparison = lazy(() => import("../pages/GpuComparison"));
@@ -65,7 +66,9 @@ export function App() {
   const documentPage = page === "gpu-comparison";
   const needsTargets = ["overview", "operations", "agent-management"].includes(page);
   const needsFleet = page !== "platform-health" && page !== "gitea" && !documentPage;
-  const fleet = useFleet(page === "overview" ? 10_000 : 30_000, needsFleet, page === "software");
+  const seconds = pageRefreshSeconds(page);
+  const refreshLabel = pageRefreshLabel(page);
+  const fleet = useFleet(seconds == null ? null : seconds * 1000, needsFleet, page === "software");
   const [config, setConfig] = useState<PlatformConfig>({
     documentation_url: "/guide/easymanage.html",
     operations_enabled: false,
@@ -147,14 +150,15 @@ export function App() {
       }
     }
     void refreshTargets();
-    const timer = window.setInterval(() => void refreshTargets(), 60_000);
+    if (page === "operations") return () => controller.abort();
+    const timer = window.setInterval(() => void refreshTargets(), page === "agent-management" ? 30_000 : 60_000);
     document.addEventListener("visibilitychange", refreshTargets);
     return () => {
       controller.abort();
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refreshTargets);
     };
-  }, [needsTargets]);
+  }, [needsTargets, page]);
 
   const nodes = fleet.data?.nodes ?? [];
   return (
@@ -174,12 +178,12 @@ export function App() {
             ))}
           </div>
           <span className="network-scope">内网基础设施平台</span>
-          <span
-            className={`live-indicator ${fleet.error ? "live-indicator--error" : ""}`}
+          {refreshLabel && <span
+            className={`live-indicator ${fleet.error && needsFleet ? "live-indicator--error" : ""}`}
           >
             <i />
-            {documentPage ? "文档按需读取" : fleet.error ? "采集接口连接异常" : page === "overview" ? "总览实时指标每 1 秒刷新" : "每 30 秒刷新"}
-          </span>
+            {refreshLabel}{fleet.error && needsFleet ? " · 连接异常" : ""}
+          </span>}
           <button
             className="theme-toggle"
             type="button"

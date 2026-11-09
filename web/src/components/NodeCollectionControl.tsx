@@ -34,10 +34,10 @@ export function useNodeCollection(kind:"users"|"permissions"|"proxy") {
       catch(error){if(!controller.signal.aborted&&revision.current===started)setSettingsError(error instanceof Error?error.message:"采集开关读取失败");}
       finally {pending=false;}
     }
-    void refresh(); const timer=window.setInterval(()=>void refresh(),15_000);
+    void refresh(); const timer=window.setInterval(()=>void refresh(),kind==="users"?180_000:300_000);
     document.addEventListener("visibilitychange",refresh);
     return()=>{active.current=false;controller.abort();window.clearInterval(timer);document.removeEventListener("visibilitychange",refresh);};
-  },[]);
+  },[kind]);
   async function toggle(id:string,enabled:boolean){
     if(saving.current.has(id))return;
     saving.current.add(id);revision.current+=1;

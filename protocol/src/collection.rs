@@ -56,12 +56,12 @@ pub const COLLECTION_ITEMS: &[(&str, &str, &str, u64, u64, u64)] = &[
         "挂载点容量、设备读写速率；CPU / SSD 温度复用此周期且不低于 30 秒；不读写业务文件",
         10,
         3600,
-        30,
+        60,
     ),
     (
         "extended_seconds",
         "扩展清单",
-        "用户与会话、块设备与分区、网卡/路由、Tailscale/ZeroTier、代理、运行服务、AI 与编程工具；软件包小时缓存，安全配置每小时采集",
+        "块设备与分区、网卡/路由、Tailscale/ZeroTier；用户、代理、软件及工具按各自独立周期采集",
         30,
         3600,
         60,
@@ -80,7 +80,7 @@ pub const COLLECTION_ITEMS: &[(&str, &str, &str, u64, u64, u64)] = &[
         "OS、内核、架构、CPU 型号与核心数",
         60,
         86400,
-        300,
+        3600,
     ),
     (
         "server_process_seconds",
@@ -104,7 +104,7 @@ pub const COLLECTION_ITEMS: &[(&str, &str, &str, u64, u64, u64)] = &[
         "本机 Gitea 健康、版本、可见账户；按需读取的缓存间隔",
         30,
         3600,
-        60,
+        300,
     ),
 ];
 
@@ -118,13 +118,13 @@ impl Default for CollectionPolicy {
             live_seconds: 1,
             report_seconds: 10,
             gpu_seconds: 10,
-            disk_seconds: 30,
+            disk_seconds: 60,
             extended_seconds: 60,
             permission_seconds: 300,
-            node_seconds: 300,
+            node_seconds: 3600,
             server_process_seconds: 15,
             platform_health_seconds: 15,
-            gitea_seconds: 60,
+            gitea_seconds: 300,
         }
     }
 }

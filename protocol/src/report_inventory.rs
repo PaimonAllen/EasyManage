@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 pub const FIELDS: &[&str] = &[
     "block_devices", "hardware_details", "users", "interfaces", "overlay_networks",
     "routes", "proxy_services", "inventory_collected_at", "running_services",
-    "host_security", "permission_audit", "ai_tools", "programming_tools",
+    "host_security", "permission_audit", "ai_tools", "programming_tools", "inventory_samples",
 ];
 
 pub fn take(metrics: &mut Value) -> Value {

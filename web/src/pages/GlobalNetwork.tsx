@@ -38,14 +38,14 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
     .sort((left, right) => left.node.hostname.localeCompare(right.node.hostname)
       || left.service.username.localeCompare(right.service.username)
       || left.service.name.localeCompare(right.service.name)), [nodes, selectedNode,enabledById]);
-  const current = rows.filter(({ node }) => inventoryFresh(node));
+  const current = rows.filter(({ node }) => inventoryFresh(node, "proxy"));
   const users = new Set(current.map(({ node, service }) => `${node.id}:${service.uid}`));
   const visibleListeners = current.reduce((count, { service }) => count + service.listen_addresses.length, 0);
   const portAnalysis = analyzeProxyPorts(current.map(({ node, service }) => ({
     nodeId: node.id, hostname: node.hostname, service,
   })));
   const monitoredNodes = visibleNodes.filter(node=>proxyMonitoringVisible(node,enabledFor(node.id)));
-  const incomplete = monitoredNodes.some((node) => !inventoryFresh(node)
+  const incomplete = monitoredNodes.some((node) => !inventoryFresh(node, "proxy")
     || node.metrics?.privilege?.mode !== "full"
     || node.metrics?.collection_issues?.some((issue) =>
       (issue.component === "proxy" || issue.component === "processes")
@@ -84,7 +84,7 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
         const services = node.metrics?.proxy_services ?? [];
         const accounts = new Set(services.map((service) => service.uid));
         return <NodePanel node={node} key={node.id} header={
-          <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p><SnapshotAge node={node} inventory /></p></div>
+          <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p><SnapshotAge node={node} inventory category="proxy" /></p></div>
             <NodeCollectionToggle hostname={node.hostname} label="代理监控采集" enabled={enabled} applied={applied}
               unavailable={settings!==null&&enabled===undefined}
               online={node.online} busy={!!busy[node.id]} onChange={()=>{if(enabled!==undefined)void toggle(node.id,enabled);}}/>
@@ -114,7 +114,7 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
             <td>{service.name}<small>PID {service.pid}</small></td>
             <td>{listenerScope(service.listen_addresses)}</td>
             <td>{service.listen_addresses.length ? service.listen_addresses.map((address) => <code className="block" key={address}>{address}</code>) : "未监听或不可读取"}</td>
-            <td className={inventoryFresh(node) ? "positive" : "muted"}>{inventoryFresh(node) ? "新鲜" : "历史"}</td>
+            <td className={inventoryFresh(node, "proxy") ? "positive" : "muted"}>{inventoryFresh(node, "proxy") ? "新鲜" : "历史"}</td>
           </tr>)}
         </tbody></table></div>
         {!rows.length && <p className="table-empty">{visibleNodes.length>0&&!monitoredNodes.length?"所选机器的代理监控已关闭或等待开启，不展示历史实例。":"所选节点当前没有可见的代理实例。"}</p>}

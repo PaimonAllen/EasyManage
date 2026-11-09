@@ -18,6 +18,12 @@ const server = await createServer({
   server: { middlewareMode: true, watch: null },
 });
 try {
+  const pageRefresh=await server.ssrLoadModule('/src/lib/pageRefresh.ts');
+  const expectedPageSeconds={overview:10,users:180,storage:60,network:60,operations:null,security:3600,permissions:300,'platform-health':15,software:3600,'global-network':300,gitea:300,'ai-tools':300,'programming-environment':43200,'gpu-comparison':null,'agent-management':30};
+  for(const [page,seconds] of Object.entries(expectedPageSeconds))assert.equal(pageRefresh.pageRefreshSeconds(page),seconds,page);
+  assert.equal(pageRefresh.pageRefreshLabel('operations'),null);
+  assert.ok(pageRefresh.pageRefreshLabel('programming-environment').includes('12 小时'));
+  assert.ok(pageRefresh.pageRefreshLabel('global-network').includes('代理监控每 5 分钟'));
   const availability=await server.ssrLoadModule('/src/lib/proxyAvailability.ts');
   const proxyComponents=await server.ssrLoadModule('/src/components/ProxyAnalysis.tsx');
   const hist='-'.repeat(470)+'uuuuu'+'usdd-';
@@ -818,6 +824,17 @@ try {
   assert.ok(agentManagement.includes("强制重启平台") && agentManagement.includes("失败回退文件，不回退数据库迁移"));
   assert.ok(/disabled=""[^>]*title="正在检查平台候选"/.test(agentManagement));
   console.log("PASS separate platform update entry, unavailable-candidate protection and migration risk notice");
+  const {App}=await server.ssrLoadModule('/src/app/App.tsx');
+  const originalWindow=globalThis.window;
+  try {
+    for(const page of ['operations','users','storage','security','platform-health','software','global-network','gitea','ai-tools','programming-environment','agent-management']){
+      globalThis.window={location:{hash:'#/'+page}};
+      const header=renderToStaticMarkup(React.createElement(App)).split('<nav')[0];
+      if(page==='operations')assert.ok(!header.includes('live-indicator')&&!header.includes('刷新'));
+      else assert.ok(header.includes(pageRefresh.pageRefreshLabel(page)),page+' header follows its refresh interval');
+    }
+  } finally {globalThis.window=originalWindow;}
+  console.log('PASS page refresh intervals and rendered header labels agree; operations has no refresh timer label');
 } finally {
   await server.close();
 }

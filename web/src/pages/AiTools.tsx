@@ -19,7 +19,7 @@ function observedState(tool: AiToolStatus) {
 
 export function AiTools({ nodes }: { nodes: NodeSummary[] }) {
   const [showAll, setShowAll] = useState(false);
-  const freshTools = nodes.filter(isFresh).flatMap((node) => node.metrics?.ai_tools ?? []).filter(isAgentTool);
+  const freshTools = nodes.filter(node => isFresh(node, "ai_tools")).flatMap((node) => node.metrics?.ai_tools ?? []).filter(isAgentTool);
   const installed = freshTools.filter((tool) => tool.executable_paths.length > 0).length;
   const processes = freshTools.reduce((total, tool) => total + tool.processes.length, 0);
   const services = freshTools.reduce((total, tool) => total + tool.service_units.length, 0);
@@ -42,13 +42,13 @@ export function AiTools({ nodes }: { nodes: NodeSummary[] }) {
         const visible = (tools ?? []).filter((tool) => showAll || detected(tool));
         const incomplete = node.metrics?.collection_issues?.some((issue) => issue.component === "ai_tools" || issue.component === "inventory");
         return <NodePanel node={node} key={node.id} header={
-          <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p><SnapshotAge node={node} inventory /></p>{incomplete && <p className="ai-scan-warning">扫描不完整 · 展开下方采集限制查看原因{!isFresh(node) && " · 历史"}</p>}</div><span className={isFresh(node) ? "positive" : "muted"}>{isFresh(node) ? "当前观测" : "历史或未知"}</span></header>
+          <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p><SnapshotAge node={node} inventory category="ai_tools" /></p>{incomplete && <p className="ai-scan-warning">扫描不完整 · 展开下方采集限制查看原因{!isFresh(node, "ai_tools") && " · 历史"}</p>}</div><span className={isFresh(node, "ai_tools") ? "positive" : "muted"}>{isFresh(node, "ai_tools") ? "当前观测" : "历史或未知"}</span></header>
           }>{() => <>
           {node.metrics?.ai_tools?.length ? <>
             <div className="table-scroll"><table><thead><tr><th>工具</th><th>类型</th><th>状态</th><th>可执行文件</th><th>运行进程 / 用户</th><th>运行服务</th></tr></thead><tbody>
               {visible.map((tool) => <tr key={tool.name}>
                 <td><strong>{agentToolLabel(tool.name)}</strong><code className="block">{tool.name}</code></td><td>Agent 工具</td>
-                <td className={isFresh(node) && (tool.processes.length || tool.service_units.length) ? "positive" : "muted"}>{observedState(tool)}{!isFresh(node) && " · 历史"}</td>
+                <td className={isFresh(node, "ai_tools") && (tool.processes.length || tool.service_units.length) ? "positive" : "muted"}>{observedState(tool)}{!isFresh(node, "ai_tools") && " · 历史"}</td>
                 <td>{tool.executable_paths.length ? tool.executable_paths.map((path) => <code className="block" key={path}>{path}</code>) : "未在限定路径发现"}</td>
                 <td>{tool.processes.length ? tool.processes.map((process) => <span className="block" key={process.pid}>{process.username}（UID {process.uid}，PID {process.pid}）</span>) : "未观测到"}</td>
                 <td>{tool.service_units.length ? tool.service_units.join(", ") : "未观测到"}</td>

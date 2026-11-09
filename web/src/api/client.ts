@@ -16,7 +16,7 @@ export async function fetchPlatformNetwork(signal?:AbortSignal):Promise<Platform
 export interface CollectionSettingsStatus {
   policy: CollectionPolicy;
   items: { key: Exclude<keyof CollectionPolicy, "revision" | "users_enabled" | "permissions_enabled" | "proxy_enabled">; title: string; description: string; minimum: number; maximum: number; default_seconds: number }[];
-  agents: { node_id: string; hostname: string; last_seen: string; applied_policy: CollectionPolicy | null; users_enabled: boolean; permissions_enabled: boolean; proxy_enabled?: boolean }[];
+  agents: { node_id: string; hostname: string; last_seen: string; applied_policy: CollectionPolicy | null; inventory_intervals?: boolean; users_enabled: boolean; permissions_enabled: boolean; proxy_enabled?: boolean }[];
 }
 
 export async function saveProxyCollection(nodeId:string,enabled:boolean,expectedEnabled:boolean):Promise<{enabled:boolean;message:string}> {

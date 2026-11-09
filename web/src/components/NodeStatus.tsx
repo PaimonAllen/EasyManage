@@ -1,30 +1,36 @@
 import type { NodeSummary } from "../types/monitoring";
 import { formatDate } from "../lib/format";
+import { inventorySample, type InventoryCategory } from "../lib/collection";
 
 export function SnapshotAge({
   node,
   inventory = false,
   disk = false,
+  category,
 }: {
   node: NodeSummary;
   inventory?: boolean;
   disk?: boolean;
+  category?: InventoryCategory;
 }) {
+  const sample = inventorySample(node, category);
+  const names = { users: "用户", software: "软件与服务", proxy: "代理", ai_tools: "AI 工具", programming: "编程环境" };
+  const label = disk ? "磁盘" : category ? names[category] : inventory ? "清单" : "指标";
   const timestamp = disk
     ? node.metrics?.disk_collected_at ?? node.metrics?.collected_at
-    : inventory
-    ? node.metrics?.inventory_collected_at
+    : inventory || category
+    ? sample.timestamp
     : node.metrics?.collected_at;
   const collected = timestamp ? Date.parse(timestamp) : NaN;
   if (!Number.isFinite(collected))
     return (
       <span className="snapshot-age">
-        尚未收到{disk ? "磁盘" : inventory ? "清单" : "指标"}快照
+        尚未收到{label}快照
       </span>
     );
   const age = Math.max(0, Math.floor((Date.now() - collected) / 1_000));
   const policy = node.metrics?.collection_policy;
-  const stale = !node.online || age > (disk ? (policy?.disk_seconds ?? 30) * 2 + 30 : inventory ? (policy?.extended_seconds ?? 60) * 2 + 30 : 45);
+  const stale = !node.online || age > (disk ? (policy?.disk_seconds ?? 60) * 2 + 30 : inventory || category ? sample.seconds * 2 + 30 : 45);
   const ageLabel =
     age < 60
       ? `${age} 秒前`
@@ -36,7 +42,7 @@ export function SnapshotAge({
       className={`snapshot-age ${stale ? "snapshot-age--stale" : ""}`}
       title={formatDate(timestamp)}
     >
-      {disk ? "磁盘" : inventory ? "清单" : "指标"}采集于 {formatDate(timestamp)} · {ageLabel}
+      {label}采集于 {formatDate(timestamp)} · {ageLabel}
       {stale && " · 历史快照"}
     </span>
   );

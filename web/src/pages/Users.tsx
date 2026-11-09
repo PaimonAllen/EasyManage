@@ -102,7 +102,7 @@ export function Users({ nodes, targets }: { nodes: NodeSummary[]; targets: Opera
                     {node.hostname} <NodeStatus node={node} />
                   </h2>
                   <p>
-                    <SnapshotAge node={node} inventory />
+                    <SnapshotAge node={node} inventory category="users" />
                   </p>
                 </div>
                 <div className="user-collection-actions"><PrivilegeBadge node={node} />

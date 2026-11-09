@@ -223,6 +223,7 @@ export interface CpuSocketMetric {
   usage_percent:number|null;frequency:CpuFrequency|null;temperature_celsius:number|null;
 }
 export interface MetricsSnapshot {
+  inventory_samples?: Partial<Record<"users" | "software" | "proxy" | "ai_tools" | "programming", { collected_at: string; interval_seconds: number } | null>> | null;
   cpu_frequency?: CpuFrequency | null;
   cpu_sockets?: CpuSocketMetric[];
   agent_control?: {revision:number;paused:boolean} | null;

@@ -73,7 +73,7 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
       } finally { pending = false; }
     }
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 15_000);
+    const timer = window.setInterval(() => void refresh(), 30_000);
     return () => { controller.abort(); window.clearInterval(timer); };
   }, []);
   useEffect(() => {
@@ -90,7 +90,7 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
       } finally { pending = false; }
     }
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 15_000);
+    const timer = window.setInterval(() => void refresh(), 30_000);
     return () => { controller.abort(); window.clearInterval(timer); };
   }, []);
   const targetByNode = new Map(targets.map((target) => [target.node_id, target]));

@@ -264,6 +264,8 @@ def exercise_api(base_url, context, enrollment_token, node_id):
         "overlay_networks": [{"provider": "tailscale", "state": "healthy", "detail": "fixture", "networks": []}],
         "routes": [], "proxy_services": [], "collection_issues": [],
         "inventory_collected_at": collected.isoformat(),
+        "inventory_samples": {"programming": {"collected_at": (collected - timedelta(hours=6)).isoformat(), "interval_seconds": 43200},
+                              "software": {"collected_at": collected.isoformat(), "interval_seconds": 3600}},
     }
     report = {"protocol_version": 1, "node_id": node_id, "agent_version": "0.1.0", "inventory": inventory, "metrics": metrics}
     require(request("/api/v1/agent/report", report)[0] == 401, "reporting without an Agent token is rejected")
@@ -346,6 +348,9 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     require(node['metrics']['interfaces'][0]['connection_name'] == 'Office profile'
             and node['metrics']['interfaces'][0]['wifi_ssid'] == 'Office:WiFi',
             'active Wi-Fi SSID and connection name survive HTTPS and database inventory round trip')
+    require(node['metrics']['inventory_samples']['programming']['interval_seconds'] == 43200
+            and parse_timestamp(node['metrics']['inventory_samples']['programming']['collected_at']) == collected - timedelta(hours=6),
+            'independent inventory intervals and original cached timestamps survive HTTPS/database round trip')
     require(node['metrics']['host_security']['interval_seconds']==3600
             and parse_timestamp(node['metrics']['host_security']['collected_at'])==collected-timedelta(minutes=30)
             and node['metrics']['host_security']['apparmor_enabled'] is True,

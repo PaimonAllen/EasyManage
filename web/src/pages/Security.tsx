@@ -11,7 +11,7 @@ function securityObservation(value: boolean | null | undefined, on: string, off:
 
 export function Security({ nodes }: { nodes: NodeSummary[] }) {
   return <>
-    <PageHeading eyebrow="Managed host security" title="Security · 服务器安全" description="安全配置每小时采集一次；账户和 SSH 服务状态复用扩展清单，页面刷新不会触发重扫" />
+    <PageHeading eyebrow="Managed host security" title="Security · 服务器安全" description="页面与安全配置每 1 小时更新；账户和 SSH 服务复用各自采集快照" />
     <section className="page-content">
       {nodes.map((node) => {
         const metrics = node.metrics;
@@ -38,7 +38,7 @@ export function Security({ nodes }: { nodes: NodeSummary[] }) {
             <tr><td>管理组账户</td><td>{admins.length ? admins.map((user) => user.username).join(", ") : "未观测到"}</td><td>依据可见账户的 sudo / wheel / lab-admins 组信息</td></tr>
             <tr><td>防火墙规则</td><td>未验证</td><td>不以服务进程或端口可达性推断实际过滤规则</td></tr>
           </tbody></table></div>
-          <p className="hint">账户和 SSH 服务清单采集于 {formatDate(inventoryAt)}；沿用扩展清单频率和各机器采集开关。</p>
+          <p className="hint">账户采集于 {formatDate(metrics?.inventory_samples?.users?.collected_at ?? inventoryAt)}（每 3 分钟）；SSH 服务清单采集于 {formatDate(metrics?.inventory_samples?.software?.collected_at ?? inventoryAt)}（每小时）。页面刷新不会触发重扫。</p>
           <p className="hint">这是当前 Agent 可读取的安全配置快照，不是漏洞扫描或合规结论。离线及过期数据仅供历史参考；未知项不可视作安全。</p>
         </>}</NodePanel>;
       })}

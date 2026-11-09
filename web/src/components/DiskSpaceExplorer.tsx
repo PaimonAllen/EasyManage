@@ -16,7 +16,7 @@ export function DiskSpaceExplorer({nodes,showBoot=true}:{nodes:NodeSummary[];sho
   const [selected,setSelected]=useState("");
   const node=nodes.find(n=>n.id===selected)??nodes[0];
   return <article className="data-panel disk-explorer">
-    <header className="panel-header"><div><h2>磁盘空间分析</h2><p>按目录层级定位空间占用 · 手动扫描 · 只读</p></div>
+    <header className="panel-header"><div><h2>磁盘空间分析</h2><p>按目录层级定位空间占用 · 手动扫描 · 只读 · 记录每 1 分钟刷新，扫描中进度每 3 秒更新</p></div>
       <label className="disk-explorer__machine">选择机器<select value={node?.id??""} onChange={e=>setSelected(e.target.value)} aria-label="磁盘空间分析机器">
         {nodes.map(n=><option key={n.id} value={n.id}>{n.hostname}{n.online?"":" · 离线"}</option>)}
       </select></label></header>
@@ -53,6 +53,8 @@ function MachineSpace({node,showBoot}:{node:NodeSummary;showBoot:boolean}){
   useEffect(()=>{
     const controller=new AbortController();let timer:ReturnType<typeof setTimeout>;
     async function load(){
+      if(controller.signal.aborted)return;
+      if(document.hidden){timer=setTimeout(load,60000);return;}
       try{
         const next=await fetchSpaceStatus(node.id,controller.signal);if(controller.signal.aborted)return;
         setStatus(next);setPath(current=>current||next.default_path||"/");
@@ -63,8 +65,8 @@ function MachineSpace({node,showBoot}:{node:NodeSummary;showBoot:boolean}){
           const key=`${summary.id}:${summary.status}:${summary.finished_at}`;
           if(loaded.current!==key){const detail=await fetchSpaceScan(node.id,summary.id,controller.signal);if(!controller.signal.aborted){setScan(detail);loaded.current=key;}}
         }else{setScan(null);loaded.current="";}
-        if(!controller.signal.aborted)timer=setTimeout(()=>{if(document.hidden){timer=setTimeout(load,15000);}else void load();},next.scans.some(s=>s.status==="running")?3000:15000);
-      }catch(e){if(!controller.signal.aborted){setError(e instanceof Error?e.message:"读取扫描记录失败");setScan(null);loaded.current="";timer=setTimeout(load,15000);}}
+        if(!controller.signal.aborted)timer=setTimeout(load,next.scans.some(s=>s.status==="running")?3000:60000);
+      }catch(e){if(!controller.signal.aborted){setError(e instanceof Error?e.message:"读取扫描记录失败");setScan(null);loaded.current="";timer=setTimeout(load,60000);}}
     }
     void load();return()=>{controller.abort();clearTimeout(timer);};
   },[node.id,selected,refresh]);

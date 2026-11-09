@@ -4,9 +4,20 @@ export function policyApplied(applied: CollectionPolicy | null, expected: Collec
   return !!applied && Object.entries(expected).every(([key, value]) => applied[key as keyof CollectionPolicy] === value);
 }
 
-export function inventoryFresh(node: NodeSummary): boolean {
-  const at = Date.parse(node.metrics?.inventory_collected_at ?? "");
-  const seconds = (node.metrics?.collection_policy?.extended_seconds ?? 60) * 2 + 30;
+export type InventoryCategory = "users" | "software" | "proxy" | "ai_tools" | "programming";
+
+export function inventorySample(node: NodeSummary, category?: InventoryCategory) {
+  if (category && node.metrics?.inventory_samples) {
+    const sample = node.metrics.inventory_samples[category];
+    return { timestamp: sample?.collected_at, seconds: sample?.interval_seconds ?? 60 };
+  }
+  return { timestamp: node.metrics?.inventory_collected_at, seconds: node.metrics?.collection_policy?.extended_seconds ?? 60 };
+}
+
+export function inventoryFresh(node: NodeSummary, category?: InventoryCategory): boolean {
+  const sample = inventorySample(node, category);
+  const at = Date.parse(sample.timestamp ?? "");
+  const seconds = sample.seconds * 2 + 30;
   return node.online && Number.isFinite(at) && Date.now() - at <= seconds * 1000;
 }
 
