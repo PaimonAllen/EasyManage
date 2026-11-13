@@ -1,3 +1,4 @@
+import {isPartition,isWindowsDevice} from "./storageTopology.ts";
 import type {BlockDevice,DiskMetric} from "../types/monitoring";
 
 export function isBootMount(path:string):boolean {
@@ -5,7 +6,8 @@ export function isBootMount(path:string):boolean {
   return value==="/boot"||value.startsWith("/boot/")||value==="/efi";
 }
 export function isBootPartition(device:BlockDevice):boolean {
-  if(device.kind!=="part"||device.mount_points.includes("/"))return false;
+  if(!isPartition(device)||device.mount_points.includes("/"))return false;
+  if(isWindowsDevice(device)&&device.partition_label?.trim().toLowerCase()==="system")return true;
   return device.mount_points.some(isBootMount)||/^(efi(?: system(?: partition)?)?|esp|bios boot(?: partition)?|boot|启动分区|efi 系统分区)$/i.test((device.partition_label??device.label??"").trim());
 }
 export const isNetworkStorage=(disk:DiskMetric)=>disk.mount?.network??/^(nfs4?|cifs|smb3|(?:fuse\.)?sshfs|9p|ceph|(?:fuse\.)?glusterfs)$/.test(disk.file_system);

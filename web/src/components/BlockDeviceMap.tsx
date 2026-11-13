@@ -1,3 +1,4 @@
+import {isPartition,isWindowsDevice,deviceMountPoints,blockDeviceTitle,solidState,windowsMountKey} from "../lib/storageTopology";
 import { useId, useState } from "react";
 import { formatBytes } from "../lib/format";
 import { diskRecording } from "../lib/diskRecording";
@@ -10,7 +11,10 @@ type Segment = { device: BlockDevice; start: number; size: number };
 
 function mountedUsage(device: BlockDevice, disks: DiskMetric[]) {
   const path = device.path ?? `/dev/${device.name}`;
-  const disk = disks.find((item) => item.name === path && device.mount_points.includes(item.mount_point));
+  const mounts=deviceMountPoints(device);
+  const disk = disks.find((item) => isWindowsDevice(device)
+    ? mounts.some(mount=>windowsMountKey(mount)===windowsMountKey(item.mount_point))
+    : item.name === path && mounts.includes(item.mount_point));
   if (!disk || !capacityKnown(disk) || !Number.isFinite(disk.total_bytes) || !Number.isFinite(disk.available_bytes)
     || disk.total_bytes <= 0 || device.size_bytes <= 0 || disk.available_bytes < 0
     || disk.available_bytes > disk.total_bytes) return null;
@@ -19,7 +23,7 @@ function mountedUsage(device: BlockDevice, disks: DiskMetric[]) {
 }
 
 function layout(device: BlockDevice): { segments: Segment[]; positioned: boolean; remainder: number } {
-  const partitions = device.children.filter((child) => child.kind === "part" && child.size_bytes > 0);
+  const partitions = device.children.filter((child) => isPartition(child) && child.size_bytes > 0);
   const total = device.size_bytes;
   if (total <= 0 || partitions.length === 0) return { segments: [], positioned: false, remainder: 0 };
   const sorted = [...partitions].sort((left, right) => (left.start_bytes ?? 0) - (right.start_bytes ?? 0));
@@ -51,21 +55,22 @@ function layout(device: BlockDevice): { segments: Segment[]; positioned: boolean
 
 function DeviceRow({ device, depth, showBoot }: { device: BlockDevice; depth: number; showBoot:boolean }) {
   if(!showBoot&&isBootPartition(device))return null;
-  const title = device.partition_label || device.label || device.name;
+  const title = isWindowsDevice(device)?blockDeviceTitle(device):device.partition_label || device.label || device.name;
+  const mounts=deviceMountPoints(device);
   const filesystem = device.filesystem?.trim() || null;
   return <>
     <div className="block-device-row" style={{ paddingLeft: `${Math.min(depth, 7) * 16 + 10}px` }}>
       <div className="block-device-row__identity">
         <span className="block-device-row__type">{device.kind}</span>
         <strong title={device.path ?? device.name}>{title}</strong>
-        {(filesystem || device.kind === "part") && <span className={`block-device-row__filesystem ${filesystem ? "" : "block-device-row__filesystem--unknown"}`} title={`文件系统格式：${filesystem ?? "未识别"}`}>{filesystem ?? "未识别"}</span>}
+        {(filesystem || isPartition(device)) && <span className={`block-device-row__filesystem ${filesystem ? "" : "block-device-row__filesystem--unknown"}`} title={`文件系统格式：${filesystem ?? "未识别"}`}>{filesystem ?? "未识别"}</span>}
         <code>{device.path ?? device.name}</code>
-        {device.mount_points.length>1&&<span className="storage-mount-badge">共享挂载 · {device.mount_points.length} 个入口</span>}
+        {mounts.length>1&&<span className="storage-mount-badge">共享挂载 · {mounts.length} 个入口</span>}
       </div>
       <div className="block-device-row__details">
         <span>{formatBytes(device.size_bytes)}</span>
-        {device.mount_points.length > 0
-          ? <span title={device.mount_points.join(" · ")}>{device.mount_points.join(" · ")}</span>
+        {mounts.length > 0
+          ? <span title={mounts.join(" · ")}>{mounts.join(" · ")}</span>
           : device.children.length > 0
             ? <span className="muted">{device.children.length} 个下属设备</span>
             : <span className="muted">未挂载</span>}
@@ -87,11 +92,13 @@ function DeviceCard({ device, disks, showBoot }: { device: BlockDevice; disks: D
   const trailingFreePercent = trailingFreeStart !== null && trailingFreeStart < device.size_bytes
     ? ((device.size_bytes - trailingFreeStart) / device.size_bytes) * 100 : 0;
   const knownHdd = recording?.kind === "smr" || recording?.kind === "cmr";
-  const driveKind = knownHdd ? "机械硬盘" : device.rotational == null ? "块设备" : device.rotational ? "机械硬盘" : "固态硬盘";
+  const driveKind = knownHdd ? "机械硬盘" : solidState(device)?"固态硬盘":device.rotational===true?"机械硬盘":"块设备";
+  const title=blockDeviceTitle(device);
+  const childKind=isWindowsDevice(device)&&device.children.length>0&&device.children.every(isPartition)?"分区":"下属设备";
   return <section className="storage-device">
     <header className="storage-device__header">
       <div>
-        <h3>{device.path ?? device.name} <span>{device.kind === "disk" ? driveKind : device.kind}</span>{recording && <button
+        <h3 title={device.path??device.name}>{title} <span>{device.kind === "disk" ? driveKind : device.kind}</span>{recording && <button
           type="button"
           className={`storage-recording-badge storage-recording-badge--${recording.kind}`}
           onClick={() => setShowRecording(value => !value)}
@@ -112,7 +119,7 @@ function DeviceCard({ device, disks, showBoot }: { device: BlockDevice; disks: D
       <p>仅按厂商型号资料标注，不运行磁盘性能测试、SMART 自检或任何写盘操作。</p>
     </div>}
     {segments.length > 0 ? <>
-      <div className={`partition-map ${positioned ? "" : "partition-map--relative"}`} role="img" aria-label={`${device.path ?? device.name} 的分区容量图`}>
+      <div className={`partition-map ${positioned ? "" : "partition-map--relative"}`} role="img" aria-label={`${title} 的分区容量图`}>
         {segments.map((segment, index) => {
           const usage = mountedUsage(segment.device, disks);
           const hiddenBoot=!showBoot&&isBootPartition(segment.device);
@@ -120,7 +127,7 @@ function DeviceCard({ device, disks, showBoot }: { device: BlockDevice; disks: D
             className={`partition-map__segment${hiddenBoot?" partition-map__segment--hidden-boot":""}`}
             key={`${segment.device.name}-${index}`}
             style={{ left: `${(segment.start / denominator) * 100}%`, width: `${(segment.size / denominator) * 100}%`, background: hiddenBoot?"var(--line)":PARTITION_COLORS[index % PARTITION_COLORS.length], color: hiddenBoot?"var(--line)":PARTITION_COLORS[index % PARTITION_COLORS.length] }}
-            title={hiddenBoot?"启动分区已隐藏，保留实际位置；不是空闲空间":`${segment.device.path ?? segment.device.name} · ${formatBytes(segment.device.size_bytes)}${segment.device.mount_points.length ? ` · ${segment.device.mount_points.join(" · ")}` : " · 未挂载"}${usage ? ` · 已用 ${formatBytes(usage.usedBytes)} / 文件系统 ${formatBytes(usage.totalBytes)}` : " · 使用量未知"}`}
+            title={hiddenBoot?"启动分区已隐藏，保留实际位置；不是空闲空间":`${segment.device.path ?? segment.device.name} · ${formatBytes(segment.device.size_bytes)}${deviceMountPoints(segment.device).length ? ` · ${deviceMountPoints(segment.device).join(" · ")}` : " · 未挂载"}${usage ? ` · 已用 ${formatBytes(usage.usedBytes)} / 文件系统 ${formatBytes(usage.totalBytes)}` : " · 使用量未知"}`}
           >{!hiddenBoot&&usage && usage.widthPercent > 0 && <span className="partition-map__used" style={{ width: `${usage.widthPercent}%` }} />}
             {!hiddenBoot&&usage && usage.widthPercent > 0 && usage.widthPercent < 100 && <span className="partition-map__usage-boundary" style={{ left: `${usage.widthPercent}%` }} aria-hidden="true" />}
           </span>;
@@ -135,7 +142,7 @@ function DeviceCard({ device, disks, showBoot }: { device: BlockDevice; disks: D
       {!positioned && <p className="storage-device__note">分区起点不可读取，图中仅按容量排列，不表示真实磁盘位置。</p>}
     </> : <p className="storage-device__note">未识别到直接分区；可能整盘使用或存在未识别布局，不能据此判断空间可用。</p>}
     <details className="storage-device-details">
-      <summary>设备与分区详情{device.children.length > 0 && <span>· {device.children.length} 个下属设备</span>}</summary>
+      <summary>设备与分区详情{device.children.length > 0 && <span>· {device.children.length} 个{childKind}</span>}</summary>
       <div className="block-device-tree"><DeviceRow device={device} depth={0} showBoot={showBoot}/></div>
     </details>
   </section>;

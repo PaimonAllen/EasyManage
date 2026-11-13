@@ -43,13 +43,21 @@ if ($request.diskio) { Section 'diskio' {
  @(Get-CimInstance Win32_PerfRawData_PerfDisk_LogicalDisk | Where-Object Name -Match '^[A-Za-z]:$' | ForEach-Object {@{name=$_.Name;read=[uint64]$_.DiskReadBytesPersec;written=[uint64]$_.DiskWriteBytesPersec;timestamp=[uint64]$_.Timestamp_PerfTime;frequency=[uint64]$_.Frequency_PerfTime}})
 } }
 if ($request.storage) { Section 'storage' {
+ # Match only a unique native disk identifier; missing media stays unknown.
+ $physical=@();try{$physical=@(Get-PhysicalDisk -ErrorAction Stop)}catch{}
  @{block_devices=@(Get-Disk | ForEach-Object {
   $disk=$_
+  $mediaMatches=@($physical|Where-Object {$disk.UniqueId -and $_.UniqueId -eq $disk.UniqueId})
+  $rotational=$null
+  if($mediaMatches.Count -eq 1){switch([string]$mediaMatches[0].MediaType){'SSD'{$rotational=$false};'HDD'{$rotational=$true}}}
   $children=@(Get-Partition -DiskNumber $disk.Number | ForEach-Object {
    $partition=$_;$volume=$partition|Get-Volume -ErrorAction SilentlyContinue
-   @{name="Disk $($disk.Number) partition $($partition.PartitionNumber)";path=$partition.AccessPaths|Select-Object -First 1;kind='partition';size_bytes=[uint64]$partition.Size;filesystem=[string]$volume.FileSystemType;label=$volume.FileSystemLabel;mount_points=@($partition.AccessPaths|Where-Object {$_ -match '^[A-Za-z]:\$'});model=$null;transport=$null;rotational=$null;removable=$null;read_only=$disk.IsReadOnly;partition_table=$null;partition_label=[string]$partition.Type;start_bytes=[uint64]$partition.Offset;children=@()}
+   $mounts=@($partition.AccessPaths|Where-Object {$_ -match '^[A-Za-z]:[\\/]'})
+   $path=if($mounts.Count){$mounts[0]}else{$partition.AccessPaths|Select-Object -First 1}
+   $type=if($partition.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'){'EFI System Partition'}else{[string]$partition.Type}
+   @{name="Disk $($disk.Number) partition $($partition.PartitionNumber)";path=$path;kind='part';size_bytes=[uint64]$partition.Size;filesystem=[string]$volume.FileSystemType;label=$volume.FileSystemLabel;mount_points=$mounts;model=$null;transport=$null;rotational=$null;removable=$null;read_only=$disk.IsReadOnly;partition_table=$null;partition_label=$type;start_bytes=[uint64]$partition.Offset;children=@()}
   })
-  @{name="Disk $($disk.Number)";path=$disk.Path;kind='disk';size_bytes=[uint64]$disk.Size;filesystem=$null;label=$null;mount_points=@();model=$disk.FriendlyName;transport=$disk.BusType.ToString();rotational=$null;removable=$null;read_only=$disk.IsReadOnly;partition_table=$disk.PartitionStyle.ToString();partition_label=$null;start_bytes=$null;children=$children}
+  @{name="Disk $($disk.Number)";path=$disk.Path;kind='disk';size_bytes=[uint64]$disk.Size;filesystem=$null;label=$null;mount_points=@();model=$disk.FriendlyName;transport=$disk.BusType.ToString();rotational=$rotational;removable=$null;read_only=$disk.IsReadOnly;partition_table=$disk.PartitionStyle.ToString();partition_label=$null;start_bytes=$null;children=$children}
  })}
 } }
 if ($request.software) { Section 'software' {

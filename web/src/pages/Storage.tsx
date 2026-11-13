@@ -1,3 +1,4 @@
+import {isPartition,deviceMountPoints} from "../lib/storageTopology";
 import { useRef, useState } from "react";
 import { Meter } from "../components/Meter";
 import { NodePanel } from "../components/NodePanel";
@@ -17,7 +18,7 @@ import type { BlockDevice, DiskMetric, NodeSummary } from "../types/monitoring";
 
 function partitions(devices: BlockDevice[]): BlockDevice[] {
   return devices.flatMap((device) => [
-    ...(device.kind === "part" ? [device] : []),
+    ...(isPartition(device) ? [device] : []),
     ...partitions(device.children),
   ]);
 }
@@ -60,7 +61,7 @@ export function Storage({ nodes }: { nodes: NodeSummary[] }) {
           const devices = node.metrics?.block_devices ?? [];
           const physical = devices.filter((device) => device.kind === "disk");
           const allPartitions = partitions(devices);
-          const unmounted = allPartitions.filter((device) => device.mount_points.length === 0).length;
+          const unmounted = allPartitions.filter((device) => deviceMountPoints(device).length === 0).length;
           const disks=node.metrics?.disks??[];
           const bootDevices=new Set(allPartitions.filter(isBootPartition).map(d=>d.path??`/dev/${d.name}`));
           const visibleDisks=disks.filter(d=>d.mount_point==="/"||showBoot||(!isBootMount(d.mount_point)&&!bootDevices.has(d.name)));

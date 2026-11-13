@@ -637,6 +637,26 @@ try {
   const shownBoot=renderToStaticMarkup(React.createElement(BlockDeviceMap,{devices:[{...devices[0],children:[boot]}],disks:[],showBoot:true}));
   assert.ok(shownBoot.includes('/boot/efi')&&shownBoot.includes('boot-fixture'));
   console.log('PASS boot partitions hidden by default with preserved geometry, shared filesystem labels and NFS unknown capacity');
+  // Reproduce the first Windows Agent report, including legacy kind/missing mounts.
+  const winPart=(n,size,start,path,type,filesystem)=>({name:`Disk 0 partition ${n}`,kind:'partition',path,mount_points:[],size_bytes:size,start_bytes:start,partition_label:type,filesystem,children:[]});
+  const winDevice={name:'Disk 0',path:'\\\\?\\scsi#native-device-id',kind:'disk',size_bytes:1000,model:'Samsung SSD 970 PRO 512GB',transport:'NVMe',rotational:null,partition_table:'GPT',mount_points:[],children:[
+    winPart(1,50,0,'\\\\?\\Volume{efi}\\','System','FAT32'),winPart(2,10,50,null,'Reserved',null),
+    winPart(3,900,60,'C:\\','Basic','NTFS'),winPart(4,40,960,'\\\\?\\Volume{recovery}\\','Recovery','NTFS')]};
+  const winVolumes=[{name:'',mount_point:'c:/',file_system:'NTFS',total_bytes:900,available_bytes:450}];
+  const winTopology=renderToStaticMarkup(React.createElement(BlockDeviceMap,{devices:[winDevice],disks:winVolumes,showBoot:false}));
+  assert.ok(winTopology.includes('磁盘 0')&&winTopology.includes('固态硬盘'));
+  assert.ok(!winTopology.includes('记录方式未确认')&&!winTopology.includes('未识别到直接分区'));
+  assert.equal((winTopology.match(/class="partition-map__segment/g)??[]).length,4);
+  assert.ok(winTopology.includes('partition-map__used')&&winTopology.includes('width:50%'));
+  assert.ok(winTopology.includes('启动分区已隐藏')&&!winTopology.includes('磁盘 0 · 分区 1'));
+  assert.ok(winTopology.includes('4 个')&&winTopology.includes('分区'));
+  const winPage=renderToStaticMarkup(React.createElement(Storage,{nodes:[{id:'windows-topology-fixture',hostname:'windows-fixture',online:true,os_name:'Windows',metrics:{...metrics,block_devices:[winDevice],disks:winVolumes}}]}));
+  assert.match(winPage,/4<!-- --> 个分区|4 个分区/);
+  assert.match(winPage,/3<!-- --> 个未挂载分区|3 个未挂载分区/);
+  const winShown=renderToStaticMarkup(React.createElement(BlockDeviceMap,{devices:[winDevice],disks:winVolumes,showBoot:true}));
+  assert.ok(winShown.includes('磁盘 0 · 分区 1'));
+  console.log('PASS Windows legacy topology: four partitions, SSD label, friendly disk identity, C drive usage and EFI visibility');
+
   assert.equal((storagePage.match(/class="number storage-table__low-space"/g) ?? []).length, 2);
   assert.equal((storagePage.match(/class="meter__warning" role="img"/g) ?? []).length, 2);
   assert.equal((storagePage.match(/⚠/g) ?? []).length, 2);

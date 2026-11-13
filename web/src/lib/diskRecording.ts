@@ -1,3 +1,4 @@
+import {solidState} from "./storageTopology.ts";
 import type { BlockDevice } from "../types/monitoring.ts";
 
 export interface RecordingEvidence {
@@ -53,7 +54,7 @@ export function diskRecording(device: Pick<BlockDevice, "kind" | "model" | "rota
     verifiedAt: westernDigital ? "2026-11-05" : "2026-09-29",
   };
   // Existing inventory identifies non-rotational devices separately; SSDs are not CMR.
-  if (device.rotational === false) return null;
+  if (solidState(device)) return null;
   return {
     kind: "unknown", label: "记录方式未确认", matchedModel: null,
     explanation: model
