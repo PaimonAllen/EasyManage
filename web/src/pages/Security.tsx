@@ -1,3 +1,4 @@
+import {isWindows} from "../lib/hostPlatform";
 import { NodeStatus } from "../components/NodeStatus";
 import { NodePanel } from "../components/NodePanel";
 import { PageHeading } from "../components/PageHeading";
@@ -15,6 +16,11 @@ export function Security({ nodes }: { nodes: NodeSummary[] }) {
     <section className="page-content">
       {nodes.map((node) => {
         const metrics = node.metrics;
+        if(isWindows(node))return <NodePanel node={node} key={node.id} header={<header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node}/></h2><p>{node.os_name} · Windows 安全观测采集于 {formatDate(metrics?.permission_audit?.collected_at)}</p></div></header>}>{()=> <>
+          <div className="table-scroll"><table><thead><tr><th>检查项</th><th>结果</th><th>观测</th></tr></thead><tbody>{metrics?.permission_audit?.checks.map(check=><tr key={check.category+check.path}><td>{check.title}</td><td>{check.status==="ok"?"符合检查项":check.status==="warning"?"需关注":"未知"}</td><td>{check.observed}</td></tr>)}</tbody></table></div>
+          {!metrics?.permission_audit&&<p className="hint">Windows 安全与 ACL 快照尚未采集，不能视为通过。</p>}
+          <p className="hint">Windows 使用原生身份、NTFS ACL 和 Windows 防火墙配置；观测不代表完整规则或漏洞审计。</p>
+        </>}</NodePanel>;
         const security = metrics?.host_security;
         const inventoryAt = metrics?.inventory_collected_at;
         const hourly = security?.interval_seconds === 3600 && !!security.collected_at;

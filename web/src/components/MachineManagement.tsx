@@ -1,3 +1,4 @@
+import {canDeployPlatform} from "../lib/hostPlatform";
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { addMachine, changeMachine, fetchMachineJob, fetchMachines, probeMachine, manageMachineSsh, redeployMachine, setMachineMonitoring } from "../api/client";
 import type { ManagedMachine, MachineDeployment, MachineStatus } from "../api/client";
@@ -71,7 +72,7 @@ export function MachineManagement({ onRefresh, externalPlatforms=[], externalErr
           <td>{machine.deleted_at?"已软删除":machineMonitoringLabel(machine)}
             {!machine.deleted_at&&!agentServiceBlocked(machine)&&machine.monitoring_supported===false&&<small className="machine-monitoring-warning">暂停采集需先<a href="#/agent-management">更新 Agent ↗</a>；停止 Agent 无需升级</small>}
             {machine.agent_service_last_error&&<small className="form-error">{machine.agent_service_last_error}</small>}
-            {machine.connection_mode==="ssh"&&<small className="block">SSH · {sshLabel(machine.ssh_transport?.status)} · {machine.ssh_transport?.connections??0}/3 条连接{machine.ssh_transport?.status==="reconnecting"?` · 重试 ${machine.ssh_transport.retry_attempt??0}/3（每 60 秒）`:""}</small>}
+            {machine.connection_mode==="ssh"&&<small className="block">SSH · {sshLabel(machine.ssh_transport?.status)} · 监控/管理 {machine.ssh_transport?.connections??0}/3 · 扫描 {machine.ssh_transport?.scan_connections??0}/{machine.ssh_transport?.scan_limit??10} 条连接{machine.ssh_transport?.status==="reconnecting"?` · 重试 ${machine.ssh_transport.retry_attempt??0}/3（每 60 秒）`:""}</small>}
             {machine.ssh_transport?.last_error&&<small className="block">{machine.ssh_transport.last_error}</small>}
             {machine.credentials_saved&&<small className="block">SSH 凭据已加密保存</small>}</td>
           <td><div className="machine-actions"><button className="button button--small button--secondary" disabled={!machine.manageable||!!job} onClick={()=>setSelected({machine,action:"edit"})}>编辑</button>
@@ -85,7 +86,7 @@ export function MachineManagement({ onRefresh, externalPlatforms=[], externalErr
     </details>
     {externalError&&<p className="form-error" role="alert">外部平台入口：{externalError}</p>}
     <ExternalPlatformManagement platforms={externalPlatforms} onChanged={onExternalChanged}/>
-    {adding&&<AddMachineDialog agentAvailable={!!status?.candidate_available&&status.ca_available&&status.registry_writable} onClose={()=>setAdding(false)} onExternalSaved={()=>{setAdding(false);setMessage("外部算力平台入口已添加，可在下方卡片点击大按钮访问。");onExternalChanged();}} onStarted={started=>{setAdding(false);setProgress({node_id:started.node_id,status:"running",progress:0,events:[]});setJob({id:started.job_id,key:started.job_key});}}/>}
+    {adding&&<AddMachineDialog agentAvailable={!!status?.candidate_available&&status.ca_available&&status.registry_writable} platformCandidates={status?.platform_candidates} onClose={()=>setAdding(false)} onExternalSaved={()=>{setAdding(false);setMessage("外部算力平台入口已添加，可在下方卡片点击大按钮访问。");onExternalChanged();}} onStarted={started=>{setAdding(false);setProgress({node_id:started.node_id,status:"running",progress:0,events:[]});setJob({id:started.job_id,key:started.job_key});}}/>}
     {selected&&<ChangeMachineDialog {...selected} onClose={()=>setSelected(null)} onDone={message=>{setMessage(message);setSelected(null);void refresh();onRefresh();}}/>}
     {sshMachine&&<MachineSshDialog machine={sshMachine} onClose={()=>setSshMachine(null)} onDone={message=>{setMessage(message);setSshMachine(null);void refresh();onRefresh();}}/>}
     {redeployTarget&&<RedeployMachineDialog machine={redeployTarget} onClose={()=>setRedeployTarget(null)} onStarted={started=>{
@@ -147,7 +148,7 @@ export function RedeployMachineDialog({machine,onClose,onStarted}:{machine:Manag
           if(!file||!file.size||file.size>MAX_PRIVATE_KEY_BYTES||/\.(pub|ppk)$/i.test(file.name))throw new Error("请选择不超过 12 KiB 的 OpenSSH / PEM 私钥文件");
           auth={auth_method:"private_key",private_key:await file.text(),passphrase:phrase.current?.value||""};
         }
-        if(machine.deployment_mode==="full"&&machine.username!=="root")auth.sudo_password=sudo.current?.value||"";
+        if(machine.platform!=="windows"&&machine.deployment_mode==="full"&&machine.username!=="root")auth.sudo_password=sudo.current?.value||"";
         pending=redeployMachine(machine.node_id,{...request,...auth});
         clearMachineAuthentication(auth);
       }
@@ -160,13 +161,13 @@ export function RedeployMachineDialog({machine,onClose,onStarted}:{machine:Manag
     <p>{machine.username}@{machine.host}:{machine.port}</p>
     {agentServiceBlocked(machine)&&<p className="notice">此机器的 Agent 已停止或服务状态未确认。重新部署会恢复 Agent 和监控，保留原机器 ID、历史与额外采集开关；仅启动旧服务或点“恢复监控”不能替代重新部署。</p>}
     <div className="notice"><strong>保留原机器 ID、历史、名称和备注</strong><code className="block">{machine.node_id}</code>
-      <p>保持原权限：{machine.deployment_mode==="full"?"管理员 Full（root 系统服务）":"普通用户 Basic（全部位于原 SSH 用户 ~/.easymanage 内）"}。此入口不更换地址、账户、主机公钥或权限级别。</p></div>
+      <p>保持原权限：{machine.platform==="windows"?(machine.deployment_mode==="full"?"管理员 Full（Windows 系统服务）":"普通用户 Basic（受限登录任务）"):machine.deployment_mode==="full"?"管理员 Full（root 系统服务）":"普通用户 Basic（全部位于原 SSH 用户 ~/.easymanage 内）"}。此入口不更换地址、账户、主机公钥或权限级别。</p></div>
     <p className="hint">支持离线节点覆盖修复，也支持已卸载后重装。核验属于同一机器 ID 后，备份并覆盖程序、配置和服务，仅重启本 Agent；保留原 SQLite 身份、待上报数据、采集设置和平台历史，不删除数据库、不重启机器。其他机器 ID 或 Basic / Full 冲突仍会拒绝覆盖。连接凭据会重新签发，原机器 ID 不变。</p>
     <AgentConnectionSettings url={url} busy={busy} onChange={setUrl} mode={connectionMode} onModeChange={setConnectionMode}/>
-    {useSeparateAdmin&&<><p className="hint">普通用户 SSH 用于原账户的文件传输；管理员授权用于恢复 Full 系统服务，可使用不同管理员账户。</p><AdminCredentialFields auth={admin} disabled={busy}/></>}
+    {useSeparateAdmin&&<><p className="hint">普通用户 SSH 用于原账户的文件传输；管理员授权用于恢复 Full 系统服务，可使用不同管理员账户。</p><AdminCredentialFields platform={machine.platform} auth={admin} disabled={busy}/></>}
     {machine.saved_credentials_usable&&<label className="machine-confirm"><input type="checkbox" checked={useSaved} disabled={busy} onChange={event=>{clear();setUseSaved(event.target.checked);}}/>使用平台已加密保存的 SSH 凭据</label>}
     {!useSaved&&<SshAuthenticationFields method={method} onMethodChange={value=>{clear();setMethod(value);}} busy={busy} required passwordRef={password} keyRef={key} passphraseRef={phrase}/>}
-    {!useSaved&&!useSeparateAdmin&&machine.deployment_mode==="full"&&machine.username!=="root"&&<label>sudo 密码（如需）<input ref={sudo} type="password" autoComplete="off" maxLength={1024} disabled={busy}/><small>密码登录时留空复用 SSH 密码；私钥登录可单独提供 sudo 密码。</small></label>}
+    {!useSaved&&!useSeparateAdmin&&machine.platform!=="windows"&&machine.deployment_mode==="full"&&machine.username!=="root"&&<label>sudo 密码（如需）<input ref={sudo} type="password" autoComplete="off" maxLength={1024} disabled={busy}/><small>密码登录时留空复用 SSH 密码；私钥登录可单独提供 sudo 密码。</small></label>}
     <label className="machine-confirm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event=>setConfirmed(event.target.checked)}/>确认按以上原机器 ID 覆盖修复并重启 Agent；保留历史和本地数据库，不新增机器。</label>
     <p className="hint">凭据仅以密文保存在平台，不回传明文、不写日志；复用可信 SSH，最多 3 条长连接。任务进度和日志会显示在机器管理中。</p>
     {error&&<p className="form-error" role="alert">{error}</p>}
@@ -179,15 +180,18 @@ function MachineKindSelector({kind,onChange,busy,agentAvailable}:{kind:EntryKind
   return <><label>接入方式<select value={kind} disabled={busy} onChange={event=>onChange(event.target.value as EntryKind)}><option value="agent" disabled={!agentAvailable}>SSH 部署 Agent 机器</option><option value="external">外部算力平台（链接入口）</option></select></label>
     {!agentAvailable&&<p className="hint">Agent 部署条件尚未就绪；外部算力平台入口可直接添加。</p>}</>;
 }
-export function AddMachineDialog({onClose,onStarted,onExternalSaved,agentAvailable}:{onClose:()=>void;onStarted:(job:{job_id:string;job_key:string;node_id:string})=>void;onExternalSaved:()=>void;agentAvailable:boolean}){
+export function AddMachineDialog({onClose,onStarted,onExternalSaved,agentAvailable,platformCandidates}:{onClose:()=>void;onStarted:(job:{job_id:string;job_key:string;node_id:string})=>void;onExternalSaved:()=>void;agentAvailable:boolean;platformCandidates?:{linux:boolean;windows:boolean}}){
   const [kind,setKind]=useState<EntryKind>(agentAvailable?"agent":"external");
   return kind==="external"?<ExternalPlatformDialog onClose={onClose} onSaved={onExternalSaved} selector={busy=><MachineKindSelector kind={kind} onChange={setKind} busy={busy} agentAvailable={agentAvailable}/>}/>
-    :<AddAgentMachineDialog onClose={onClose} onStarted={onStarted} onKindChange={setKind} agentAvailable={agentAvailable}/>;
+    :<AddAgentMachineDialog onClose={onClose} onStarted={onStarted} onKindChange={setKind} agentAvailable={agentAvailable} platformCandidates={platformCandidates}/>;
 }
-function AddAgentMachineDialog({onClose,onStarted,onKindChange,agentAvailable}:{onClose:()=>void;onStarted:(job:{job_id:string;job_key:string;node_id:string})=>void;onKindChange:(kind:EntryKind)=>void;agentAvailable:boolean}){
+function AddAgentMachineDialog({onClose,onStarted,onKindChange,agentAvailable,platformCandidates}:{onClose:()=>void;onStarted:(job:{job_id:string;job_key:string;node_id:string})=>void;onKindChange:(kind:EntryKind)=>void;agentAvailable:boolean;platformCandidates?:{linux:boolean;windows:boolean}}){
   const dialog=useRef<HTMLDialogElement>(null);
   const [name,setName]=useState("");const [host,setHost]=useState("");const [port,setPort]=useState(22);
   const [username,setUsername]=useState("");const [authMethod,setAuthMethod]=useState<MachineAuthMethod>("password");
+  const [platform,setPlatform]=useState<"linux"|"windows">("linux");
+  const [pwshPath,setPwshPath]=useState("");
+  const selectedAvailable=canDeployPlatform(platform,agentAvailable,platformCandidates);
   const [deploymentMode,setDeploymentMode]=useState<MachineDeploymentMode>("basic");
   const [connectionMode,setConnectionMode]=useState<"auto"|"direct"|"ssh">("auto");
   const sudoInput=useRef<HTMLInputElement>(null);
@@ -197,7 +201,7 @@ function AddAgentMachineDialog({onClose,onStarted,onKindChange,agentAvailable}:{
   function clearInputs(){for(const input of [passwordInput.current,keyInput.current,passphraseInput.current,sudoInput.current])if(input)input.value="";}
   useEffect(()=>{dialog.current?.showModal();return clearInputs;},[]);
   async function submit(){
-    if(busy||!agentAvailable)return;setError("");setBusy(true);
+    if(busy||!selectedAvailable)return;setError("");setBusy(true);
     try{
       if(!fingerprint){
         const result=await probeMachine(host.trim(),port);setFingerprint(result.fingerprint);setConfirmed(false);
@@ -213,8 +217,8 @@ function AddAgentMachineDialog({onClose,onStarted,onKindChange,agentAvailable}:{
           authentication={auth_method:"private_key",private_key:await file.text(),passphrase:passphraseInput.current?.value||""};
         }
         let pending:ReturnType<typeof addMachine>;
-        if(deploymentMode==="full"&&username.trim()!=="root")authentication.sudo_password=sudoInput.current?.value||"";
-        try{pending=addMachine({host:host.trim(),port,display_name:name.trim(),username:username.trim(),server_url:url.trim(),fingerprint,deployment_mode:deploymentMode,connection_mode:connectionMode,...authentication});}
+        if(platform==="linux"&&deploymentMode==="full"&&username.trim()!=="root")authentication.sudo_password=sudoInput.current?.value||"";
+        try{pending=addMachine({platform,pwsh_path:pwshPath.trim()||"pwsh.exe",host:host.trim(),port,display_name:name.trim(),username:username.trim(),server_url:url.trim(),fingerprint,deployment_mode:deploymentMode,connection_mode:connectionMode,...authentication});}
         finally{clearMachineAuthentication(authentication);clearInputs();}
         onStarted(await pending);
       }
@@ -225,8 +229,11 @@ function AddAgentMachineDialog({onClose,onStarted,onKindChange,agentAvailable}:{
     <div className="dialog-title"><h2>添加机器并部署 Agent</h2><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭">×</button></div>
     <MachineKindSelector kind="agent" busy={busy} agentAvailable={agentAvailable} onChange={kind=>{clearInputs();onKindChange(kind);}}/>
     <p className="hint">无需预装 Agent：填写新机器的 SSH 信息并选择运行权限，平台将直接下发最新 Agent、安装并启动，随后自动等待对应权限的心跳。部署进度和日志会显示在机器管理中。</p>
-    <AgentDeploymentFields mode={deploymentMode} onChange={mode=>{clearInputs();setDeploymentMode(mode);setConfirmed(false);}} busy={busy} username={username} sudoRef={sudoInput}/>
-    <details><summary>目标机器要求（仅 Linux）</summary><p className="hint">目标需 Python3 和匹配的 CPU 架构。普通用户自动选择 systemd 用户服务或无 linger 兼容守护，无需 sudo。兼容模式在允许用户 cron 时配置开机及每分钟恢复；否则不保证开机/退出会话后的自动恢复。管理员模式需 systemd 及 root/sudo 授权。不覆盖已有 Agent 身份。</p></details>
+    <label>操作系统<select value={platform} disabled={busy} onChange={event=>{const value=event.target.value as "linux"|"windows";clearInputs();setPlatform(value);setDeploymentMode(value==="windows"?"full":"basic");setFingerprint("");setConfirmed(false);}}><option value="linux">Linux</option><option value="windows">Windows（PowerShell 7 / pwsh）</option></select></label>
+    {platform==="windows"&&<label>PowerShell 7 路径（可选）<input placeholder="自动查找，也可填写绝对路径" value={pwshPath} disabled={busy} onChange={event=>setPwshPath(event.target.value)}/><small>自动查找 PATH、常见安装目录及当前账户安装记录；也可指定绝对路径，无需修改 SSH 默认 Shell。</small></label>}
+    {!selectedAvailable&&<p className="notice">{platform==="windows"?"Windows":"Linux"} Agent 候选尚未发布或部署条件未就绪，请先准备对应平台的候选文件。</p>}
+    <AgentDeploymentFields platform={platform} mode={deploymentMode} onChange={mode=>{clearInputs();setDeploymentMode(mode);setConfirmed(false);}} busy={busy} username={username} sudoRef={sudoInput}/>
+    {platform==="windows"?<p className="hint">Windows Full 安装为 LocalSystem 原生服务；SSH 账户必须拥有实际管理员令牌，PowerShell 需机器级安装（MSI 或受保护目录 ZIP）。Basic 使用当前用户的受限计划任务，只在该用户已登录时运行。自动连接优先使用 SSH 反向 HTTPS 隧道，保留证书校验；仅 HTTPS 模式要求目标可访问平台。</p>:<details><summary>Linux 目标机器要求</summary><p className="hint">目标需 Python3 和匹配的 CPU 架构。普通用户自动选择 systemd 用户服务或无 linger 兼容守护，无需 sudo。兼容模式在允许用户 cron 时配置开机及每分钟恢复；否则不保证开机/退出会话后的自动恢复。管理员模式需 systemd 及 root/sudo 授权。不覆盖已有 Agent 身份。</p></details>}
     <label>显示名称<input required maxLength={160} value={name} disabled={busy} onChange={event=>setName(event.target.value)}/></label>
     <label>目标内网 IP<input required value={host} disabled={busy} onChange={event=>{setHost(event.target.value);setFingerprint("");setConfirmed(false);}}/></label>
     <label>SSH 端口<input required type="number" min={1} max={65535} value={port} disabled={busy} onChange={event=>{setPort(Number(event.target.value));setFingerprint("");setConfirmed(false);}}/></label>
@@ -239,11 +246,15 @@ function AddAgentMachineDialog({onClose,onStarted,onKindChange,agentAvailable}:{
     </>}
     <p className="hint">确认指纹前不发送鉴权凭据。验证成功后，SSH 密码、私钥及口令使用平台专用主密钥加密保存，不回传浏览器、不写入日志；平台重启后可恢复已启用的 SSH 长连接。请确保平台证书可信。</p>
     {error&&<p className="form-error" role="alert">{error}</p>}
-    <div className="dialog-actions"><button type="button" className="button button--secondary" disabled={busy} onClick={onClose}>取消</button><button className="button" disabled={!agentAvailable||busy||!!fingerprint&&!confirmed}>{busy?"处理中…":fingerprint?"确认下发并启动":"检查 SSH 主机指纹"}</button></div>
+    <div className="dialog-actions"><button type="button" className="button button--secondary" disabled={busy} onClick={onClose}>取消</button><button className="button" disabled={!selectedAvailable||busy||!!fingerprint&&!confirmed}>{busy?"处理中…":fingerprint?"确认下发并启动":"检查 SSH 主机指纹"}</button></div>
   </form></dialog>;
 }
 
-export function AgentDeploymentFields({mode,onChange,busy,username,sudoRef}:{mode:MachineDeploymentMode;onChange:(mode:MachineDeploymentMode)=>void;busy:boolean;username:string;sudoRef:RefObject<HTMLInputElement|null>}){
+export function AgentDeploymentFields({platform="linux",mode,onChange,busy,username,sudoRef}:{platform?:"linux"|"windows";mode:MachineDeploymentMode;onChange:(mode:MachineDeploymentMode)=>void;busy:boolean;username:string;sudoRef:RefObject<HTMLInputElement|null>}){
+  if(platform==="windows")return <>
+    <label>Agent 运行权限<select value={mode} disabled={busy} onChange={event=>onChange(event.target.value as MachineDeploymentMode)}><option value="full">管理员 Full（LocalSystem Windows 服务）</option><option value="basic">普通用户 Basic（受限计划任务，需用户登录）</option></select></label>
+    <p className="hint">{mode==="full"?"安装到 ProgramData\\EasyManage，使用 Windows 服务管理器启动和恢复；不绕过 UAC、不修改 SSH 或防火墙。":"安装到当前用户 LocalAppData\\EasyManage，使用受限登录任务；不保证退出登录或未登录时持续监控。"}</p>
+  </>;
   return <>
     <label>Agent 运行权限<select value={mode} disabled={busy} onChange={event=>onChange(event.target.value as MachineDeploymentMode)}>
       <option value="basic">普通用户 Basic（默认，后续可提权）</option><option value="full">管理员 Full（首次直接以 root 运行）</option>
@@ -260,7 +271,7 @@ export function AgentConnectionSettings({url,busy,onChange,mode="auto",onModeCha
     <label>监控连接方式<select value={mode} disabled={busy} onChange={event=>onModeChange?.(event.target.value as "auto"|"direct"|"ssh")}>
       <option value="auto">自动：HTTPS 不可达时使用 SSH 长连接</option><option value="ssh">SSH 长连接（只需目标 SSH 端口）</option><option value="direct">仅 HTTPS 直连</option>
     </select></label>
-    <p className="hint">平台连接地址默认使用当前页面地址，自动写入 Agent 配置。SSH 模式由平台主动连接目标，不要求目标回连平台；通常保持 2 条、最多 3 条 SSH，命令/文件复用通道，不为每次采集重新登录。</p>
+    <p className="hint">平台连接地址默认使用当前页面地址，自动写入 Agent 配置。SSH 模式由平台主动连接目标，不要求目标回连平台；通常保持 2 条、最多 3 条监控/管理 SSH；按需扫描另用最多 10 条短连接。命令/文件复用通道，不为每次采集重新登录。</p>
     <details><summary>高级网络设置（通常无需修改）</summary>
       <label>Agent 上报地址<input required type="url" value={url} disabled={busy} onChange={event=>onChange(event.target.value)}/></label>
       <p className="hint">此地址用于 HTTPS 直连，不是目标机器地址。SSH 模式自动使用目标回环隧道，不需要填写目标能回连的平台地址；需管理员允许 SSH 回环端口转发。隧道继续校验 CA/证书。</p>
@@ -327,13 +338,13 @@ export function MachineSshDialog({machine,onClose,onDone}:{machine:ManagedMachin
   }
   return <dialog ref={dialog} className="credentials-dialog" onCancel={event=>{if(busy)event.preventDefault();else onClose();}}><form autoComplete="off" onSubmit={event=>{event.preventDefault();void submit();}}>
     <div className="dialog-title"><h2>SSH 长连接 · {machine.display_name||machine.hostname}</h2><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭">×</button></div>
-    <p>{machine.username}@{machine.host}:{machine.port} · {sshLabel(machine.ssh_transport?.status)} · {machine.ssh_transport?.connections??0}/3 条连接</p>
+    <p>{machine.username}@{machine.host}:{machine.port} · {sshLabel(machine.ssh_transport?.status)} · 监控/管理 {machine.ssh_transport?.connections??0}/3 · 扫描 {machine.ssh_transport?.scan_connections??0}/{machine.ssh_transport?.scan_limit??10} 条连接</p>
     <label>操作<select value={action} disabled={busy} onChange={event=>{setAction(event.target.value as typeof action);clear();setConfirmed(false);}}><option value="connect">建立 / 重连 SSH 长连接并切换上报（会重启 Agent）</option><option value="disconnect">断开并暂停自动恢复（保留加密凭据）</option><option value="forget">断开并删除平台保存的凭据</option></select></label>
     <p className="hint">复用已核验主机密钥及原机器 ID，不重装、不降权、不删除 SQLite。平台重启后自动恢复此前启用的连接；手动断开不会自动恢复。</p>
     {savedUsable&&<label className="machine-confirm"><input type="checkbox" checked={useSaved} disabled={busy} onChange={event=>{clear();setUseSaved(event.target.checked);}}/>使用平台已加密保存的 SSH 凭据（无需重复输入）</label>}
     {!useSaved&&<SshAuthenticationFields method={method} onMethodChange={value=>{clear();setMethod(value);}} busy={busy} required passwordRef={password} keyRef={key} passphraseRef={phrase}/>}
-    {!useSaved&&action==="connect"&&machine.username!=="root"&&<label>已有 Full 服务的 sudo 密码（如需）<input ref={sudo} type="password" autoComplete="off" disabled={busy} maxLength={1024}/><small>Basic 留空；已有 Full 使用密码鉴权时留空复用 SSH 密码，密钥鉴权时可单独填写并加密保存。</small></label>}
-    <p className="notice">凭据以 AES-256-GCM 加密保存在平台私有保险库，不返回明文。断线每 60 秒重试，最多 3 次；失败后停止，可手动重连。监控通常占用 2 条、最多 3 条 SSH 连接，需允许回环端口转发。新浏览器需验证一次 SSH。</p>
+    {!useSaved&&action==="connect"&&machine.platform!=="windows"&&machine.username!=="root"&&<label>已有 Full 服务的 sudo 密码（如需）<input ref={sudo} type="password" autoComplete="off" disabled={busy} maxLength={1024}/><small>Basic 留空；已有 Full 使用密码鉴权时留空复用 SSH 密码，密钥鉴权时可单独填写并加密保存。</small></label>}
+    <p className="notice">凭据以 AES-256-GCM 加密保存在平台私有保险库，不返回明文。断线每 60 秒重试，最多 3 次；失败后停止，可手动重连。监控通常占用 2 条、最多 3 条监控/管理 SSH 连接；按需扫描另用最多 10 条短连接。需允许回环端口转发。新浏览器需验证一次 SSH。</p>
     <label className="machine-confirm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event=>setConfirmed(event.target.checked)}/>确认操作此机器；断开后经隧道上报会暂停，安装及身份仍保留。</label>
     {error&&<p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button type="button" className="button button--secondary" disabled={busy} onClick={onClose}>取消</button><button className="button" disabled={busy||!confirmed}>{busy?"处理中…":"确认"}</button></div>
   </form></dialog>;

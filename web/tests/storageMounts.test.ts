@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import {test} from "node:test";
-import {isBootMount,isBootPartition,capacityKnown,sharedStorage,storageMountKey,scanDiskTargets} from "../src/lib/storageMounts.ts";
+import {isBootMount,isBootPartition,capacityKnown,sharedStorage,storageMountKey,scanDiskTargets,directoryScanMounts} from "../src/lib/storageMounts.ts";
 import type {BlockDevice,DiskMetric} from "../src/types/monitoring.ts";
 const disk=(name:string,mount_point:string):DiskMetric=>({name,mount_point,file_system:"ext4",total_bytes:100,available_bytes:50});
 test("hide only confirmed boot partitions, never root or ordinary FAT data",()=>{
@@ -49,4 +49,26 @@ test("shared filesystem grouping uses identity, not matching capacity",()=>{
   assert.ok(!capacityKnown({...a,mount:{...meta,capacity_known:false}}));
   assert.ok(capacityKnown(a));
   assert.equal(sharedStorage([disk('overlay','/one'),disk('overlay','/two')]).size,0);
+});
+
+test("Windows local drive paths and filesystem names are valid scan targets",()=>{
+ const disk={name:"C:",mount_point:"C:\\",file_system:"NTFS",total_bytes:100,available_bytes:50,read_bytes_per_second:null,written_bytes_per_second:null};
+ assert.equal(scanDiskTargets([disk]).length,1);
+});
+
+test("directory choices hide shared home bigdata aliases but retain original and independent data mounts",()=>{
+  const mount={device_id:'8:1',root:'/',source:'/dev/sda1',network:false,read_only:false,capacity_known:true};
+  const original={...disk('/dev/sda1','/data/data_hdd_2'),mount};
+  const project={...original,mount_point:'/data/projects/bigdata',mount:{...mount,root:'/projects'}};
+  const alias={...original,mount_point:'/home/ck/bigdata',mount:{...mount,root:'/users/ck/data'}};
+  const alias2={...alias,mount_point:'/home/tzr/bigdata2'};
+  const independent={...disk('/dev/sdb1','/home/unique/bigdata'),mount:{...mount,device_id:'8:2',source:'/dev/sdb1'}};
+  const unknown=disk('/dev/sdc1','/home/unknown/bigdata');
+  const unrelated={...original,mount_point:'/home/other/unrelated',mount:{...mount,root:'/other'}};
+  assert.deepEqual(directoryScanMounts([alias,original,alias2,project,independent,unknown,unrelated]).map(d=>d.mount_point),
+    ['/data/data_hdd_2','/data/projects/bigdata','/home/unique/bigdata','/home/unknown/bigdata','/home/other/unrelated']);
+  // Equal capacity or one shared device without a covering original is not
+  // evidence that a directory can be removed.
+  assert.equal(directoryScanMounts([alias,{...project,mount:{...mount,root:'/separate'}}]).length,2);
+  assert.equal(directoryScanMounts([alias]).length,1);
 });

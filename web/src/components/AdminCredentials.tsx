@@ -65,11 +65,11 @@ export function useAdminCredentials(nodeIds: (string | null)[]) {
     try { for (const id of nodeIds) await forgetAdminCredentials(id); setAvailable(false); setMode("password"); clear(); }
     catch (caught) { setError(caught instanceof Error ? caught.message : "清除失败"); }
   }
-  return {ready, loading:checkedScope!==scope, available, mode, setMode:changeMode, username, setUsername,
+  return {clear, ready, loading:checkedScope!==scope, available, mode, setMode:changeMode, username, setUsername,
     password, setPassword, key, passphrase, setPassphrase, sudoPassword, setSudoPassword, error, setError, prepare, forget, readKey};
 }
 
-export function AdminCredentialFields({auth, disabled}: {auth: ReturnType<typeof useAdminCredentials>; disabled: boolean}) {
+export function AdminCredentialFields({auth, disabled,platform="linux"}: {auth: ReturnType<typeof useAdminCredentials>; disabled: boolean;platform?:string}) {
   const [forgetting, setForgetting] = useState(false);
   const locked = disabled || auth.loading || forgetting;
   return <fieldset disabled={locked} className="admin-credentials">
@@ -88,8 +88,8 @@ export function AdminCredentialFields({auth, disabled}: {auth: ReturnType<typeof
           {auth.key && <p className="hint">私钥已选择，内容不会显示。</p>}
           <label>私钥口令（如有）<input type="password" autoComplete="off" maxLength={1024} value={auth.passphrase} onChange={event=>auth.setPassphrase(event.target.value)} /></label>
         </>}
-        <label>sudo 密码（如与 SSH 密码不同）<input type="password" autoComplete="off" maxLength={1024} value={auth.sudoPassword} onChange={event=>auth.setSudoPassword(event.target.value)} /></label>
-        <p className="hint">首次验证 SSH 和管理员权限后加密保存在平台；按所选机器复用，不会授权其他机器。私钥登录时，如 sudo 需要密码请填写。</p>
+        {platform!=="windows"&&<label>sudo 密码（如与 SSH 密码不同）<input type="password" autoComplete="off" maxLength={1024} value={auth.sudoPassword} onChange={event=>auth.setSudoPassword(event.target.value)} /></label>}
+        <p className="hint">{platform==="windows"?"验证 Windows SSH 会话的实际管理员令牌，不使用 sudo，也不绕过 UAC；凭据仅授权所选机器。":"首次验证 SSH 和管理员权限后加密保存在平台；按所选机器复用，不会授权其他机器。私钥登录时，如 sudo 需要密码请填写。"}</p>
       </> : <p className="hint">将复用平台保险库中的凭据，无需再次输入密码或私钥。</p>}
       {auth.available && <button type="button" className="button button--secondary button--small" onClick={()=>{
         if (!window.confirm("清除所选机器的管理员凭据？不影响普通用户 SSH 长连接。")) return;

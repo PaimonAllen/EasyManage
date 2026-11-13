@@ -15,6 +15,7 @@ import type { NodeSummary, UserStatus } from "../types/monitoring";
 
 const ADMIN_GROUPS = new Set(["sudo", "wheel", "lab-admins"]);
 const SESSION_LABELS: Record<string, string> = {
+  windows_logon:"Windows 交互登录",
   terminal: "终端",
   logind: "系统会话",
   ssh: "SSH 进程",
@@ -133,11 +134,11 @@ export function Users({ nodes, targets }: { nodes: NodeSummary[]; targets: Opera
                           {user.uid === 0 && (
                             <span className="badge badge--full">root</span>
                           )}
-                          {user.uid !== 0 && user.groups.some((group) => ADMIN_GROUPS.has(group)) && (
+                          {(user.administrator===true || (user.uid !== 0 && user.groups.some((group) => ADMIN_GROUPS.has(group)))) && (
                             <span className="badge badge--admin">admin</span>
                           )}
                           <small>
-                            UID {user.uid} · GID {user.gid}
+                            {user.native_id ? `SID ${user.native_id}` : `UID ${user.uid} · GID ${user.gid}`}
                           </small>
                         </td>
                         <td>

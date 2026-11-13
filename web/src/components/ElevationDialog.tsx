@@ -80,7 +80,7 @@ export function ElevationDialog({
           </button>
         </div>
         <p className="hint">
-          Full 会以 root 运行此节点的
+          Full 会以 {node.metrics?.privilege?.native?.platform==="windows"?"LocalSystem Windows 服务":"root"} 运行此节点的
           Agent，用于读取完整的系统指标。请输入目标机器上可通过 SSH
           登录且拥有管理员权限的账户。
         </p>
@@ -91,7 +91,7 @@ export function ElevationDialog({
           </div>
         ) : (
           <>
-            <AdminCredentialFields auth={auth} disabled={busy} />
+            <AdminCredentialFields platform={node.metrics?.privilege?.native?.platform} auth={auth} disabled={busy} />
             <p className="hint">
               凭据加密保存在平台，不保存在浏览器。LAN、Tailscale、ZeroTier
               地址在 HTTPS 证书覆盖后均可作为平台入口；操作请求必须与当前页面使用相同的地址和端口。

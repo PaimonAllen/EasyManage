@@ -49,7 +49,7 @@ export function AgentStopDialog({machine,onClose,onStopped}:{machine:ManagedMach
     <div className="dialog-title"><h2>停止 Agent · {machine.display_name||machine.hostname}</h2><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭">×</button></div>
     <p className="notice">停止后关闭 Agent 进程、心跳和自动拉起，并断开此节点的 SSH 监控长连接。保留 Agent 文件、配置、原机器 ID、本地数据库和平台历史。继续使用只能重新部署 Agent。</p>
     <p className="hint">“暂停监控”保留轻量心跳，可直接恢复；本操作会停止 Agent 服务。平台与其他机器继续运行。</p>
-    {full?<AdminCredentialFields auth={auth} disabled={busy}/>:<>
+    {full?<AdminCredentialFields platform={machine.platform} auth={auth} disabled={busy}/>:<>
       <p>原 SSH 账户：{machine.username}@{machine.host}:{machine.port} · Basic，不调用 sudo</p>
       {machine.saved_credentials_usable&&<label className="machine-confirm"><input type="checkbox" checked={saved} disabled={busy} onChange={event=>{clear();setSaved(event.target.checked);}}/>使用平台已加密保存的 SSH 凭据</label>}
       {!saved&&<SshAuthenticationFields method={method} onMethodChange={value=>{clear();setMethod(value);}} busy={busy} required passwordRef={password} keyRef={key} passphraseRef={passphrase}/>}

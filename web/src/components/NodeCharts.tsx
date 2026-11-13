@@ -85,7 +85,7 @@ export function NodeCharts({ node, history, historyError, liveSamples, temperatu
   const frequencyFresh=node.online&&Number.isFinite(frequencyAt)&&frequencyAt<=checkedAt&&checkedAt-frequencyAt<=90_000;
   const hasFrequency=frequencyFresh&&frequency&&Number.isFinite(frequency.average_mhz)&&frequency.average_mhz>0;
   const frequencyLabel=hasFrequency?`均频 ${(frequency.average_mhz/1000).toFixed(2)} GHz`:"均频 —";
-  const cpuDetail=`${cpus.length>1?`${cpus.length} 颗 CPU · `:""}${frequencyLabel} · ${node.cpu_logical_cores} 线程 · Load ${metrics.load_average_one.toFixed(2)}`;
+  const cpuDetail=`${cpus.length>1?`${cpus.length} 颗 CPU · `:""}${frequencyLabel} · ${node.cpu_logical_cores} 线程 · Load ${metrics.load_average_one == null ? "—" : metrics.load_average_one.toFixed(2)}`;
   const cpuDetailTitle=hasFrequency?`${cpuDetail}；${frequency.logical_cpus} 个有效逻辑 CPU（含空闲），内核报告范围 ${(frequency.minimum_mhz/1000).toFixed(2)}–${(frequency.maximum_mhz/1000).toFixed(2)} GHz；采集于 ${new Date(frequency.collected_at).toLocaleString()}，30 秒缓存；频率变化不等同于热降频。`
     :`${cpuDetail}；${frequency?"频率数据已过期或节点离线":"暂无频率数据；旧 Agent 需更新，不支持的系统不会伪造频率"}。`;
   const networkMax = rateScale([rx, tx, ...points.flatMap((point) => [point.network_received_bytes_per_second, point.network_transmitted_bytes_per_second])]);

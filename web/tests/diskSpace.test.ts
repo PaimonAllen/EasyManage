@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import {test} from "node:test";
-import {entryPath,parentPercent,sortedEntries,spaceTreemap,spaceDirectoryPath,excludedSpaceEntry,directorySummaryItems} from "../src/lib/diskSpace.ts";
+import {entryPath,parentPercent,sortedEntries,spaceTreemap,spaceDirectoryPath,excludedSpaceEntry,directorySummaryItems,stableSpacePage} from "../src/lib/diskSpace.ts";
 import type {SpaceEntry} from "../src/api/diskSpace.ts";
 const entry=(id:number,parent:number|null,name:string,size:number):SpaceEntry=>({id,parent,name,allocated:size,apparent:size,kind:"directory",files:0,directories:0,issue:null,incomplete:false,mtime:0});
 const nodes=[entry(0,null,"/",100),entry(1,0,"home",80),entry(2,1,"nested",40),entry(3,0,"var",20)];
@@ -36,4 +36,16 @@ test("all-local grouping preserves real paths and marks excluded mounts",()=>{
   for(const issue of ['mount_boundary','duplicate_mount','separate_filesystem'])assert.equal(excludedSpaceEntry({...all[2],issue}),true);
   assert.equal(excludedSpaceEntry(all[2]),false);
   assert.equal(parentPercent(all[2],all,'allocated'),50);
+});
+
+test("live refresh updates values while preserving reading order; explicit new pages retain server ordering",()=>{
+  const original={directory:nodes[0],ancestors:[nodes[0]],entries:[nodes[1],nodes[3]],top:[nodes[1],nodes[3]],total:2,offset:0,limit:250};
+  const next={...original,directory:{...nodes[0],allocated:200},entries:[{...nodes[3],allocated:120},{...nodes[1],allocated:70},entry(4,0,"new",10)],total:3};
+  const stable=stableSpacePage(original,next);
+  assert.deepEqual(stable.entries.map(n=>n.id),[1,3,4]);
+  assert.deepEqual(stable.entries.map(n=>n.allocated),[70,120,10]);
+  assert.equal(stable.directory.allocated,200);
+  assert.deepEqual(stableSpacePage(undefined,next).entries.map(n=>n.id),[3,1,4]);
+  assert.equal(stableSpacePage(original,{...next,offset:250}).entries,next.entries);
+  assert.deepEqual(stableSpacePage(original,{...next,entries:[next.entries[0]]}).entries.map(n=>n.id),[3]);
 });

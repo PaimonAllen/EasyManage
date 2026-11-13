@@ -1,3 +1,4 @@
+import {isFullPrivilege,privilegeIdentity} from "../lib/hostPlatform";
 import type { NodeSummary } from "../types/monitoring";
 import { formatDate } from "../lib/format";
 import { inventorySample, type InventoryCategory } from "../lib/collection";
@@ -65,11 +66,11 @@ export function NodeStatus({ node }: { node: NodeSummary }) {
 export function PrivilegeBadge({ node }: { node: NodeSummary }) {
   const privilege = node.metrics?.privilege;
   if (!privilege) return <span className="badge badge--muted">权限待上报</span>;
-  const full = privilege.mode === "full" && privilege.uid === 0;
+  const full = isFullPrivilege(privilege);
   return (
     <span
       className={`badge ${full ? "badge--full" : "badge--basic"}`}
-      title={`运行用户 ${privilege.username} · UID ${privilege.uid}`}
+      title={`运行用户 ${privilege.username} · ${privilegeIdentity(privilege)}`}
     >
       {full ? "Full" : "Basic"} · {privilege.username}
     </span>

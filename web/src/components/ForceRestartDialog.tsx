@@ -41,7 +41,7 @@ export function ForceRestartDialog({ target, onClose, onSubmitted }: {
         <p className="form-error">将立即终止该服务的全部进程并重新启动，当前请求及监控连接会中断。</p>
         <p className="hint">{target ? "支持离线或故障 Agent；保留目标机已配置的 Full / Basic 权限。" : "仅重启平台服务；数据库故障仍需管理员恢复 PostgreSQL。"} 可复用首次验证后加密保存的管理员凭据。</p>
         {!target&&<p className="hint">平台重启会短暂中断 SSH 长连接；已加密保存凭据且启用的连接将自动恢复。不影响 Agent 安装和原有权限。</p>}
-        <AdminCredentialFields auth={auth} disabled={busy} />
+        <AdminCredentialFields platform={target?.platform} auth={auth} disabled={busy} />
       </>}
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="dialog-actions"><button className="button button--secondary" type="button" disabled={busy} onClick={onClose}>{message ? "关闭" : "取消"}</button>

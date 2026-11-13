@@ -1,6 +1,7 @@
 import { NodePanel } from "../components/NodePanel";
 import { useEffect, useId, useRef, useState } from "react";
 import { permissionFreshSeconds } from "../lib/collection";
+import { pageRefreshSeconds } from "../lib/pageRefresh";
 import { fetchPermissionReviews, markPermissionReview, type PermissionReview } from "../api/client";
 import { CollectionNotes, NodeStatus } from "../components/NodeStatus";
 import { PageHeading } from "../components/PageHeading";
@@ -127,7 +128,7 @@ export function PermissionChecks({ nodes }: { nodes: NodeSummary[] }) {
       finally { window.clearTimeout(timeout); request = null; }
     }
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 300_000);
+    const timer = window.setInterval(() => void refresh(), (pageRefreshSeconds("permissions") ?? 3600) * 1000);
     const visible = () => { if (!document.hidden) void refresh(); };
     document.addEventListener("visibilitychange", visible);
     return () => { mounted.current = false; request?.abort(); window.clearInterval(timer); document.removeEventListener("visibilitychange", visible); };
@@ -171,7 +172,7 @@ export function PermissionChecks({ nodes }: { nodes: NodeSummary[] }) {
             <Summary checks={audit.checks} isReviewed={isReviewed} />
             {audit.truncated && <p className="permission-limit">扫描超过上限：最多展示 64 个个人目录、32 个项目目录和 64 个 sudo 附加规则文件；未覆盖的路径状态未知。</p>}
             {!current && <p className="permission-limit">节点离线或权限快照超过 8 分钟，以下结果仅供历史参考。</p>}
-            {categories.map((category) => {
+            {(node.metrics?.privilege?.native?.platform==="windows"?[{id:"windows_acl",title:"Windows NTFS ACL"},{id:"windows_firewall",title:"Windows 防火墙"}]:categories).map((category) => {
               const checks = audit.checks.filter((item) => item.category === category.id);
               return <section className="permission-category" key={category.id}>
                 <h3>{category.title} <small>{checks.length} 项</small></h3>

@@ -7,7 +7,7 @@ import type { NodeSummary } from "../types/monitoring";
 export function OSandSoftwares({ nodes }: { nodes: NodeSummary[] }) {
   const [query, setQuery] = useState("");
   return <>
-    <PageHeading eyebrow="Operating systems & packages" title="OSandSoftwares" description="各节点实际系统版本、已安装软件包与运行中的 systemd 服务" />
+    <PageHeading eyebrow="Operating systems & packages" title="OSandSoftwares" description="各节点实际系统版本、已安装软件包与运行中的系统服务（Linux systemd / Windows SCM）" />
     <section className="page-content">
       <label>搜索软件包 <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="名称或版本" /></label>
       {nodes.map((node) => {

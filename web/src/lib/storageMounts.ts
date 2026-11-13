@@ -30,15 +30,28 @@ export function sharedStorage(disks:DiskMetric[]):Map<string,SharedStorage>{
   return result;
 }
 
+// Common directory choices show the original shared data mount, rather than
+// one bind entry per home user. Keep separate disks and unknown identities.
+export function directoryScanMounts(disks:DiskMetric[]):DiskMetric[]{
+  const groups=sharedStorage(disks);
+  return disks.filter(disk=>{
+    if(!/^\/home\/[^/]+\/bigdata\d*\/?$/.test(disk.mount_point)||!disk.mount)return true;
+    const root=disk.mount.root;
+    return !groups.get(storageMountKey(disk))?.members.some(original=>
+      !original.mount_point.startsWith("/home/")&&original.mount&&
+      (original.mount.root==="/"||original.mount.root===root||root.startsWith(original.mount.root.replace(/\/$/,"")+"/")));
+  });
+}
+
 // Only mounted local filesystems supported by the directory scanner. Overlay
 // mounts and network/virtual filesystems are not physical disk choices.
-const scanFilesystems=new Set(['ext2','ext3','ext4','xfs','btrfs','zfs','f2fs','jfs','reiserfs','ntfs','ntfs3','fuseblk','exfat','vfat','hfsplus','bcachefs']);
+const scanFilesystems=new Set(['NTFS','ReFS','FAT32','exFAT','ntfs','refs','fat32','exfat','ext2','ext3','ext4','xfs','btrfs','zfs','f2fs','jfs','reiserfs','ntfs','ntfs3','fuseblk','exfat','vfat','hfsplus','bcachefs']);
 export interface ScanDiskTarget {key:string;disk:DiskMetric;aliases:number;subtree:boolean}
 export function scanDiskTargets(disks:DiskMetric[],devices:BlockDevice[]=[],showBoot=true):ScanDiskTarget[]{
   const bootDevices=new Set<string>();
   function collectBoot(items:BlockDevice[]){for(const d of items){if(isBootPartition(d))bootDevices.add(d.path??`/dev/${d.name}`);collectBoot(d.children);}}
   collectBoot(devices);
-  const candidates=disks.filter(d=>scanFilesystems.has(d.file_system)&&!isNetworkStorage(d)&&d.mount_point.startsWith('/')&&
+  const candidates=disks.filter(d=>scanFilesystems.has(d.file_system)&&!isNetworkStorage(d)&&(d.mount_point.startsWith('/')||/^[A-Za-z]:[\\/]/.test(d.mount_point))&&
     (showBoot||d.mount_point==='/'||(!isBootMount(d.mount_point)&&!bootDevices.has(d.name))));
   const groups=new Map<string,DiskMetric[]>();
   for(const disk of candidates){

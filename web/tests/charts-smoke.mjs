@@ -19,7 +19,7 @@ const server = await createServer({
 });
 try {
   const pageRefresh=await server.ssrLoadModule('/src/lib/pageRefresh.ts');
-  const expectedPageSeconds={overview:10,users:180,storage:60,network:60,operations:null,security:3600,permissions:300,'platform-health':15,software:3600,'global-network':300,gitea:300,'ai-tools':300,'programming-environment':43200,'gpu-comparison':null,'agent-management':30};
+  const expectedPageSeconds={overview:10,users:180,storage:60,network:60,operations:null,security:3600,permissions:3600,'platform-health':15,software:3600,'global-network':300,gitea:300,'ai-tools':300,'programming-environment':43200,'gpu-comparison':null,'agent-management':30};
   for(const [page,seconds] of Object.entries(expectedPageSeconds))assert.equal(pageRefresh.pageRefreshSeconds(page),seconds,page);
   assert.equal(pageRefresh.pageRefreshLabel('operations'),null);
   assert.ok(pageRefresh.pageRefreshLabel('programming-environment').includes('12 小时'));
@@ -215,10 +215,15 @@ try {
   assert.ok(!diskHtml.includes("<script>fixture</script>")&&diskHtml.includes("&lt;script&gt;"));
   console.log("PASS hierarchical disk usage, parent percentages, partial lower-bound notices, treemap and escaped filenames");
   const controls=renderToStaticMarkup(React.createElement(DiskSpaceExplorer,{nodes:[{id:'fixture',hostname:'fixture',online:true,metrics:null}]}));
+  assert.ok(controls.includes('全量快照模式')&&controls.includes('实时扫描模式')&&controls.includes('aria-pressed="true"'));
   assert.equal((controls.match(/value="0" selected="">无限制/g)??[]).length,2);
-  assert.ok(controls.includes('关闭页面后任务继续')&&controls.includes('仅保存目录大小、数量和层级'));
+  assert.ok(controls.includes('关闭或 F5 刷新页面后任务继续')&&controls.includes('仅汇总目录大小、数量和层级'));
   assert.ok(controls.includes('扫描范围')&&controls.includes('全部本地磁盘')&&controls.includes('指定目录仅扫描所在文件系统'));
   assert.ok(controls.includes('<option value="disk">指定磁盘</option>'));
+  const fullControls=renderToStaticMarkup(React.createElement(DiskSpaceExplorer,{nodes:[{id:'full-fixture',hostname:'fixture',online:true,metrics:{privilege:{mode:'full',uid:0,username:'root'}}}]}));
+  assert.match(fullControls, /class="disk-explorer__fixed-level" disabled=""[^>]*>/);
+  assert.ok(fullControls.includes('<option value="full" selected="">root · Full Agent</option>'));
+  assert.ok(!fullControls.includes("授权管理员扫描")&&fullControls.includes("选择扫描目录")&&fullControls.includes("请下拉选择扫描目录")&&fullControls.includes("自定义路径…"));
   const {PagedSpaceVisualization}=await server.ssrLoadModule('/src/components/PagedSpaceVisualization.tsx');
   const paged=renderToStaticMarkup(React.createElement(PagedSpaceVisualization,{nodeId:'fixture',scanId:'fixture',result:{root:'/fixture',uid:1000,username:'fixture',status:'cancelled',reason:'cancelled',visited:32011,errors:0,skipped_mounts:0,symlinks:0,hardlinks:0,nodes:[diskTree[0]],paged:true},onChoosePath:()=>{}}));
   assert.ok(paged.includes('手动取消')&&paged.includes('大小为已读取部分的下限')&&paged.includes('排序作用于全部子目录'));
@@ -715,7 +720,7 @@ try {
   assert.ok(aiPage.includes("Claude Code") && aiPage.includes("Agent 工具"));
   assert.ok(!aiPage.includes("/runtime-fixture/ollama") && !aiPage.includes("ollama.service"));
   assert.ok(aiPage.includes("已发现安装的工具</strong><span>2</span>"));
-  assert.ok(aiPage.includes("运行进程</strong><span>0</span>") && aiPage.includes("systemd 服务</strong><span>0</span>"));
+  assert.ok(aiPage.includes("运行进程</strong><span>0</span>") && aiPage.includes("系统服务</strong><span>0</span>"));
   const oldAi = renderToStaticMarkup(React.createElement(AiTools, { nodes: [{ id: "old-ai", hostname: "old", online: false, metrics: {} }] }));
   assert.ok(oldAi.includes("尚未收到新版 Agent 的 AI 工具清单"));
   console.log("PASS expanded multi-user AI inventory paths and incomplete-scan reasons, with legacy Agent fallback");
@@ -781,7 +786,7 @@ try {
   console.log("PASS overview machine management entry, safe default Basic, archive list and unavailable-candidate protection");
   const connectionSettings = renderToStaticMarkup(React.createElement(AgentConnectionSettings,{url:"https://platform.example:8443",busy:false,onChange:()=>{}}));
   assert.ok(connectionSettings.includes("自动写入 Agent 配置") && connectionSettings.includes('value="https://platform.example:8443"'));
-  assert.ok(connectionSettings.includes('value="auto" selected=""') && connectionSettings.includes("最多 3 条 SSH"));
+  assert.ok(connectionSettings.includes('value="auto" selected=""') && connectionSettings.includes("最多 3 条监控/管理 SSH") && connectionSettings.includes("扫描另用最多 10 条短连接"));
   assert.ok(connectionSettings.includes("不为每次采集重新登录") && connectionSettings.includes("需管理员允许 SSH 回环端口转发"));
   const sshSettings=renderToStaticMarkup(React.createElement(AgentConnectionSettings,{url:"https://platform.example:8443",mode:"ssh",busy:false,onChange:()=>{},onModeChange:()=>{}}));
   assert.ok(sshSettings.includes('value="ssh" selected=""') && sshSettings.includes("隧道继续校验 CA/证书"));
@@ -798,6 +803,16 @@ try {
   assert.ok(fullMode.includes('value="full" selected=""') && fullMode.includes("/var/lib/easymanage-agent") && fullMode.includes('type="password"'));
   assert.ok(!rootMode.includes('type="password"'));
   console.log("PASS Basic/Full deployment choices, home-only Basic storage, root/sudo notices and masked sudo input");
+  assert.ok(agentAdd.includes('value="windows"')&&agentAdd.includes('PowerShell 7 / pwsh'));
+  const windowsFullMode=renderToStaticMarkup(React.createElement(AgentDeploymentFields,{...modeProps,mode:"full",platform:"windows"}));
+  const windowsBasicMode=renderToStaticMarkup(React.createElement(AgentDeploymentFields,{...modeProps,mode:"basic",platform:"windows"}));
+  assert.ok(windowsFullMode.includes('LocalSystem')&&windowsFullMode.includes('ProgramData')&&!windowsFullMode.includes('sudo')&&!windowsFullMode.includes('type="password"'));
+  assert.ok(windowsBasicMode.includes('LocalAppData')&&windowsBasicMode.includes('需用户登录'));
+  const windowsPrivilege={mode:"full",uid:4294967295,username:"SYSTEM",native:{platform:"windows",principal:"S-1-5-18",administrator:true,capabilities:[]}};
+  assert.equal(updateEligible({...pendingPauseUpgrade,online:true,monitoring_paused:false,metrics:{privilege:windowsPrivilege}},availableFull),true);
+  assert.equal(updateEligible({...pendingPauseUpgrade,online:true,monitoring_paused:false,metrics:{privilege:{...windowsPrivilege,native:{...windowsPrivilege.native,administrator:false}}}},availableFull),false);
+  console.log("PASS Windows selector, native service/limited-task choices and Administrator-token-based Full eligibility");
+
   const fieldProps = {onMethodChange:()=>{},busy:false,required:true,passwordRef:{current:null},keyRef:{current:null},passphraseRef:{current:null}};
   const passwordFields = renderToStaticMarkup(React.createElement(SshAuthenticationFields,{...fieldProps,method:"password"}));
   const keyFields = renderToStaticMarkup(React.createElement(SshAuthenticationFields,{...fieldProps,method:"private_key"}));

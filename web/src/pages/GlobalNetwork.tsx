@@ -25,6 +25,10 @@ export function proxyMonitoringVisible(node:NodeSummary,desired:boolean|undefine
   return desired!==false && node.metrics?.collection_policy?.proxy_enabled!==false;
 }
 
+function ownerKey(node:NodeSummary,service:{uid:number;username:string}):string|null {
+ if(node.metrics?.privilege?.native?.platform==="windows")return service.username&&service.username!=="unknown"?`${node.id}:${service.username}`:null;
+ return `${node.id}:${service.uid}`;
+}
 export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
   const [selectedNode, setSelectedNode] = useState("");
   const {settings,settingsError,busy,errors,toggle}=useNodeCollection("proxy");
@@ -39,7 +43,8 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
       || left.service.username.localeCompare(right.service.username)
       || left.service.name.localeCompare(right.service.name)), [nodes, selectedNode,enabledById]);
   const current = rows.filter(({ node }) => inventoryFresh(node, "proxy"));
-  const users = new Set(current.map(({ node, service }) => `${node.id}:${service.uid}`));
+  const users = new Set(current.map(({node,service})=>ownerKey(node,service)).filter((value):value is string=>value!==null));
+  const unknownOwners=current.some(({node,service})=>ownerKey(node,service)===null);
   const visibleListeners = current.reduce((count, { service }) => count + service.listen_addresses.length, 0);
   const portAnalysis = analyzeProxyPorts(current.map(({ node, service }) => ({
     nodeId: node.id, hostname: node.hostname, service,
@@ -69,7 +74,7 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
         <header className="panel-header"><div><h2>代理运行概览</h2><p>只统计新鲜 Agent 清单；不将历史快照算作当前运行。</p></div></header>
         <div className="health-grid">
           <div><strong>代理进程</strong><span>{current.length}</span><small>可识别、可见的进程</small></div>
-          <div><strong>涉及用户</strong><span>{users.size}</span><small>按节点和 UID 去重</small></div>
+          <div><strong>涉及用户</strong><span>{users.size}{unknownOwners?" + 未知":""}</span><small>按节点及可观测的 UID / Windows 账户去重</small></div>
           <div><strong>可见监听</strong><span>{visibleListeners}</span><small>地址不等于代理可用</small></div>
           <div><strong>跨境出口</strong><span className="muted">未验证</span><small>不主动探测外部站点</small></div>
         </div>
@@ -82,7 +87,7 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
         const applied=node.metrics?.collection_policy?.proxy_enabled;
         const hidden=!proxyMonitoringVisible(node,enabled);
         const services = node.metrics?.proxy_services ?? [];
-        const accounts = new Set(services.map((service) => service.uid));
+        const accounts = new Set(services.map(service=>ownerKey(node,service)).filter((value):value is string=>value!==null));
         return <NodePanel node={node} key={node.id} header={
           <header className="panel-header"><div><h2>{node.hostname} <NodeStatus node={node} /></h2><p><SnapshotAge node={node} inventory category="proxy" /></p></div>
             <NodeCollectionToggle hostname={node.hostname} label="代理监控采集" enabled={enabled} applied={applied}
@@ -91,7 +96,7 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
           </header>
           } notice={errors[node.id]&&<p className="form-error" role="alert">{errors[node.id]}</p>}>{() => <>
           {hidden?<p className="table-empty">{enabled===true?"代理采集正在开启，等待 Agent 应用并采集新清单。":"代理监控采集已关闭，不展示旧快照。"}{enabled===false?(applied===false?"Agent 已确认停止代理采集。":"等待 Agent 应用；离线或旧版节点暂不能确认。"):""}</p>:<>
-          <p>{services.length} 个可见代理进程 · {accounts.size} 个用户上下文 · Agent {node.metrics?.privilege?.mode ?? "未知"} 权限</p>
+          <p>{services.length} 个可见代理进程 · {accounts.size}{services.some(service=>ownerKey(node,service)===null)?" + 未知":""} 个用户上下文 · Agent {node.metrics?.privilege?.mode ?? "未知"} 权限</p>
           {!services.length && <p className="table-empty">当前权限下未观测到已识别的代理进程；不代表该节点没有代理。</p>}
           <CollectionNotes node={node} components={["proxy", "processes", "privilege"]} />
           </>}
@@ -110,7 +115,7 @@ export function GlobalNetwork({ nodes }: { nodes: NodeSummary[] }) {
         </div>}
         <div className="table-scroll"><table><thead><tr><th>节点</th><th>所属用户</th><th>代理进程</th><th>监听范围</th><th>可见监听地址</th><th>快照</th></tr></thead><tbody>
           {rows.map(({ node, service }) => <tr key={`${node.id}-${service.pid}-${service.name}`}>
-            <td>{node.hostname}</td><td><strong>{service.username}</strong><small>UID {service.uid}</small></td>
+            <td>{node.hostname}</td><td><strong>{service.username}</strong><small>{node.metrics?.privilege?.native?.platform==="windows"?"Windows 进程":`UID ${service.uid}`}</small></td>
             <td>{service.name}<small>PID {service.pid}</small></td>
             <td>{listenerScope(service.listen_addresses)}</td>
             <td>{service.listen_addresses.length ? service.listen_addresses.map((address) => <code className="block" key={address}>{address}</code>) : "未监听或不可读取"}</td>

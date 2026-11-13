@@ -31,7 +31,7 @@ export function AiTools({ nodes }: { nodes: NodeSummary[] }) {
         <div className="health-grid">
           <div><strong>已发现安装的工具</strong><span>{installed}</span><small>账户清单中的用户目录和固定系统路径</small></div>
           <div><strong>运行进程</strong><span>{processes}</span><small>仅识别白名单进程名</small></div>
-          <div><strong>systemd 服务</strong><span>{services}</span><small>当前上报的运行单元</small></div>
+          <div><strong>系统服务</strong><span>{services}</span><small>当前上报的运行单元</small></div>
         </div>
         <p className="hint">本页检测 Codex、Claude Code、Gemini CLI、OpenCode、Aider 这类 Agent 工具，不统计模型推理运行时、模型/API 提供方、WebUI 或编程语言环境。未发现不等于未安装；通用 Python / Node 进程不会被猜测为 Agent 工具。</p>
         <p className="hint">新版 Agent 检查账户清单内 /home/账户 与 /root 的常见安装位置：本地 bin、npm、Bun、OpenCode、pnpm、NVM / FNM / mise、Conda、pipx / uv。不递归扫描项目；每次最多 64 个账户目录、1024 个探测目录、每个版本目录最多 16 个环境，工作预算 2 秒。旧 Agent 保留原检测范围，但本页只展示 Agent 工具。</p>
@@ -50,7 +50,7 @@ export function AiTools({ nodes }: { nodes: NodeSummary[] }) {
                 <td><strong>{agentToolLabel(tool.name)}</strong><code className="block">{tool.name}</code></td><td>Agent 工具</td>
                 <td className={isFresh(node, "ai_tools") && (tool.processes.length || tool.service_units.length) ? "positive" : "muted"}>{observedState(tool)}{!isFresh(node, "ai_tools") && " · 历史"}</td>
                 <td>{tool.executable_paths.length ? tool.executable_paths.map((path) => <code className="block" key={path}>{path}</code>) : "未在限定路径发现"}</td>
-                <td>{tool.processes.length ? tool.processes.map((process) => <span className="block" key={process.pid}>{process.username}（UID {process.uid}，PID {process.pid}）</span>) : "未观测到"}</td>
+                <td>{tool.processes.length ? tool.processes.map((process) => <span className="block" key={process.pid}>{process.username}（{node.metrics?.privilege?.native?.platform==="windows"?"Windows · ":`UID ${process.uid}，`}PID {process.pid}）</span>) : "未观测到"}</td>
                 <td>{tool.service_units.length ? tool.service_units.join(", ") : "未观测到"}</td>
               </tr>)}
             </tbody></table></div>

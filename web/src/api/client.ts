@@ -73,6 +73,7 @@ export interface PlatformConfig {
 }
 
 export interface OperationTarget {
+  platform?: "linux"|"windows";
   node_id: string;
   hostname: string;
   host: string;
@@ -85,6 +86,7 @@ export interface OperationTarget {
 }
 
 export interface ManagedMachine {
+  platform?: "linux"|"windows";
   agent_service_state?:string|null; agent_service_desired_stopped?:boolean; agent_service_revision?:number;
   agent_service_last_error?:string|null; agent_stop_available?:boolean;
   node_id: string; hostname: string; display_name: string | null; note: string;
@@ -101,10 +103,10 @@ export interface ManagedMachine {
   monitoring_supported?: boolean;
   monitoring_reported_revision?: number | null;
   control_seen_at?: string | null;
-  ssh_transport?: {status: string; connections: number; limit: number; remote_port: number | null; reconnects: number; retry_attempt?: number; retry_limit?: number; retry_interval_seconds?: number; last_error?: string | null} | null;
+  ssh_transport?: {status: string; connections: number; limit: number; scan_connections?: number; scan_limit?: number; remote_port: number | null; reconnects: number; retry_attempt?: number; retry_limit?: number; retry_interval_seconds?: number; last_error?: string | null} | null;
 }
 export interface MachineStatus {
-  machines: ManagedMachine[]; candidate_available: boolean; ca_available: boolean; registry_writable: boolean;
+  machines: ManagedMachine[]; candidate_available: boolean; platform_candidates?: {linux:boolean;windows:boolean}; ca_available: boolean; registry_writable: boolean;
 }
 export interface MachineDeployment {
   node_id: string; status: "running" | "success" | "failed"; progress: number;
@@ -129,7 +131,7 @@ export async function probeMachine(host: string, port: number): Promise<{fingerp
   return readResponse(await fetch("/api/v1/machines/probe", { method: "POST", headers: {"Content-Type":"application/json"},
     body: JSON.stringify({host, port}), cache:"no-store", signal:AbortSignal.timeout(30_000) }));
 }
-export async function addMachine(request: {host: string; port: number; display_name: string; server_url: string; fingerprint: string; username: string; deployment_mode?: MachineDeploymentMode; connection_mode?: "auto" | "direct" | "ssh"} & MachineAuthentication): Promise<{job_id: string; job_key: string; node_id: string}> {
+export async function addMachine(request: {platform?: "linux"|"windows"; pwsh_path?:string; host: string; port: number; display_name: string; server_url: string; fingerprint: string; username: string; deployment_mode?: MachineDeploymentMode; connection_mode?: "auto" | "direct" | "ssh"} & MachineAuthentication): Promise<{job_id: string; job_key: string; node_id: string}> {
   const body = serializeMachineRequest(request);
   return readResponse(await fetch("/api/v1/machines", { method:"POST", headers:{"Content-Type":"application/json"},
     body, cache:"no-store", signal:AbortSignal.timeout(20_000) }));
@@ -279,6 +281,7 @@ export interface GiteaAccounts {
 }
 
 export interface ManagedUser {
+  native_id?: string|null;
   username: string;
   uid: number;
   gid: number;

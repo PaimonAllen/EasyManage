@@ -1,3 +1,4 @@
+import {isFullPrivilege} from "../lib/hostPlatform";
 import { useEffect, useRef, useState } from "react";
 import { restartAgent } from "../api/client";
 import type { NodeSummary } from "../types/monitoring";
@@ -10,7 +11,7 @@ export function AgentRestartDialog({ node, onClose, onSubmitted }: {
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const active = useRef(true);
-  const full = node.metrics?.privilege?.mode === "full" && node.metrics.privilege.uid === 0;
+  const full = isFullPrivilege(node.metrics?.privilege);
   const auth = useAdminCredentials(full ? [node.id] : []);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -42,7 +43,7 @@ export function AgentRestartDialog({ node, onClose, onSubmitted }: {
       <div className="dialog-title"><div><p className="eyebrow">Agent service restart</p><h2>重启 {node.hostname} Agent</h2></div><button className="icon-button" type="button" aria-label="关闭" disabled={busy} onClick={onClose}>×</button></div>
       <p className="hint">只重启此节点的 EasyManage Agent 服务，不重启主机。生产监控心跳会短暂中断；离线或权限模式不确定时服务端会拒绝操作。</p>
       {message ? <div className="notice notice--success" role="status">{message}<p>最终状态以新心跳为准。</p></div> : <>
-        {full && <AdminCredentialFields auth={auth} disabled={busy} />}
+        {full && <AdminCredentialFields platform={node.metrics?.privilege?.native?.platform} auth={auth} disabled={busy} />}
         {!full && <p className="hint">Basic Agent 将通过可信普通用户 SSH 目标重启，不需要管理员密码。</p>}
       </>}
       {error && <p className="form-error" role="alert">{error}</p>}

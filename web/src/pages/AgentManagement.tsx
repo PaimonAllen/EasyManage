@@ -1,3 +1,4 @@
+import {isFullPrivilege} from "../lib/hostPlatform";
 import { useEffect, useRef, useState } from "react";
 import { fetchRecoveryStatus, fetchPlatformUpdateStatus, updateAgent, type OperationTarget, type RecoveryStatus, type PlatformUpdateStatus } from "../api/client";
 import { AgentRestartDialog } from "../components/AgentRestartDialog";
@@ -22,13 +23,13 @@ function updateHeartbeatAvailable(node: NodeSummary): boolean {
 export function updateEligible(node: NodeSummary, target?: OperationTarget): boolean {
   const privilege = node.metrics?.privilege;
   return Boolean(target?.update_available && target.update_state === "available" && updateHeartbeatAvailable(node)
-    && (privilege?.mode === "basic" || (privilege?.mode === "full" && privilege.uid === 0)));
+    && (privilege?.mode === "basic" || (isFullPrivilege(privilege))));
 }
 
 function restartEligible(node: NodeSummary, target?: OperationTarget): boolean {
   const privilege = node.metrics?.privilege;
   return Boolean(!agentServiceBlocked(node) && target?.restart_available && node.online
-    && ((privilege?.mode === "basic" && privilege.uid !== 0) || (privilege?.mode === "full" && privilege.uid === 0)));
+    && ((privilege?.mode === "basic" && privilege.uid !== 0) || (isFullPrivilege(privilege))));
 }
 
 function updateCondition(node: NodeSummary, target?: OperationTarget): string {
@@ -99,7 +100,7 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
   const needsAdmin = selectedNodes.some((node) => node.metrics?.privilege?.mode === "full");
   const auth = useAdminCredentials(selectedNodes.filter(node=>node.metrics?.privilege?.mode === "full").map(node=>node.id));
   const online = nodes.filter((node) => node.online).length;
-  const full = nodes.filter((node) => node.online && node.metrics?.privilege?.mode === "full" && node.metrics.privilege.uid === 0).length;
+  const full = nodes.filter((node) => node.online && isFullPrivilege(node.metrics?.privilege)).length;
 
   function selectForUpdate(nodeId: string) {
     setSelection(nodeId);
@@ -171,7 +172,7 @@ export function AgentManagement({ nodes, targets, onRefresh, onElevate }: {
         <div className="table-scroll"><table><thead><tr><th>节点 / Agent</th><th>最近心跳</th><th>运行权限</th><th>可信 SSH 目标</th><th>更新条件</th><th>管理操作</th></tr></thead><tbody>
           {nodes.map((node) => {
             const target = targetByNode.get(node.id);
-            const privileged = node.metrics?.privilege?.mode === "full" && node.metrics.privilege.uid === 0;
+            const privileged = isFullPrivilege(node.metrics?.privilege);
             const canUpdate = updateEligible(node, target);
             const canRestart = restartEligible(node, target);
             return <tr key={node.id}>

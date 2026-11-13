@@ -50,3 +50,21 @@ export function spaceTreemap(items:{id:number;name:string;value:number}[],width=
   partition(items.filter(item=>Number.isFinite(item.value)&&item.value>0).sort((a,b)=>b.value-a.value),0,0,width,height);
   return result;
 }
+
+// Refresh values without moving the rows being read. A user-initiated sort or
+// page change still applies the server's ordering to the entire directory.
+export function stableSpacePage(previous:SpacePage|undefined,next:SpacePage):SpacePage {
+  if(!previous||previous.directory.id!==next.directory.id||previous.offset!==next.offset)return next;
+  const incoming=new Map(next.entries.map(entry=>[entry.id,entry]));
+  const entries:SpaceEntry[]=[];
+  for(const entry of previous.entries){const updated=incoming.get(entry.id);if(updated){entries.push(updated);incoming.delete(entry.id);}}
+  entries.push(...incoming.values());
+  return {...next,entries};
+}
+
+// Every set of siblings shares its parent color. Expanded directory groups
+// differ, while refresh, sorting, filtering and pagination preserve the color.
+export function spaceEntryColor(entry:Pick<SpaceEntry,"parent">,tone:"bar"|"label"="bar"):string {
+  const hue=(((entry.parent??0)*137.507764+215)%360+360)%360;
+  return `hsl(${hue.toFixed(3)} 68% var(${tone==="label"?"--space-label-lightness, 74%":"--space-bar-lightness, 60%"}))`;
+}

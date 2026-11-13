@@ -32,11 +32,14 @@ export interface BlockDevice {
 }
 
 export interface AgentPrivilege {
+  native?: {platform: string; principal: string; administrator: boolean; capabilities: string[]} | null;
   mode: string;
   username: string;
   uid: number;
 }
 export interface UserStatus {
+  administrator?:boolean|null;
+  native_id?: string | null;
   username: string;
   uid: number;
   gid: number;
@@ -235,9 +238,9 @@ export interface MetricsSnapshot {
   gpu_collected_at?: string | null;
   collected_at: string;
   cpu_usage_percent: number;
-  load_average_one: number;
-  load_average_five: number;
-  load_average_fifteen: number;
+  load_average_one: number | null;
+  load_average_five: number | null;
+  load_average_fifteen: number | null;
   memory_total_bytes: number;
   memory_used_bytes: number;
   swap_total_bytes: number;

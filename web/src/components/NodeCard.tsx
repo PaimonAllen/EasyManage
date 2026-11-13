@@ -1,3 +1,4 @@
+import {isFullPrivilege} from "../lib/hostPlatform";
 import type { SensorSnapshot } from "../lib/temperature";
 import { useId, useState } from "react";
 import { NodeCharts } from "./NodeCharts";
@@ -67,14 +68,14 @@ export function NodeCard({
             disabled={
               !node.online ||
               !elevationAvailable ||
-              (metrics?.privilege?.mode === "full" && metrics.privilege.uid === 0)
+              (isFullPrivilege(metrics?.privilege))
             }
             onClick={onElevate}
             title={
               !elevationAvailable ? "该节点尚未配置 SSH 提权目标" : undefined
             }
           >
-            {metrics?.privilege?.mode === "full" && metrics.privilege.uid === 0
+            {isFullPrivilege(metrics?.privilege)
               ? "已获得 Full 权限"
               : "提升到 Full"}
           </button>

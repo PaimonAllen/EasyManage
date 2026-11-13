@@ -6,7 +6,7 @@ const seconds: Record<string, number | null> = {
   network: 60,
   operations: null,
   security: 3600,
-  permissions: 300,
+  permissions: 3600,
   "platform-health": 15,
   software: 3600,
   "global-network": 300,

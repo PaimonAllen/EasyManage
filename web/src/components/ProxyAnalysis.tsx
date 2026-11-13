@@ -38,7 +38,9 @@ export const ProxyAvailabilityBar=memo(function ProxyAvailabilityBar({history,st
       return <span key={bucket.index} className={`proxy-availability__slot proxy-availability__slot--${bucket.state}${bucket.known>0&&bucket.known<5?" proxy-availability__slot--partial":""}`}
         title={`${time.from} 起 15 分钟：可用 ${bucket.up} 次，故障 ${bucket.down} 次，未知 ${bucket.unknown} 次\n从上到下，每小格 3 分钟：\n${samples}${checking&&Math.floor(checkingIndex/5)===bucket.index?"\n✱ 本轮检测中，等待结果":""}`} aria-hidden="true">
         <span className="proxy-availability__samples" style={{backgroundImage:`linear-gradient(to bottom,${colors})`}}/>
-        {checking&&Math.floor(checkingIndex/5)===bucket.index&&<span className="proxy-availability__checking" style={{top:`${(checkingIndex%5)*20+10}%`}}>✱</span>}
+        {checking&&Math.floor(checkingIndex/5)===bucket.index&&<span className="proxy-availability__checking" style={{top:`${(checkingIndex%5)*20+10}%`}}>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="11" fill="#17212b"/><path d="M12 3v18M4.2 7.5l15.6 9M4.2 16.5l15.6-9" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/></svg>
+        </span>}
       </span>;})}
   </div>;
 });
