@@ -13,3 +13,6 @@ workspace = true
 chrono.workspace = true
 easymanage-protocol = { path = "../protocol" }
 tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+sysinfo.workspace = true

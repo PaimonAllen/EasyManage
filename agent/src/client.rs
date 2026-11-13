@@ -91,11 +91,14 @@ impl ServerClient {
         let inventory = easymanage_protocol::report_inventory::take(&mut outgoing["metrics"]);
         let inventory_digest = easymanage_protocol::report_inventory::digest(&inventory)?;
         let reuse_inventory = self.inventory.lock().ok().is_some_and(|cached| {
-            cached.as_ref().is_some_and(|(node, digest)| *node == report.node_id && *digest == inventory_digest)
+            cached.as_ref().is_some_and(|(node, digest)| {
+                *node == report.node_id && *digest == inventory_digest
+            })
         });
         if reuse_inventory {
             outgoing["reuse_inventory"] = serde_json::Value::String(inventory_digest.clone());
-            outgoing["protocol_version"] = easymanage_protocol::INVENTORY_CACHE_PROTOCOL_VERSION.into();
+            outgoing["protocol_version"] =
+                easymanage_protocol::INVENTORY_CACHE_PROTOCOL_VERSION.into();
         } else {
             easymanage_protocol::report_inventory::restore(&mut outgoing["metrics"], inventory);
         }
@@ -103,7 +106,8 @@ impl ServerClient {
             outgoing["metrics"]["software_packages"] = serde_json::json!([]);
             outgoing["reuse_software_inventory"] = true.into();
             if !reuse_inventory {
-                outgoing["protocol_version"] = easymanage_protocol::SOFTWARE_CACHE_PROTOCOL_VERSION.into();
+                outgoing["protocol_version"] =
+                    easymanage_protocol::SOFTWARE_CACHE_PROTOCOL_VERSION.into();
             }
         }
         let (mut status, mut body) = self
@@ -119,7 +123,12 @@ impl ServerClient {
 
         // A restored/moved database can lose its cache. Retry the durable full
         // report once, without re-enrolling, discarding history or new SSH.
-        if (reuse || reuse_inventory) && matches!(status,reqwest::StatusCode::CONFLICT | reqwest::StatusCode::BAD_REQUEST) {
+        if (reuse || reuse_inventory)
+            && matches!(
+                status,
+                reqwest::StatusCode::CONFLICT | reqwest::StatusCode::BAD_REQUEST
+            )
+        {
             if let Ok(mut cached) = self.software.lock() {
                 *cached = None;
             }
@@ -154,7 +163,8 @@ impl ServerClient {
             };
         }
         if let Ok(mut cached) = self.inventory.lock() {
-            *cached = accepted.inventory_cached
+            *cached = accepted
+                .inventory_cached
                 .filter(|key| *key == inventory_digest)
                 .map(|key| (report.node_id, key));
         }

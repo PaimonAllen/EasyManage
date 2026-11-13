@@ -386,9 +386,9 @@ impl Collector {
             cpu_sockets: self
                 .cpu_frequency
                 .socket_metrics(self.system.cpus(), &self.cpu_package_temperatures),
-            load_average_one: load.one,
-            load_average_five: load.five,
-            load_average_fifteen: load.fifteen,
+            load_average_one: Some(load.one),
+            load_average_five: Some(load.five),
+            load_average_fifteen: Some(load.fifteen),
             memory_total_bytes: fast.memory_total_bytes,
             memory_used_bytes: fast.memory_used_bytes,
             swap_total_bytes: self.system.total_swap(),

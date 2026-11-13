@@ -256,6 +256,8 @@ impl ExtendedInventory {
                 continue;
             }
             users.push(UserStatus {
+                administrator: None,
+                native_id: None,
                 username: fields[0].to_owned(),
                 uid,
                 gid,
@@ -504,6 +506,7 @@ pub fn effective_uid() -> Option<u32> {
 fn current_privilege(owners: &HashMap<u32, String>) -> AgentPrivilege {
     let uid = effective_uid().unwrap_or(u32::MAX);
     AgentPrivilege {
+        native: None,
         mode: if uid == 0 { "full" } else { "basic" }.to_owned(),
         username: owners.get(&uid).cloned().unwrap_or_else(|| uid.to_string()),
         uid,

@@ -94,10 +94,13 @@ fn check_administrator() -> Result<(), PrivilegeError> {
         "[Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(",
         "[Security.Principal.WindowsBuiltInRole]::Administrator)"
     );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", command])
-        .output()
-        .map_err(|error| PrivilegeError::CheckFailed(error.to_string()))?;
+    let output = Command::new(
+        crate::shell::resolve_pwsh()
+            .map_err(|error| PrivilegeError::CheckFailed(error.to_string()))?,
+    )
+    .args(["-NoProfile", "-NonInteractive", "-Command", command])
+    .output()
+    .map_err(|error| PrivilegeError::CheckFailed(error.to_string()))?;
 
     if !output.status.success() {
         return Err(PrivilegeError::CheckFailed(format!(

@@ -5,4 +5,5 @@ mod platform;
 pub mod privilege;
 pub mod process;
 pub mod shutdown;
+pub mod shell;
 pub mod storage;

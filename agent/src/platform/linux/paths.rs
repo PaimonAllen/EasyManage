@@ -5,36 +5,54 @@ use anyhow::{Context, Result, bail};
 use std::env;
 use std::path::PathBuf;
 
-pub(crate) const SYSTEM_ENV_FILE: &str = "/etc/easymanage/agent.env";
+pub(crate) fn system_config_path() -> Option<PathBuf> {
+    Some(PathBuf::from("/etc/easymanage/agent.env"))
+}
 
 pub(crate) fn user_config_path() -> Option<PathBuf> {
     let preferred = user_config_path_from(|key| env::var_os(key).map(PathBuf::from));
-    if preferred.as_ref().is_some_and(|path| path.is_file()) { return preferred; }
+    if preferred.as_ref().is_some_and(|path| path.is_file()) {
+        return preferred;
+    }
     // Existing configurations can still specify the original identity database.
-    let legacy = env::var_os("HOME").map(PathBuf::from)
+    let legacy = env::var_os("HOME")
+        .map(PathBuf::from)
         .map(|home| home.join(".local/share/easymanage/config/agent.env"));
-    let xdg = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+    let xdg = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .map(|base| base.join("easymanage/agent.env"));
-    legacy.filter(|path| path.is_file()).or_else(|| xdg.filter(|path| path.is_file())).or(preferred)
+    legacy
+        .filter(|path| path.is_file())
+        .or_else(|| xdg.filter(|path| path.is_file()))
+        .or(preferred)
 }
 
 fn user_config_path_from(get: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
-    get("HOME").map(|home| home.join(".easymanage/config/agent.env")).or_else(|| get("XDG_CONFIG_HOME")
-        .filter(|value| !value.as_os_str().is_empty())
-        .map(|base| base.join("easymanage/agent.env")))
+    get("HOME")
+        .map(|home| home.join(".easymanage/config/agent.env"))
+        .or_else(|| {
+            get("XDG_CONFIG_HOME")
+                .filter(|value| !value.as_os_str().is_empty())
+                .map(|base| base.join("easymanage/agent.env"))
+        })
 }
 
 pub(crate) fn default_state_path() -> Result<PathBuf> {
     let uid = super::inventory::effective_uid();
-    let preferred = default_state_path_from(uid, |key| {
-        env::var_os(key).map(PathBuf::from)
-    })?;
+    let preferred = default_state_path_from(uid, |key| env::var_os(key).map(PathBuf::from))?;
     if uid != Some(0) && !preferred.exists() {
         if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-            if [home.join(".local/share/easymanage/state/state.db"), home.join(".local/state/easymanage/agent/state.db")]
-                .iter().any(|path| path.is_file()) {
-                bail!("legacy Agent identity exists; migrate it to ~/.easymanage or set EASYMANAGE_AGENT_STATE_DB explicitly");
+            if [
+                home.join(".local/share/easymanage/state/state.db"),
+                home.join(".local/state/easymanage/agent/state.db"),
+            ]
+            .iter()
+            .any(|path| path.is_file())
+            {
+                bail!(
+                    "legacy Agent identity exists; migrate it to ~/.easymanage or set EASYMANAGE_AGENT_STATE_DB explicitly"
+                );
             }
         }
     }
@@ -48,9 +66,13 @@ fn default_state_path_from(
     if uid == Some(0) {
         return Ok(PathBuf::from("/var/lib/easymanage-agent/state.db"));
     }
-    get("HOME").map(|home| home.join(".easymanage/state/state.db")).or_else(|| get("XDG_STATE_HOME")
-        .filter(|value| !value.as_os_str().is_empty())
-        .map(|base| base.join("easymanage/agent/state.db")))
+    get("HOME")
+        .map(|home| home.join(".easymanage/state/state.db"))
+        .or_else(|| {
+            get("XDG_STATE_HOME")
+                .filter(|value| !value.as_os_str().is_empty())
+                .map(|base| base.join("easymanage/agent/state.db"))
+        })
         .context("set EASYMANAGE_AGENT_STATE_DB when HOME and XDG_STATE_HOME are unavailable")
 }
 

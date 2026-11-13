@@ -142,6 +142,7 @@ mod tests {
             collected_at: at,
             samples: Default::default(),
             privilege: easymanage_protocol::AgentPrivilege {
+                native: None,
                 mode: "basic".into(),
                 username: "fixture".into(),
                 uid: 1000,

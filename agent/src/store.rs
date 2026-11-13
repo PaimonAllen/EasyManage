@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use easymanage_protocol::{AgentReport, HardwareDetails, HostSecurity};
+use easymanage_protocol::AgentReport;
+#[cfg(target_os = "linux")]
+use easymanage_protocol::{HardwareDetails, HostSecurity};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -16,6 +18,7 @@ pub struct Store {
 }
 
 impl Store {
+    #[cfg(target_os = "linux")]
     pub(crate) async fn host_security(&self, uid: u32) -> Result<Option<HostSecurity>> {
         let Some(value) = self.metadata("host_security_v1").await? else {
             return Ok(None);
@@ -25,6 +28,7 @@ impl Store {
         };
         Ok((cached_uid == uid).then_some(snapshot))
     }
+    #[cfg(target_os = "linux")]
     pub(crate) async fn save_host_security(&self, uid: u32, snapshot: &HostSecurity) -> Result<()> {
         self.set_metadata(
             "host_security_v1",
@@ -32,10 +36,12 @@ impl Store {
         )
         .await
     }
+    #[cfg(target_os = "linux")]
     pub(crate) async fn network_capacity_cache(&self) -> Result<Option<String>> {
         self.metadata("network_capacity_v1").await
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) async fn save_network_capacity_cache(&self, value: &str) -> Result<()> {
         self.set_metadata("network_capacity_v1", value).await
     }
@@ -97,6 +103,7 @@ impl Store {
             .await
     }
 
+    #[cfg(target_os = "linux")]
     pub async fn hardware_details(&self, uid: u32) -> Result<Option<HardwareDetails>> {
         let Some(value) = self.metadata("hardware_details_v1").await? else {
             return Ok(None);
@@ -109,6 +116,7 @@ impl Store {
         Ok((cached_uid == uid && details.valid()).then_some(details))
     }
 
+    #[cfg(target_os = "linux")]
     pub async fn save_hardware_details(&self, uid: u32, details: &HardwareDetails) -> Result<()> {
         self.set_metadata(
             "hardware_details_v1",
@@ -285,11 +293,23 @@ impl Store {
                         .context("stored software inventory is missing")?;
                 value["metrics"]["software_packages"] = serde_json::from_str(&software)?;
             }
-            if let Some(key) = value.get("_inventory_key").and_then(serde_json::Value::as_str) {
-                let inventory: String = sqlx::query_scalar("SELECT payload FROM outbox_inventory WHERE digest=?1")
-                    .bind(key).fetch_one(&self.pool).await.context("stored inventory is missing")?;
-                easymanage_protocol::report_inventory::restore(&mut value["metrics"], serde_json::from_str(&inventory)?);
-                value["protocol_version"] = value.get("_original_protocol").cloned()
+            if let Some(key) = value
+                .get("_inventory_key")
+                .and_then(serde_json::Value::as_str)
+            {
+                let inventory: String =
+                    sqlx::query_scalar("SELECT payload FROM outbox_inventory WHERE digest=?1")
+                        .bind(key)
+                        .fetch_one(&self.pool)
+                        .await
+                        .context("stored inventory is missing")?;
+                easymanage_protocol::report_inventory::restore(
+                    &mut value["metrics"],
+                    serde_json::from_str(&inventory)?,
+                );
+                value["protocol_version"] = value
+                    .get("_original_protocol")
+                    .cloned()
                     .context("stored inventory protocol is missing")?;
             }
             let report =
@@ -450,7 +470,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!payload.contains("shared-software-marker"));
-        assert!(serde_json::from_str::<serde_json::Value>(&payload).unwrap()["_inventory_key"].is_string());
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap()["_inventory_key"]
+                .is_string()
+        );
         report.metrics.software_packages[0].version = "2".into();
         store.enqueue(&report).await.unwrap();
         assert_eq!(
@@ -521,26 +544,38 @@ mod tests {
         let store = Store::open(&state.database()).await.unwrap();
         let mut report = report(Uuid::new_v4(), 1);
         report.metrics.inventory_collected_at = Some(chrono::Utc::now());
-        report.metrics.hardware_details = Some(serde_json::from_value(serde_json::json!({
-            "collected_at":"2026-11-05T00:00:00Z", "processors":[], "motherboard":[],
-            "memory":[], "graphics":[], "displays":[], "disks":[], "audio":[], "network":[],
-            "notes":[]
-        })).unwrap());
+        report.metrics.hardware_details = Some(
+            serde_json::from_value(serde_json::json!({
+                "collected_at":"2026-11-05T00:00:00Z", "processors":[], "motherboard":[],
+                "memory":[], "graphics":[], "displays":[], "disks":[], "audio":[], "network":[],
+                "notes":[]
+            }))
+            .unwrap(),
+        );
         let expected = serde_json::to_value(&report).unwrap();
         let first = store.enqueue(&report).await.unwrap();
         let second = store.enqueue(&report).await.unwrap();
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox_inventory")
-            .fetch_one(&store.pool).await.unwrap();
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
         assert_eq!(count, 1);
-        report.metrics.inventory_collected_at = Some(chrono::Utc::now() + chrono::Duration::seconds(60));
+        report.metrics.inventory_collected_at =
+            Some(chrono::Utc::now() + chrono::Duration::seconds(60));
         let changed = serde_json::to_value(&report).unwrap();
         store.enqueue(&report).await.unwrap();
         store.pool.close().await;
         let store = Store::open(&state.database()).await.unwrap();
-        assert_eq!(serde_json::to_value(store.oldest().await.unwrap().unwrap().1).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_value(store.oldest().await.unwrap().unwrap().1).unwrap(),
+            expected
+        );
         store.acknowledge(first).await.unwrap();
         store.acknowledge(second).await.unwrap();
-        assert_eq!(serde_json::to_value(store.oldest().await.unwrap().unwrap().1).unwrap(), changed);
+        assert_eq!(
+            serde_json::to_value(store.oldest().await.unwrap().unwrap().1).unwrap(),
+            changed
+        );
     }
 
     #[tokio::test]

@@ -126,6 +126,7 @@ impl Store {
     }
 }
 
+#[cfg(not(windows))]
 async fn available_bytes(path: &Path) -> Option<u64> {
     // Query only the state filesystem, never enumerate mounts or touch NFS
     // inventory. This child is started only for a large idle legacy database.
@@ -150,6 +151,22 @@ async fn available_bytes(path: &Path) -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+#[cfg(windows)]
+async fn available_bytes(path: &Path) -> Option<u64> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        sysinfo::Disks::new_with_refreshed_list()
+            .list()
+            .iter()
+            .filter(|disk| path.starts_with(disk.mount_point()))
+            .max_by_key(|disk| disk.mount_point().as_os_str().len())
+            .map(|disk| disk.available_space())
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]

@@ -86,11 +86,32 @@ pub struct BlockDevice {
 pub struct AgentPrivilege {
     pub mode: String,
     pub username: String,
+    /// Legacy POSIX identifier; u32::MAX on Windows. Use native identity there.
     pub uid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NativeIdentity {
+    pub platform: String,
+    pub principal: String,
+    pub administrator: bool,
+    pub capabilities: Vec<String>,
+}
+
+impl AgentPrivilege {
+    pub fn is_full(&self) -> bool {
+        self.mode == "full" && self.native.as_ref().map_or(self.uid == 0, |n| n.platform == "windows" && n.administrator)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UserStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub administrator: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_id: Option<String>,
     pub username: String,
     pub uid: u32,
     pub gid: u32,
@@ -432,9 +453,9 @@ pub struct MetricsSnapshot {
     pub cpu_frequency: Option<CpuFrequency>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cpu_sockets: Vec<CpuSocketMetric>,
-    pub load_average_one: f64,
-    pub load_average_five: f64,
-    pub load_average_fifteen: f64,
+    pub load_average_one: Option<f64>,
+    pub load_average_five: Option<f64>,
+    pub load_average_fifteen: Option<f64>,
     pub memory_total_bytes: u64,
     pub memory_used_bytes: u64,
     pub swap_total_bytes: u64,
@@ -598,4 +619,14 @@ pub struct HealthResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+#[cfg(test)]
+mod native_identity_tests {
+ use super::*;
+ #[test] fn windows_administrator_never_requires_or_fabricates_posix_root() {
+  let privilege:AgentPrivilege=serde_json::from_value(serde_json::json!({"mode":"full","username":"SYSTEM","uid":u32::MAX,"native":{"platform":"windows","principal":"S-1-5-18","administrator":true,"capabilities":[]}})).unwrap();
+  assert!(privilege.is_full());let mut rejected=privilege.clone();rejected.native.as_mut().unwrap().administrator=false;assert!(!rejected.is_full());
+  let legacy:AgentPrivilege=serde_json::from_value(serde_json::json!({"mode":"full","username":"root","uid":0})).unwrap();assert!(legacy.is_full());
+ }
 }

@@ -2,5 +2,7 @@
 
 #[cfg(target_os = "linux")]
 pub use crate::platform::linux::process::ProcessSampler;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub use crate::platform::windows::process::ProcessSampler;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub use crate::platform::unavailable::ProcessSampler;

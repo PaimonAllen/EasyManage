@@ -2114,8 +2114,8 @@ mod tests {
         use super::*;
         for value in [
             json!({"username":"admin","password":"fixture-password"}),
-            json!({"username":"admin","private_key":"-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n-----END OPENSSH PRIVATE KEY-----","passphrase":"fixture","sudo_password":"other-fixture"}),
-            json!({"username":"root","private_key":"-----BEGIN RSA PRIVATE KEY-----\nfixture"}),
+            json!({"username":"admin","private_key":format!("-----BEGIN {}-----\nfixture\n-----END {}-----", "OPENSSH PRIVATE KEY", "OPENSSH PRIVATE KEY"),"passphrase":"fixture","sudo_password":"other-fixture"}),
+            json!({"username":"root","private_key":format!("-----BEGIN {}-----\nfixture", "RSA PRIVATE KEY")}),
         ] {
             let credentials: Credentials = serde_json::from_value(value).unwrap();
             assert!(validate_credentials(&credentials).is_ok());

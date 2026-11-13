@@ -2,5 +2,7 @@
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
-#[cfg(any(test, not(target_os = "linux")))]
+#[cfg(target_os = "windows")]
+pub(crate) mod windows;
+#[cfg(any(test, not(any(target_os = "linux", target_os = "windows"))))]
 pub(crate) mod unavailable;

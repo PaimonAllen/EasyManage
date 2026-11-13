@@ -3,7 +3,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::platform::paths::{SYSTEM_ENV_FILE, default_state_path, user_config_path};
+use crate::platform::paths::{default_state_path, system_config_path, user_config_path};
 
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -27,7 +27,9 @@ impl AgentConfig {
             if let Some(path) = user_config_path() {
                 load_implicit_environment_file(&path)?;
             }
-            load_implicit_environment_file(Path::new(SYSTEM_ENV_FILE))?;
+            if let Some(path) = system_config_path() {
+                load_implicit_environment_file(&path)?;
+            }
         }
 
         let server_url = required_env("EASYMANAGE_SERVER_URL")?
