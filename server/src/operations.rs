@@ -85,6 +85,8 @@ struct OperationsState {
 
 #[derive(Default)]
 struct Limits {
+    disk_scans: HashMap<Uuid, usize>,
+    scan_attempts: VecDeque<(Instant, Uuid)>,
     active: HashMap<Uuid, usize>,
     elevating: HashSet<Uuid>,
     attempts: VecDeque<(Instant, Uuid)>,
@@ -112,8 +114,22 @@ impl Drop for Lease {
     }
 }
 
+#[derive(Clone, Copy, Default, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HostPlatform { #[default] Linux, Windows }
+impl HostPlatform { fn is_windows(self) -> bool { self == Self::Windows } }
+fn default_pwsh() -> String { "pwsh.exe".into() }
+
 #[derive(Clone, Deserialize, Serialize)]
 struct Target {
+    #[serde(default)]
+    platform: HostPlatform,
+    #[serde(default = "default_pwsh")]
+    pwsh_path: String,
+    #[serde(default)]
+    architecture: Option<String>,
+    #[serde(default)]
+    native_principal: Option<String>,
     node_id: Uuid,
     hostname: String,
     host: IpAddr,
@@ -144,7 +160,7 @@ struct Target {
 
 impl Target {
     fn elevation_available(&self) -> bool {
-        self.default_user != "root"
+        (!self.platform.is_windows() && self.default_user != "root" || self.platform.is_windows() && self.agent_mode.as_deref()==Some("basic") && self.native_principal.is_some())
             && self.agent_sha256.is_some()
             && self.server_url.is_some()
             && self.ca_sha256.is_some()
@@ -158,7 +174,7 @@ impl Target {
         if self.release_sha256.is_none() {
             return "not_published";
         }
-        if self.ssh_alias.is_none() && self.connection_mode != ssh_transport::Mode::Ssh {
+        if !self.platform.is_windows() && self.ssh_alias.is_none() && self.connection_mode != ssh_transport::Mode::Ssh {
             return "untrusted_target";
         }
         match (&self.release_sha256, &self.agent_sha256) {
@@ -171,7 +187,7 @@ impl Target {
     }
 
     fn restart_available(&self) -> bool {
-        (self.default_user != "root" && self.ssh_alias.is_some())
+        self.platform.is_windows() || (self.default_user != "root" && self.ssh_alias.is_some())
             || self.connection_mode == ssh_transport::Mode::Ssh
     }
 }
@@ -189,6 +205,7 @@ enum Registry {
 
 #[derive(Serialize)]
 struct PublicTarget {
+    platform: HostPlatform,
     node_id: Uuid,
     hostname: String,
     host: IpAddr,
@@ -566,6 +583,12 @@ fn run_force_restart(
     cancellation: &Cancellation,
     platform: bool,
 ) -> Result<(), OperationsError> {
+    if target.platform.is_windows() {
+        if platform { return Err(OperationsError::bad_request("Windows target is an Agent, not the Linux controller")); }
+        let session=ssh_connect(target,&credentials,cancellation)?;
+        machines::windows_operation(&session,target,"verify_admin",json!({}))?;
+        machines::windows_operation(&session,target,"force_restart",json!({}))?; return Ok(());
+    }
     let invocation = format!(
         "/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --kill-after=2s 45s /bin/bash --noprofile --norc -c {} -- {} {}",
         shell_quote(FORCE_RESTART_SCRIPT),
@@ -582,6 +605,10 @@ fn run_privileged_command(
     invocation: &str,
 ) -> Result<(), OperationsError> {
     let session = ssh_connect(target, &credentials, cancellation)?;
+    if target.platform.is_windows() {
+        machines::windows_operation(&session, target, "verify_admin", json!({}))?;
+        return machines::windows_run_fixed(&session, target, invocation);
+    }
     run_privileged_on(&session, credentials, invocation)
 }
 
@@ -637,6 +664,7 @@ async fn list_targets(
     let targets: Vec<_> = load_targets(&state.registry)?
         .into_iter()
         .map(|target| PublicTarget {
+            platform: target.platform,
             elevation_available: target.elevation_available(),
             update_available: target.update_available(),
             update_state: target.update_state(),
@@ -680,8 +708,11 @@ fn load_all_targets(path: &FsPath) -> Result<Vec<Target>, OperationsError> {
             targets.push(target);
         }
     }
-    if targets.len() > 128 {
-        return Err(OperationsError::registry());
+    if targets.len() > 128 { return Err(OperationsError::registry()); }
+    for target in &mut targets {
+        if target.platform.is_windows() {
+            target.release_sha256=machines::windows_candidate_digest(target.architecture.as_deref());
+        }
     }
     Ok(targets)
 }
@@ -730,8 +761,8 @@ fn read_target_file(path: &FsPath) -> Result<Vec<Target>, OperationsError> {
         if !identifiers.insert(target.node_id)
             || target.port == 0
             || target.ssh_remote_port == Some(0)
-            || !valid_username(&target.default_user)
-            || !valid_agent_home(&target.agent_home, &target.default_user)
+            || !valid_target_identity(target)
+            || target.native_principal.as_deref().is_some_and(|sid|!sid.starts_with("S-1-") || sid.len()>184)
             || !target.known_hosts.is_absolute()
             || target
                 .agent_sha256
@@ -788,7 +819,7 @@ fn release_root() -> Result<PathBuf, OperationsError> {
 async fn reported_agent_mode(pool: &PgPool, node_id: Uuid) -> Result<bool, OperationsError> {
     #[cfg(target_os = "linux")]
     agent_service::require_running(pool, node_id).await?;
-    let row = sqlx::query("SELECT n.last_seen, m.metrics->'privilege'->>'mode' AS mode, m.metrics->'privilege'->>'uid' AS uid FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.id=$1")
+    let row = sqlx::query("SELECT n.last_seen, m.metrics->'privilege'->>'mode' AS mode, m.metrics->'privilege'->>'uid' AS uid, m.metrics->'privilege'->'native' AS native FROM nodes n LEFT JOIN metrics_latest m ON m.node_id=n.id WHERE n.id=$1")
         .bind(node_id).fetch_optional(pool).await.map_err(|_| OperationsError::busy())?
         .ok_or(OperationsError::bad_request("节点尚未注册"))?;
     let last_seen: chrono::DateTime<chrono::Utc> = row
@@ -801,6 +832,10 @@ async fn reported_agent_mode(pool: &PgPool, node_id: Uuid) -> Result<bool, Opera
     }
     let mode: Option<String> = row.try_get("mode").map_err(|_| OperationsError::busy())?;
     let uid: Option<String> = row.try_get("uid").map_err(|_| OperationsError::busy())?;
+    let native: Option<serde_json::Value> = row.try_get("native").map_err(|_|OperationsError::busy())?;
+    if let Some(native)=native.filter(|n|n["platform"]=="windows") {
+        return match (mode.as_deref(),native["administrator"].as_bool()) { (Some("full"),Some(true))=>Ok(true),(Some("basic"),Some(false))=>Ok(false),_=>Err(OperationsError::bad_request("Windows Agent 权限信息不一致")) };
+    }
     match (
         mode.as_deref(),
         uid.and_then(|value| value.parse::<u32>().ok()),
@@ -832,10 +867,10 @@ async fn update_agent(
         ));
     }
     let root = release_root()?;
-    let binary = root.join("target/release/easymanage-agent");
+    let binary = machines::candidate_for(target.platform,target.architecture.as_deref())?;
     let script = release_fleet_script(&root);
     check_release_file(&binary)?;
-    if target.connection_mode != ssh_transport::Mode::Ssh {
+    if !target.platform.is_windows() && target.connection_mode != ssh_transport::Mode::Ssh {
         check_private_file(&script)?;
     }
     let release_hash = hex::encode(Sha256::digest(
@@ -870,6 +905,13 @@ async fn update_agent(
     let worker_state = state.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let _lease = lease;
+        if target.platform.is_windows(){
+            let cancellation=Cancellation::default();
+            let session=if let Some(credentials)=credentials.as_ref(){ssh_connect(&target,credentials,&cancellation)?}else{machines::windows_saved_session(&worker_state,&target)?};
+            if full{machines::windows_operation(&session,&target,"verify_admin",json!({}))?;}
+            machines::windows_update(&session,&target,&binary)?;
+            target.agent_sha256=Some(release_hash);machines::save_target(&worker_state,&target)?;return Ok(());
+        }
         let action = if full { "stage-full" } else { "deploy-agent" };
         if target.connection_mode == ssh_transport::Mode::Ssh {
             let stage = machines::update_over_ssh(&target, &binary, full)?;
@@ -951,7 +993,7 @@ async fn restart_agent(
         }
         None
     };
-    let release = if full || target.connection_mode == ssh_transport::Mode::Ssh {
+    let release = if target.platform.is_windows() || full || target.connection_mode == ssh_transport::Mode::Ssh {
         None
     } else {
         let root = release_root()?;
@@ -976,8 +1018,14 @@ async fn restart_agent(
     .await?;
     let cancellation = Arc::new(Cancellation::default());
     let _cancel_guard = CancelOnDrop(Arc::clone(&cancellation));
+    let worker_state=state.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let _lease = lease;
+        if target.platform.is_windows(){
+            let session=if let Some(credentials)=credentials.as_ref(){ssh_connect(&target,credentials,&cancellation)?}else{machines::windows_saved_session(&worker_state,&target)?};
+            if full{machines::windows_operation(&session,&target,"verify_admin",json!({}))?;}
+            machines::windows_operation(&session,&target,"restart",json!({}))?;return Ok(());
+        }
         if full {
             restart_full_agent(
                 &target,
@@ -1160,8 +1208,42 @@ fn valid_agent_home(path: &FsPath, username: &str) -> bool {
             .all(|part| !matches!(part, Component::ParentDir))
 }
 
+fn valid_ssh_username(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 128 && !name.starts_with('-')
+        && !name.chars().any(|c|c.is_control() || matches!(c, '\'' | '"' | ';' | '`' | '$' | '%' | '&' | '|' | '<' | '>'))
+}
+fn valid_target_identity(target: &Target) -> bool {
+    if target.platform.is_windows() {
+        valid_ssh_username(&target.default_user) && valid_windows_path(&target.agent_home.to_string_lossy()) && valid_pwsh_path(&target.pwsh_path)
+    } else {valid_username(&target.default_user) && valid_agent_home(&target.agent_home,&target.default_user)}
+}
+fn valid_windows_path(path: &str) -> bool {
+    let bytes=path.as_bytes();bytes.len()>3 && bytes[0].is_ascii_alphabetic() && bytes[1]==b':' && matches!(bytes[2],b'/'|b'\\')
+        && !bytes[2..].contains(&b':')
+        && !path.chars().any(|c|c.is_control() || matches!(c, '"' | '\'' | ';' | '`' | '$' | '%' | '&' | '|' | '<' | '>' | '*' | '?'))
+        && !path.replace('\\',"/").split('/').any(|part|matches!(part,"."|".."))
+}
+fn valid_pwsh_path(path:&str)->bool{matches!(path,"pwsh"|"pwsh.exe") || (valid_windows_path(path) && path.replace('\\',"/").to_ascii_lowercase().ends_with("/pwsh.exe"))}
+fn windows_invocation(path: &str, interactive: bool) -> Result<String,OperationsError> {
+    use base64::Engine;
+    if !valid_pwsh_path(path) { return Err(OperationsError::registry()); }
+    let bootstrap="& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::ReadLine()))))";
+    let encoded=base64::engine::general_purpose::STANDARD.encode(bootstrap.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+    let args=if interactive {"-NoLogo -NoProfile -NoExit".into()}else{format!("-NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}")};
+    // Probe processes have closed private stdin. The selected shell inherits the
+    // original SSH stream, preserving large/Unicode payloads without PS 5 buffering.
+    let launch=format!("[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false);$x=New-Object Diagnostics.Process;$a=$x.StartInfo;$a.FileName=$p;$a.UseShellExecute=$false;$a.Arguments='{args}';[void]$x.Start();$x.WaitForExit();exit $x.ExitCode");
+    let script=format!("{}\n$p=Find-EasyManagePwsh '{}';\n{}",easymanage_runtime::shell::WINDOWS_PWSH_DISCOVERY,path.replace('\'',"''"),launch);
+    let encoded=base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+    let loader=format!("[scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'))).Invoke()");
+    let noninteractive=if interactive {""}else{"-NonInteractive "};
+    let invocation=format!("cmd.exe /d /s /c \"\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoLogo -NoProfile {noninteractive}-Command {loader}\"");
+    if invocation.len()>8191 {return Err(OperationsError::bad_request("PowerShell 路径过长"));}
+    Ok(invocation)
+}
+
 fn validate_credentials(credentials: &Credentials) -> Result<(), OperationsError> {
-    if !valid_username(&credentials.username)
+    if !valid_ssh_username(&credentials.username)
         || credentials.use_saved
         || (credentials.password.is_empty() && credentials.private_key.is_empty())
         || (!credentials.password.is_empty() && !credentials.private_key.is_empty())
@@ -1241,7 +1323,7 @@ fn acquire_node_lease(
     }
     if limits.active.values().sum::<usize>() >= 8
         || limits.elevating.contains(&node_id)
-        || (elevation && limits.active.get(&node_id).copied().unwrap_or_default() > 0)
+        || (elevation && (limits.active.get(&node_id).copied().unwrap_or_default() > 0 || limits.disk_scans.get(&node_id).copied().unwrap_or_default() > 0))
         || limits.active.get(&node_id).copied().unwrap_or_default() >= 2
         || (count_attempt && limits.attempts.len() >= 30)
         || (count_attempt
@@ -1359,8 +1441,10 @@ async fn elevate(
     .await?;
     let cancellation = Arc::new(Cancellation::default());
     let _cancel_guard = CancelOnDrop(Arc::clone(&cancellation));
+    let worker_state=state.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let _lease = lease;
+        if target.platform.is_windows(){return machines::windows_promote(&worker_state,&target,credentials,&cancellation);}
         promote_agent(&target, credentials, &cancellation)
     });
     let result = match tokio::time::timeout(ELEVATION_TIMEOUT + SSH_TIMEOUT * 3, worker).await {
@@ -1399,10 +1483,12 @@ async fn manage_user(
     Json(request): Json<UserActionRequest>,
 ) -> Result<Json<serde_json::Value>, OperationsError> {
     validate_origin(&headers, &uri)?;
+    let (target, lease) = target_and_lease(&state, node_id, true)?;
+    let valid_account=|name:&str|if target.platform.is_windows(){valid_ssh_username(name)&&name.len()<=64&&!name.chars().any(|c|"\\/:*?[]<>|".contains(c))}else{valid_managed_username(name)};
     if !matches!(
         request.action.as_str(),
         "list" | "create" | "update" | "delete"
-    ) || (request.action != "list" && !valid_managed_username(&request.subject))
+    ) || (request.action != "list" && !valid_account(&request.subject))
         || request.display_name.len() > 100
         || request
             .display_name
@@ -1413,7 +1499,7 @@ async fn manage_user(
             "" | "/bin/bash" | "/bin/zsh" | "/usr/bin/zsh" | "/usr/sbin/nologin"
         )
         || request.groups.as_ref().is_some_and(|groups| {
-            groups.len() > 16 || groups.iter().any(|name| !valid_managed_username(name))
+            groups.len() > 16 || groups.iter().any(|name| !valid_account(name))
         })
         || (request.action != "list" && request.confirmation != request.subject)
     {
@@ -1445,12 +1531,11 @@ async fn manage_user(
         ..Default::default()
     };
     validate_credentials(&credentials)?;
-    if !valid_managed_username(&credentials.username) {
+    if !valid_ssh_username(&credentials.username) {
         return Err(OperationsError::bad_request(
             "管理员账户名称不符合本地账户格式",
         ));
     }
-    let (target, lease) = target_and_lease(&state, node_id, true)?;
     let action = operation.action.clone();
     audit(
         &state.pool,
@@ -1509,6 +1594,10 @@ fn manage_user_worker(
 ) -> Result<serde_json::Value, OperationsError> {
     let session = ssh_connect(target, &credentials, cancellation)?;
     session.set_timeout(35_000);
+    if target.platform.is_windows(){
+        let result=machines::windows_operation(&session,target,"users",json!({"operation":{"action":request.action,"subject":request.subject,"display_name":request.display_name,"groups":request.groups,"confirmation":request.confirmation}}))?;
+        return serde_json::from_str(result.trim()).map_err(|_|OperationsError::ssh("Windows 账户结果格式无效"));
+    }
     let groups = request.groups.map_or_else(
         || {
             if request.action == "update" {
@@ -1696,6 +1785,7 @@ fn restart_full_agent(
 ) -> Result<(), OperationsError> {
     let session = ssh_connect(target, &credentials, cancellation)?;
     session.set_timeout(40_000);
+    if target.platform.is_windows(){machines::windows_operation(&session,target,"verify_admin",json!({}))?;machines::windows_operation(&session,target,"restart",json!({}))?;return Ok(());}
     let invocation = format!(
         "/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=2s 30s /bin/bash --noprofile --norc -c {}",
         shell_quote(FULL_RESTART_SCRIPT),
@@ -1955,8 +2045,8 @@ fn terminal_worker(
         .handle_extended_data(ExtendedData::Merge)
         .map_err(|_| OperationsError::ssh("无法初始化终端"))?;
     channel
-        .exec("/bin/bash -l")
-        .map_err(|_| OperationsError::ssh("目标账户无法启动 bash"))?;
+        .exec(&if target.platform.is_windows() { windows_invocation(&target.pwsh_path, true)? } else { "/bin/bash -l".into() })
+        .map_err(|_| OperationsError::ssh("目标账户无法启动对应系统的终端"))?;
     session.set_blocking(false);
     events
         .try_send(TerminalEvent::Ready)
@@ -2235,6 +2325,7 @@ mod tests {
     #[test]
     fn candidate_update_requires_a_different_known_installed_digest() {
         let mut target = Target {
+            platform: HostPlatform::Linux, pwsh_path: default_pwsh(), architecture: None, native_principal: None,
             node_id: Uuid::nil(),
             hostname: "fixture".to_owned(),
             host: "127.0.0.1".parse().unwrap(),
@@ -2377,4 +2468,35 @@ mod tests {
         assert_eq!(decoder.push(b"ok\xff\xe4"), "ok\u{fffd}");
         assert_eq!(decoder.push(&[0xb8, 0xad]), "中");
     }
+}
+
+#[cfg(test)]
+mod windows_target_tests {
+ use super::*;
+ #[test] fn windows_paths_are_native_absolute_and_never_shell_fragments(){
+  for path in ["C:/Program Files/PowerShell/7/pwsh.exe", "D:\\Users\\fixture\\AppData\\Local\\EasyManage"]{assert!(valid_windows_path(path));}
+  for path in ["C:/../Windows", "C:/EasyManage;whoami", "C:/%TEMP%/agent.exe", "\\\\server/share", "relative", "C:/a/./b", "C:/a\n","C:/file:stream"]{assert!(!valid_windows_path(path),"{path}");}
+  assert!(windows_invocation("pwsh.exe",false).is_ok());assert!(windows_invocation("pwsh",true).is_ok());
+  for invalid in ["pwsh.exe & whoami","../pwsh.exe","cmd.exe","pwsh -Command anything"]{assert!(windows_invocation(invalid,false).is_err());}
+  let invocation=windows_invocation("C:/Program Files/PowerShell/7/pwsh.exe",false).unwrap();assert!(invocation.contains("-Command"));assert!(invocation.contains("WindowsPowerShell"));assert!(!invocation.contains("bash"));
+ }
+ #[test] fn discovery_bootstrap_stays_within_cmd_limit_and_keeps_workload_on_stdin(){
+  use base64::Engine;
+  for hint in ["pwsh.exe","C:/Program Files/PowerShell/7/pwsh.exe","D:/old-package/pwsh.exe"] {
+   let invocation=windows_invocation(hint,false).unwrap();assert!(invocation.len()<=8191);
+   let encoded=invocation.split("FromBase64String('").nth(1).unwrap().split('\'').next().unwrap();
+   let bytes=base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+   let source=String::from_utf8(bytes).unwrap();
+   assert!(source.contains("Find-EasyManagePwsh"));assert!(!source.contains("[Console]::ReadLine()"));
+   assert!(!source.contains("$a.RedirectStandardInput=$true;[void]$x.Start()"));assert!(source.contains("-lt 7"));
+   assert!(source.contains("Get-AppxPackage"));assert!(source.contains("InstalledVersions"));
+   assert!(source.contains("Text.UTF8Encoding($false)"));
+   assert!(source.contains(hint));
+  }
+  let long_hint=format!("C:/{}/pwsh.exe","a".repeat(4000));assert!(windows_invocation(&long_hint,false).is_err());
+ }
+ #[test] fn target_os_defaults_to_linux_for_existing_trusted_registries(){
+  let target:Target=serde_json::from_value(json!({"node_id":Uuid::nil(),"hostname":"fixture","host":"127.0.0.1","default_user":"fixture","agent_home":"/home/fixture/.easymanage","known_hosts":"/tmp/fixture.known_hosts"})).unwrap();
+  assert_eq!(target.platform,HostPlatform::Linux);assert!(valid_target_identity(&target));
+ }
 }

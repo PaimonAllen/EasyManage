@@ -95,7 +95,7 @@ async fn mark(
     let check = &request.check;
     if !matches!(
         check.category.as_str(),
-        "home" | "shared" | "project" | "sudo" | "root"
+        "home" | "shared" | "project" | "sudo" | "root" | "windows_acl" | "windows_firewall"
     ) || check.title.is_empty()
         || check.title.len() > 256
         || check.path.is_empty()

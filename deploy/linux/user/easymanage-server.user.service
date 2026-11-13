@@ -16,7 +16,8 @@ UMask=0077
 NoNewPrivileges=true
 Nice=5
 TasksMax=512
-MemoryMax=4G
+# On-demand analyses retain memory in this process; do not impose a service-wide cap.
+MemoryMax=infinity
 LimitNOFILE=65536
 
 [Install]

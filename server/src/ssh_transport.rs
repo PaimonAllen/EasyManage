@@ -1,6 +1,7 @@
 //! Controller-initiated, bounded SSH transports. Credentials at rest use ssh_vault.
 //! Two long-lived TCP sessions (control + reverse HTTPS), plus one optional admin
-//! identity. Channels are NOT connections. Control operations serialize because
+//! identity. Up to ten independent, short-lived read-scan sessions use a separate
+//! pool, leaving those monitoring/management connections available. Channels are NOT connections. Control operations serialize because
 //! libssh2 blocking mode belongs to a session, not to an individual channel.
 use super::*;
 use base64::Engine as _;
@@ -17,6 +18,7 @@ fn fingerprint(session: &Session) -> Result<String, OperationsError> {
 }
 
 pub(super) const MAX_CONNECTIONS: usize = 3;
+const MAX_SCAN_CONNECTIONS: usize = 10;
 pub(super) const RETRY_LIMIT: u32 = 3;
 pub(super) const RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_PIPES: usize = 8;
@@ -168,6 +170,7 @@ struct State {
 
 struct Host {
     slots: Arc<Semaphore>,
+    scan_slots: Arc<Semaphore>,
     // Serializes physical connection creation, including reconnection and admin login.
     dial: Mutex<()>,
     state: Mutex<State>,
@@ -176,6 +179,7 @@ impl Default for Host {
     fn default() -> Self {
         Self {
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            scan_slots: Arc::new(Semaphore::new(MAX_SCAN_CONNECTIONS)),
             dial: Mutex::new(()),
             state: Mutex::new(State::default()),
         }
@@ -191,7 +195,7 @@ fn host(address: SocketAddr) -> Result<Arc<Host>, OperationsError> {
     let mut hosts = hosts().lock().map_err(|_| OperationsError::busy())?;
     if !hosts.contains_key(&address) && hosts.len() >= 256 {
         // Reclaim only idle endpoints; never evict a transport with live connections.
-        hosts.retain(|_, host| host.slots.available_permits() != MAX_CONNECTIONS);
+        hosts.retain(|_, host| host.slots.available_permits() != MAX_CONNECTIONS || host.scan_slots.available_permits() != MAX_SCAN_CONNECTIONS);
         if hosts.len() >= 256 {
             return Err(OperationsError::busy());
         }
@@ -223,8 +227,10 @@ pub(super) fn maintenance() {
 }
 
 fn dial(host: &Host, address: SocketAddr) -> Result<Arc<Connection>, OperationsError> {
-    let slot = host
-        .slots
+    dial_in(&host.slots, address)
+}
+fn dial_in(slots: &Arc<Semaphore>, address: SocketAddr) -> Result<Arc<Connection>, OperationsError> {
+    let slot = slots
         .clone()
         .try_acquire_owned()
         .map_err(|_| OperationsError::busy())?;
@@ -348,6 +354,26 @@ pub(super) fn operation(
     authenticated(target, &auth, cancellation)
 }
 
+// A scan never occupies or changes the blocking mode of the cached control
+// session. Serialize handshakes only, then let all ten scanners run independently.
+pub(super) fn scan(target: &Target, auth: &Auth, cancellation: &Cancellation) -> Result<SessionLease, OperationsError> {
+    let address = SocketAddr::new(target.host, target.port);
+    let host = host(address)?;
+    let _dial = host.dial.lock().map_err(|_| OperationsError::busy())?;
+    if target.connection_mode == Mode::Ssh {
+        let state = host.state.lock().map_err(|_| OperationsError::busy())?;
+        if state.stop.is_none() || state.control.is_none() {
+            return Err(OperationsError::ssh("SSH 控制连接尚未恢复；请等待或重新鉴权"));
+        }
+    }
+    let connection = dial_in(&host.scan_slots, address)?;
+    verify(&connection, target)?;
+    auth.authenticate(&connection.session)?;
+    *cancellation.socket.lock().map_err(|_| OperationsError::busy())? = Some(connection.socket.try_clone().map_err(|_| OperationsError::busy())?);
+    if cancellation.is_cancelled() { cancellation.cancel(); return Err(OperationsError::ssh("操作已取消")); }
+    Ok(SessionLease { connection, _serial: None })
+}
+
 pub(super) fn authenticated(
     target: &Target,
     auth: &Auth,
@@ -437,6 +463,7 @@ pub(super) fn status(target: &Target) -> serde_json::Value {
     };
     json!({"status":if state.status.is_empty() {"disconnected"} else {state.status},
         "connections":MAX_CONNECTIONS - host.slots.available_permits(), "limit":MAX_CONNECTIONS,
+        "scan_connections":MAX_SCAN_CONNECTIONS-host.scan_slots.available_permits(),"scan_limit":MAX_SCAN_CONNECTIONS,
         "remote_port":state.port.or(target.ssh_remote_port), "reconnects":state.reconnects,
         "retry_attempt":state.retry_attempt,"retry_limit":RETRY_LIMIT,"retry_interval_seconds":RETRY_INTERVAL.as_secs(),
         "last_error":state.last_error})
@@ -513,7 +540,11 @@ impl Drop for SetupGuard {
     }
 }
 
-fn verify_listener(session: &Session, port: u16) -> Result<(), OperationsError> {
+fn verify_listener(session: &Session, target: &Target, port: u16) -> Result<(), OperationsError> {
+    if target.platform.is_windows(){
+        let result=machines::windows_operation(session,target,"verify_loopback",json!({"port":port}))?;
+        if result.trim()!="loopback"{return Err(OperationsError::ssh("Windows SSH 回环监听核验失败"));}return Ok(());
+    }
     // GatewayPorts=yes can override the client's requested bind address. Verify
     // the actual Linux listener before installing any loopback Agent URL.
     let script = "import sys\np=int(sys.argv[1]);found=[]\nfor f in ('/proc/net/tcp','/proc/net/tcp6'):\n for line in open(f).read().splitlines()[1:]:\n  row=line.split();a,port=row[1].split(':')\n  if int(port,16)==p and row[3]=='0A': found.append(a)\nassert found and all(a=='0100007F' for a in found)\nprint('loopback')";
@@ -568,7 +599,7 @@ pub(super) fn start(
     if port == 0 {
         return Err(OperationsError::ssh("SSH 未返回有效的回环监听端口"));
     }
-    verify_listener(session, port)?;
+    verify_listener(session, target, port)?;
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     {
@@ -722,7 +753,7 @@ fn maintain(
                         .ok_or(OperationsError::busy())?
                         .lease()?
                 };
-                if let Err(error) = verify_listener(&control_lease, port) {
+                if let Err(error) = verify_listener(&control_lease, &target, port) {
                     // An outage may kill BOTH sessions. The forward can recover
                     // before the old control socket notices EOF; do not retain
                     // that dead cached control forever across retries.
@@ -741,7 +772,7 @@ fn maintain(
                     auth.authenticate(&connection.session)?;
                     let replacement = Cached::new(connection, auth.identity());
                     let check = replacement.lease()?;
-                    verify_listener(&check, port)?;
+                    verify_listener(&check, &target, port)?;
                     drop(check);
                     control = Some(replacement);
                 } else {
@@ -1028,6 +1059,17 @@ mod tests {
         assert!(host.slots.clone().try_acquire_owned().is_err());
         drop(slots);
         assert_eq!(host.slots.available_permits(), MAX_CONNECTIONS);
+    }
+    #[test]
+    fn ten_scan_sessions_do_not_consume_the_three_core_connections() {
+        let host=Host::default();
+        let core:Vec<_>=(0..3).map(|_|host.slots.clone().try_acquire_owned().unwrap()).collect();
+        let scans:Vec<_>=(0..10).map(|_|host.scan_slots.clone().try_acquire_owned().unwrap()).collect();
+        assert!(host.scan_slots.clone().try_acquire_owned().is_err());
+        assert!(host.slots.clone().try_acquire_owned().is_err());
+        drop(scans); assert_eq!(host.scan_slots.available_permits(),10);
+        assert_eq!(host.slots.available_permits(),0);
+        drop(core); assert_eq!(host.slots.available_permits(),3);
     }
     #[test]
     fn reconnects_wait_one_minute_and_stop_after_three_attempts() {

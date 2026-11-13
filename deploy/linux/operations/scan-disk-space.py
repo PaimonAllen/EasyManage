@@ -4,7 +4,7 @@
 File metadata is aggregated in memory; only directory summaries leave the
 scanner. No per-file database or temporary files. No symlink following, file
 content, cleanup or shell execution. Stdout is batched NDJSON; stdin closes or
-receives a byte to cancel. Results are lower bounds when incomplete.
+receives x to cancel, p to pause or r to resume. Results are lower bounds when incomplete.
 """
 import errno
 import json
@@ -111,8 +111,26 @@ def open_directory(path):
         raise
 
 
+def sensitive_path(path, scope='directory'):
+    parts = [part for part in path.split('/') if part]
+    return scope == 'all_local' or len(parts) <= 1 or parts[0] in {
+        'root', 'etc', 'boot', 'usr', 'var', 'bin', 'sbin', 'lib', 'lib32',
+        'lib64', 'libx32', 'proc', 'sys', 'dev', 'run', 'opt', 'srv'}
+
+
+def original_mount_path(path, table, entry):
+    # Catch a public-looking bind alias of /, /etc, /root, etc. Use the
+    # broadest original root on the same local filesystem, never realpath.
+    bases = [base for base in table if base['device'] == entry['device']
+             and base['filesystem'] == entry['filesystem']
+             and contains(base['root'], entry['root'])]
+    base = min(bases, key=lambda e: (e['root'].count('/'), len(e['root']), len(e['path']), e['path']))
+    actual = os.path.normpath(entry['root'].rstrip('/') + '/' + os.path.relpath(path, entry['path']))
+    return os.path.normpath(base['path'].rstrip('/') + '/' + os.path.relpath(actual, base['root']))
+
+
 def scan(path, seconds=0, emit=lambda value: None, cancelled=lambda: False,
-         max_nodes=0, max_depth=MAX_DEPTH, allowed_fs=LOCAL_FS, stream=False, scope='directory'):
+         max_nodes=0, max_depth=MAX_DEPTH, allowed_fs=LOCAL_FS, stream=False, scope='directory', realtime=False, paused_duration=lambda: 0, enforce_scope=False, approved_sensitive=False):
     if not path.startswith('/') or '\x00' in path or len(path.encode()) > 2048 or '..' in path.split('/'):
         raise ValueError('invalid_path')
     path = os.path.normpath(path)
@@ -123,7 +141,12 @@ def scan(path, seconds=0, emit=lambda value: None, cancelled=lambda: False,
                         key=lambda entry: len(entry['path']))
     if scope == 'directory' and (not containing or containing[-1]['filesystem'] not in allowed_fs):
         raise ValueError('unsupported_filesystem')
-    started = time.monotonic()
+    if enforce_scope and not approved_sensitive:
+        if sensitive_path(path, scope) or (scope == 'directory' and
+                sensitive_path(original_mount_path(path, table, containing[-1]))):
+            raise ValueError('administrator_review_required')
+    clock = lambda: time.monotonic() - paused_duration()
+    started = clock()
     if seconds < 0 or max_nodes < 0:
         raise ValueError('invalid_limit')
     deadline = started + seconds if seconds else None
@@ -132,11 +155,13 @@ def scan(path, seconds=0, emit=lambda value: None, cancelled=lambda: False,
     # batch. Ordinary files are discarded immediately after aggregation. Only
     # multiply-linked inode numbers need to survive for deduplication.
     directory_count = 0
+    active = []
     # Leave room to unwind active directories and report a partial result if
     # an unusually large hard-link set reaches the process memory ceiling.
     memory_reserve = bytearray(1024 * 1024)
     stats = {'visited': 0, 'errors': 0, 'skipped_mounts': 0, 'symlinks': 0, 'hardlinks': 0}
     reason, last_progress = '', started
+    completed_work = 0.0
     boundaries = {entry['path']: entry for entry in table}
     root_stat = root_mount = None
     plan = []
@@ -153,23 +178,39 @@ def scan(path, seconds=0, emit=lambda value: None, cancelled=lambda: False,
             if len(pending) >= 256:
                 flush()
 
-    def checkpoint(force=False):
+    def checkpoint(force=False, counting=False):
         nonlocal reason, last_progress
-        now = time.monotonic()
         if cancelled():
             reason = 'cancelled'
             raise StopScan()
+        now = clock()
         if deadline is not None and now >= deadline:
             reason = 'time_limit'
             raise StopScan()
         if max_nodes and stats['visited'] >= max_nodes:
             reason = 'entry_limit'
             raise StopScan()
-        if force or now - last_progress >= 2:
+        if force or now - last_progress >= (1 if realtime else 2):
+            if realtime:
+                # Active parents do not yet contain the unfinished child. Fold
+                # copies of the stack, never mutate traversal accumulators.
+                child = None
+                for original in reversed(active):
+                    partial = dict(original)
+                    if child is not None:
+                        add_totals(partial, child)
+                    partial['incomplete'] = True
+                    publish(partial)
+                    child = partial
+                if child is not None and child['id'] != root['id']:
+                    partial = dict(root)
+                    add_totals(partial, child)
+                    partial['incomplete'] = True
+                    publish(partial)
             flush()
-            emit({'type': 'progress', 'elapsed_seconds': round(now-started, 1), **stats})
+            emit({'type': 'progress', 'elapsed_seconds': round(now-started, 1), 'estimated_percent': round(min(99.9, completed_work*100), 3), **stats})
             last_progress = now
-        if stats['visited'] and stats['visited'] % 64 == 0:
+        if not counting and stats['visited'] and stats['visited'] % 64 == 0:
             time.sleep(0.01)
 
     def add(name, parent, metadata, kind):
@@ -221,80 +262,110 @@ def scan(path, seconds=0, emit=lambda value: None, cancelled=lambda: False,
         node['incomplete'] = True
         stats['errors'] += 1
 
-    def walk(fd, node, current, depth):
-        nonlocal memory_reserve
+    def walk(fd, node, current, depth, start=0.0, weight=1.0):
+        nonlocal memory_reserve, completed_work
+        finished = False
+        active.append(node)
         publish(node)
         try:
             if depth >= max_depth:
                 unavailable(node, 'depth_limit')
                 return
             try:
+                # Count names in this directory only, without retaining them,
+                # stat calls, or traversing descendants ahead of the scan. This
+                # gives each sibling a share of its parent's estimated work.
+                count = 0
                 with os.scandir(fd) as entries:
-                    for entry in entries:
+                    for _ in entries:
+                        count += 1
+                        if count % 256 == 0:
+                            checkpoint(counting=True)
+                os.lseek(fd, 0, os.SEEK_SET)
+                step = weight / (count + 1)
+                with os.scandir(fd) as entries:
+                    for index, entry in enumerate(entries):
                         checkpoint()
-                        name = entry.name
-                        # JSON cannot represent surrogateescape filenames losslessly.
+                        interrupted = False
                         try:
-                            name.encode('utf-8', 'strict')
-                        except UnicodeError:
-                            unavailable(node, 'unrepresentable_name')
-                            continue
-                        child_path = current.rstrip('/') + '/' + name
-                        if child_path in boundaries:
-                            # Do not stat known mount points: even metadata on
-                            # a network/automount root can block or trigger I/O.
-                            child = add(name, node['id'], empty, 'directory')
-                            skip_mount(child, boundaries[child_path])
-                            add_totals(node, child)
-                            publish(child)
-                            continue
-                        try:
-                            metadata = entry.stat(follow_symlinks=False)
-                        except OSError:
-                            unavailable(node, 'changed_or_denied')
-                            continue
-                        kind = 'directory' if stat.S_ISDIR(metadata.st_mode) else 'file' if stat.S_ISREG(metadata.st_mode) else 'symlink' if stat.S_ISLNK(metadata.st_mode) else 'special'
-                        child = add(name, node['id'], metadata, kind)
-                        child_fd = None
-                        try:
-                            if metadata.st_dev != root_stat.st_dev:
-                                skip_mount(child)
+                            name = entry.name
+                            # JSON cannot represent surrogateescape filenames losslessly.
+                            try:
+                                name.encode('utf-8', 'strict')
+                            except UnicodeError:
+                                unavailable(node, 'unrepresentable_name')
                                 continue
-                            if kind != 'directory':
+                            child_path = current.rstrip('/') + '/' + name
+                            if child_path in boundaries:
+                                # Do not stat known mount points: even metadata on
+                                # a network/automount root can block or trigger I/O.
+                                child = add(name, node['id'], empty, 'directory')
+                                skip_mount(child, boundaries[child_path])
+                                add_totals(node, child)
+                                publish(child)
                                 continue
-                            if len(child_path.encode()) > 2048:
-                                unavailable(child, 'path_limit')
+                            try:
+                                metadata = entry.stat(follow_symlinks=False)
+                            except OSError:
+                                unavailable(node, 'changed_or_denied')
                                 continue
-                            child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
-                            actual = os.fstat(child_fd)
-                            if (actual.st_dev, actual.st_ino) != (metadata.st_dev, metadata.st_ino):
-                                unavailable(child, 'changed_or_denied')
-                            elif mount_id(child_fd) != root_mount:
-                                skip_mount(child)
-                            else:
-                                walk(child_fd, child, child_path, depth+1)
-                        except OSError as error:
-                            unavailable(child, 'permission_denied' if error.errno in (errno.EACCES, errno.EPERM) else 'changed_or_denied')
+                            kind = 'directory' if stat.S_ISDIR(metadata.st_mode) else 'file' if stat.S_ISREG(metadata.st_mode) else 'symlink' if stat.S_ISLNK(metadata.st_mode) else 'special'
+                            child = add(name, node['id'], metadata, kind)
+                            child_fd = None
+                            try:
+                                if metadata.st_dev != root_stat.st_dev:
+                                    skip_mount(child)
+                                    continue
+                                if kind != 'directory':
+                                    continue
+                                if len(child_path.encode()) > 2048:
+                                    unavailable(child, 'path_limit')
+                                    continue
+                                child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                                actual = os.fstat(child_fd)
+                                if (actual.st_dev, actual.st_ino) != (metadata.st_dev, metadata.st_ino):
+                                    unavailable(child, 'changed_or_denied')
+                                elif mount_id(child_fd) != root_mount:
+                                    skip_mount(child)
+                                else:
+                                    walk(child_fd, child, child_path, depth+1, start+index*step, step)
+                            except OSError as error:
+                                unavailable(child, 'permission_denied' if error.errno in (errno.EACCES, errno.EPERM) else 'changed_or_denied')
+                            finally:
+                                if child_fd is not None:
+                                    os.close(child_fd)
+                                add_totals(node, child)
+                                publish(child)
+                        except (StopScan, MemoryError):
+                            interrupted = True
+                            raise
                         finally:
-                            if child_fd is not None:
-                                os.close(child_fd)
-                            add_totals(node, child)
-                            publish(child)
+                            if not interrupted:
+                                completed_work = max(completed_work, min(start+weight, start+(index+1)*step))
+
             except OSError:
                 unavailable(node, 'changed_or_denied')
+            finished = True
         except (StopScan, MemoryError):
             memory_reserve = None
             node['incomplete'] = True
             raise
         finally:
+            if finished:
+                completed_work = max(completed_work, start+weight)
             publish(node)
+            active.pop()
 
     empty = SimpleNamespace(st_blocks=0, st_size=0, st_mtime=0)
     root = add(path, None, empty, 'directory')
     try:
         if stream:
             emit({'type': 'metadata', 'root': path, 'scope': scope, 'uid': os.geteuid(), 'username': pwd.getpwuid(os.geteuid()).pw_name})
-        emit({'type': 'progress', 'elapsed_seconds': 0, **stats})
+            if realtime:
+                initial = dict(root, incomplete=True)
+                publish(initial)
+                flush()
+        emit({'type': 'progress', 'elapsed_seconds': 0, 'estimated_percent': 0, **stats})
         if scope == 'all_local':
             publish(root)
             plan = filesystem_plan(table, allowed_fs, checkpoint)
@@ -303,7 +374,7 @@ def scan(path, seconds=0, emit=lambda value: None, cancelled=lambda: False,
             targets = plan
         else:
             targets = [dict(containing[-1], path=path)]
-        for entry in targets:
+        for target_index, entry in enumerate(targets):
             checkpoint()
             node = add(entry['path'], root['id'], empty, 'directory') if scope == 'all_local' else root
             if scope == 'all_local':
@@ -322,7 +393,7 @@ def scan(path, seconds=0, emit=lambda value: None, cancelled=lambda: False,
                     unavailable(node, 'mount_changed')
                 else:
                     node.update(allocated=max(0, root_stat.st_blocks*512), apparent=max(0, root_stat.st_size), mtime=int(root_stat.st_mtime))
-                    walk(fd, node, entry['path'], 0)
+                    walk(fd, node, entry['path'], 0, target_index/len(targets), 1.0/len(targets))
             except OSError as error:
                 if scope == 'directory' and fd is None:
                     raise
@@ -349,11 +420,54 @@ def scan(path, seconds=0, emit=lambda value: None, cancelled=lambda: False,
     return {'type': 'result', 'root': path, 'uid': os.geteuid(), 'username': pwd.getpwuid(os.geteuid()).pw_name,
             'status': 'cancelled' if reason == 'cancelled' else 'partial' if reason or root['incomplete'] else 'complete',
             'reason': reason or ('unreadable_entries' if root['incomplete'] else ''),
-            'elapsed_seconds': round(time.monotonic()-started, 2),
+            'elapsed_seconds': round(clock()-started, 2),
+            'estimated_percent': 100 if not reason and not root['incomplete'] else round(min(99.9, completed_work*100), 3),
             'scope': scope, 'filesystem': 'multiple' if scope == 'all_local' else containing[-1]['filesystem'],
             'filesystems': filesystem_results,
             **stats, 'detail_level': 'directories', 'saved_directories': directory_count,
             'paged': stream, 'nodes': [root] if stream else nodes}
+
+
+class ScanControl:
+    """Cooperative controls only at traversal checkpoints; never read file content."""
+    def __init__(self, emit, stopped, fd=None):
+        self.emit, self.stopped = emit, stopped
+        self.fd = sys.stdin.fileno() if fd is None else fd
+        self.paused = False
+        self.paused_seconds = 0
+        self.paused_at = None
+
+    def read(self, timeout):
+        if not select.select([self.fd], [], [], timeout)[0]:
+            return
+        data = os.read(self.fd, 4096)
+        if not data:
+            self.stopped[0] = True
+        for command in data:
+            if command in (112, 114):  # p / r
+                pause = command == 112
+                if pause != self.paused:
+                    now = time.monotonic()
+                    if pause:
+                        self.paused_at = now
+                    elif self.paused_at is not None:
+                        self.paused_seconds += now - self.paused_at
+                        self.paused_at = None
+                    self.paused = pause
+                    self.emit({'type': 'control', 'paused': pause})
+            else:
+                self.stopped[0] = True
+
+    def duration(self):
+        return self.paused_seconds + (time.monotonic() - self.paused_at if self.paused_at is not None else 0)
+
+    def __call__(self):
+        if self.stopped[0]:
+            return True
+        self.read(0)
+        while self.paused and not self.stopped[0]:
+            self.read(0.1)
+        return self.stopped[0]
 
 
 def main():
@@ -369,17 +483,11 @@ def main():
     stop = [False]
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__(0, True))
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__(0, True))
-    def cancelled():
-        if stop[0]:
-            return True
-        if select.select([sys.stdin], [], [], 0)[0]:
-            os.read(sys.stdin.fileno(), 1)
-            return True
-        return False
     def emit(value):
         print(json.dumps(value, ensure_ascii=True, separators=(',', ':')), flush=True)
-    emit(scan(request['path'], request['seconds'], emit, cancelled,
-              max_nodes=request.get('max_entries', 0), stream=True, scope=request.get('scope', 'directory')))
+    control = ScanControl(emit, stop)
+    emit(scan(request['path'], request['seconds'], emit, control,
+              max_nodes=request.get('max_entries', 0), stream=True, scope=request.get('scope', 'directory'), realtime=request.get('realtime', False), paused_duration=control.duration, enforce_scope=True, approved_sensitive=request.get('approved_sensitive') is True))
 
 
 if __name__ == '__main__':

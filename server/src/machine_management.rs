@@ -7,6 +7,9 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use tokio::sync::Semaphore;
 
+#[path = "windows.rs"]
+mod windows;
+
 const USER_INSTALL: &str = include_str!("../../deploy/linux/user/install-user-agent.sh");
 const USER_UNIT: &str = include_str!("../../deploy/linux/user/easymanage-agent.user.service");
 const USER_CONTROL: &str = include_str!("../../deploy/linux/user/agent-user-control.py");
@@ -155,6 +158,10 @@ impl DeploymentMode {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AddMachine {
+    #[serde(default)]
+    platform: HostPlatform,
+    #[serde(default = "default_pwsh")]
+    pwsh_path: String,
     host: IpAddr,
     port: u16,
     display_name: String,
@@ -397,6 +404,7 @@ async fn redeploy(
         None
     };
     let mut install = AddMachine {
+        platform: target.platform, pwsh_path: target.pwsh_path.clone(),
         host: target.host,
         port: target.port,
         display_name: row.get("name"),
@@ -449,7 +457,7 @@ async fn redeploy(
     }
     install.validate_authentication()?;
     check_parent(&state.registry)?;
-    candidate()?;
+    candidate_for(install.platform, None)?;
     agent_ca(&state)?;
     let permit = state
         .machines
@@ -664,8 +672,12 @@ async fn manage_ssh(
     } else {
         None
     };
+    let windows_admin=if target.platform.is_windows() && full {
+        resolve_credentials(&state,&target,&headers,Credentials{use_saved:true,..Default::default()}).ok()
+    }else{None};
     let action = request.action;
     let mut authentication = AddMachine {
+        platform: target.platform, pwsh_path: target.pwsh_path.clone(),
         host: target.host,
         port: target.port,
         display_name: target.hostname.clone(),
@@ -749,7 +761,7 @@ async fn manage_ssh(
         ssh_transport::stop(&target)?;
         let mut session = ssh_transport::onboarding(SocketAddr::new(target.host, target.port))?;
         ssh_transport::verify_lease(&session, &target)?;
-        if full
+        if !target.platform.is_windows() && full
             && authentication.username != "root"
             && authentication.sudo_password.is_empty()
             && authentication.auth_method == AuthMethod::Password
@@ -770,7 +782,7 @@ async fn manage_ssh(
         }
         let ca = agent_ca(&worker_state)?;
         let local = checked_local_https(&worker_state, &handle, &ca)?;
-        let port = ssh_transport::start(&target, auth, &mut session, local)?;
+        let port = ssh_transport::start(&target, auth.clone(), &mut session, local)?;
         let mut setup = ssh_transport::SetupGuard::new(&target);
         // Renew only an unregistered node's scoped credential, never a global
         // enrollment secret or an already registered Agent identity/token.
@@ -784,13 +796,13 @@ async fn manage_ssh(
                 .bind(id).bind(crate::api::hash_token(&token)).bind(&target.default_user).execute(&worker_state.pool).await
         }).map_err(|_| OperationsError::busy())?.rows_affected()>0;
         let url = format!("https://127.0.0.1:{port}");
-        let result = configure_network(
-            &session,
-            &authentication,
-            &target,
-            &url,
-            renewal.then_some(token.as_str()),
-        );
+        let unchanged_windows_transport=target.platform.is_windows() && !renewal && target.server_url.as_deref()==Some(url.as_str());
+        let admin_session=if let Some(credentials)=windows_admin.as_ref().filter(|_|!unchanged_windows_transport).filter(|c|c.username!=auth.username || !crate::api::constant_time_equal(&c.password,&auth.password) || !crate::api::constant_time_equal(&c.private_key,&auth.key)) {
+            Some(ssh_connect(&target,credentials,&Cancellation::default())?)
+        }else{None};
+        let result=if unchanged_windows_transport{Ok(())}else if let Some(admin)=admin_session.as_ref(){
+            windows_operation(admin,&target,"configure",json!({"url":url,"token":renewal.then_some(token.as_str()),"ca_sha256":target.ca_sha256})).map(|_|())
+        }else{configure_network(&session,&authentication,&target,&url,renewal.then_some(token.as_str()))};
         if let Err(error) = result {
             let _ = ssh_transport::stop(&target);
             return Err(error);
@@ -799,7 +811,7 @@ async fn manage_ssh(
         target.ssh_remote_port = Some(port);
         target.server_url = Some(url);
         save_target(&worker_state, &target)?;
-        if full {
+        if target.platform.is_windows(){if !unchanged_windows_transport{windows_operation(admin_session.as_deref().unwrap_or(&session),&target,"restart",json!({}))?;}}else if full {
             // Same authenticated control connection; no new SSH invocation.
             admin_command(
                 &session,
@@ -853,6 +865,7 @@ fn configure_network(
     url: &str,
     token: Option<&str>,
 ) -> Result<(), OperationsError> {
+    if target.platform.is_windows(){windows_operation(session,target,"configure",json!({"url":url,"token":token,"ca_sha256":target.ca_sha256}))?;return Ok(());}
     let invocation = format!(
         "/usr/bin/python3 -I -c {} {} {} {} {} {}",
         shell_quote(NETWORK_CONFIG),
@@ -929,6 +942,7 @@ fn configure_network(
 }
 
 pub(super) fn restart_basic_on(session: &Session, target: &Target) -> Result<(), OperationsError> {
+    if target.platform.is_windows(){windows_operation(session,target,"restart",json!({}))?;return Ok(());}
     let script = format!(
         "set -eu; if command -v systemctl >/dev/null; then if systemctl is-active --quiet easymanage-agent.service || systemctl is-enabled --quiet easymanage-agent.service; then exit 3; fi; fi; base={}; if test -f \"$base/config/agent-launch.json\" && python3 -c 'import json,sys;sys.exit(0 if json.load(open(sys.argv[1])).get(\"backend\")==\"compatibility\" else 1)' \"$base/config/agent-launch.json\"; then python3 \"$base/bin/agent-user-control.py\" restart; else systemctl --user restart easymanage-agent.service; fi",
         shell_quote(&target.agent_home.to_string_lossy())
@@ -1038,7 +1052,7 @@ async fn list(
             "note":row.get::<String,_>("management_note"),"deleted_at":row.get::<Option<DateTime<Utc>>,_>("deleted_at"),
             "last_seen":row.get::<DateTime<Utc>,_>("last_seen"),
             "host":target.map(|t|t.host),"port":target.map(|t|t.port),
-            "username":target.map(|t|t.default_user.clone()),"manageable":target.is_some() || platform_admin_available,
+            "platform":target.map(|t|t.platform),"username":target.map(|t|t.default_user.clone()),"manageable":target.is_some() || platform_admin_available,
             "connection_mode":target.map(|t|t.connection_mode),
             "credentials_saved":target.is_some_and(|t|ssh_vault::exists(&state.registry,t)),
             "deployment_mode":target.map(|t|preserved_mode(t,observed.as_deref()).name()),
@@ -1048,7 +1062,7 @@ async fn list(
             "ssh_transport":target.filter(|t|t.connection_mode==ssh_transport::Mode::Ssh).map(ssh_transport::status)})
     }).collect();
     Ok(Json(
-        json!({"machines":machines,"candidate_available":candidate().is_ok(),"ca_available":agent_ca(&state).is_ok(),
+        json!({"machines":machines,"candidate_available":candidate().is_ok() || candidate_for(HostPlatform::Windows,None).is_ok(),"platform_candidates":{"linux":candidate().is_ok(),"windows":candidate_for(HostPlatform::Windows,None).is_ok()},"ca_available":agent_ca(&state).is_ok(),
         "registry_writable":check_parent(&state.registry).is_ok()}),
     ))
 }
@@ -1111,7 +1125,7 @@ async fn add(
     validate_host(request.host, request.port)?;
     validate_label(&request.display_name, "")?;
     request.validate_authentication()?;
-    if !valid_username(&request.username)
+    if !request.platform.is_windows() && (!valid_username(&request.username)
         || !request
             .username
             .bytes()
@@ -1120,14 +1134,15 @@ async fn add(
             &deployment_home(&request.username).join(".easymanage"),
             &request.username,
         )
-        || !valid_controller_url(&request.server_url)
+        || !valid_controller_url(&request.server_url))
     {
         return Err(OperationsError::bad_request(
             "请使用有效 SSH 账户及带端口的 HTTPS 平台地址；普通用户 home 需为 /home/账户，root 为 /root",
         ));
     }
+    if request.platform.is_windows() && (!valid_ssh_username(&request.username) || !valid_pwsh_path(&request.pwsh_path) || !request.sudo_password.is_empty()) {return Err(OperationsError::bad_request("Windows SSH 账户/pwsh 路径无效；Windows 不使用 sudo"));}
     check_parent(&state.registry)?;
-    let _ = candidate()?;
+    let _ = candidate_for(request.platform,None)?;
     let _ = agent_ca(&state)?;
     state.machines.rate_limit()?;
     let targets = load_all_targets(&state.registry)?;
@@ -1252,7 +1267,7 @@ fn launch_deployment(
                 state
                     .machines
                     .event(id, 100, "success", if redeploy {"已收到重新部署后新进程的真实心跳；原机器 ID、本地数据库、待上报数据和平台历史保留，连接凭据已更新"}
-                        else if deployment_mode == DeploymentMode::Basic { "已收到新 Agent 的 Basic 心跳，部署完成；后续可通过设备总览提权" } else { "已收到新 Agent 的 Full / UID 0 心跳，管理员部署完成" })
+                        else if deployment_mode == DeploymentMode::Basic { "已收到新 Agent 的 Basic 心跳，部署完成；后续可通过设备总览提权" } else { "已收到新 Agent 的原生 Full 管理员心跳，部署完成" })
             }
             Ok(Err(error)) => state.machines.event(id, 100, "failed", error.1),
             Err(_) => state.machines.event(
@@ -1860,7 +1875,7 @@ fn deploy(
         ));
     }
     let mode = request.deployment_mode;
-    if mode == DeploymentMode::Full
+    if !request.platform.is_windows() && mode == DeploymentMode::Full
         && request.username != "root"
         && request.sudo_password.is_empty()
         && request.auth_method == AuthMethod::Password
@@ -1872,6 +1887,7 @@ fn deploy(
     } else {
         authenticate(&session, &mut request)?;
     }
+    if request.platform.is_windows() { return windows::deploy(state,id,request,handle,browser_token,existing,administrator,session,ssh_auth); }
     let same_admin = administrator.as_ref().is_some_and(|credentials| {
         credentials.username == ssh_auth.username
             && crate::api::constant_time_equal(&credentials.password, &ssh_auth.password)
@@ -2038,6 +2054,7 @@ fn deploy(
             .map_err(|_| OperationsError::ssh("无法保存已核验 SSH 公钥，未继续安装"))?;
     }
     let mut target = existing.clone().unwrap_or_else(|| Target {
+        platform: HostPlatform::Linux, pwsh_path: default_pwsh(), architecture: Some(fields[2].into()), native_principal: None,
         node_id: id,
         hostname: request.display_name.clone(),
         host: request.host,
@@ -2400,7 +2417,7 @@ async fn change(
         let _permit = permit;
         let session = ssh_connect(&check, &credentials, &Cancellation::default())?;
         if admin || credentials.username != check.default_user {
-            verify_admin(&session, &credentials)?;
+            if check.platform.is_windows(){windows_operation(&session,&check,"verify_admin",json!({}))?;}else{verify_admin(&session, &credentials)?;}
         }
         drop(session);
         Ok::<(), OperationsError>(())
@@ -2731,4 +2748,34 @@ mod tests {
             assert!(controller_address(value).is_err());
         }
     }
+}
+
+pub(super) fn candidate_for(platform: HostPlatform, architecture: Option<&str>) -> Result<PathBuf,OperationsError> {
+    if !platform.is_windows(){return candidate();}
+    let arch=architecture.unwrap_or("x64");
+    let targets: &[&str]=match arch {"x64"|"x86_64"=>&["x86_64-pc-windows-gnu","x86_64-pc-windows-msvc"],"arm64"|"aarch64"=>&["aarch64-pc-windows-msvc"],_=>return Err(OperationsError::bad_request("Windows CPU 架构暂不支持"))};
+    let root=release_root()?;
+    for target in targets {let path=root.join(format!("target/{target}/release/easymanage-agent.exe"));if check_release_file(&path).is_ok(){return Ok(path);}}
+    Err(OperationsError::bad_request("Windows Agent 候选尚未构建并发布，请先执行 Windows 构建脚本"))
+}
+pub(super) fn windows_operation(session:&Session,target:&Target,action:&str,extra:serde_json::Value)->Result<String,OperationsError>{windows::operation(session,target,action,extra)}
+pub(super) fn windows_run_fixed(session:&Session,target:&Target,script:&str)->Result<(),OperationsError>{windows::run_fixed(session,&target.pwsh_path,script).map(|_|())}
+
+pub(super) fn windows_update(session:&Session,target:&Target,binary:&FsPath)->Result<(),OperationsError>{windows::update(session,target,binary)}
+
+pub(super) fn windows_saved_session(state:&OperationsState,target:&Target)->Result<ssh_transport::SessionLease,OperationsError>{
+    let saved=ssh_vault::load(&state.registry,target)?;
+    ssh_transport::authenticated(target,&saved.auth(),&Cancellation::default())
+}
+
+pub(super) fn windows_promote(state:&OperationsState,target:&Target,credentials:Credentials,cancellation:&Cancellation)->Result<(),OperationsError>{windows::promote(state,target,credentials,cancellation)}
+
+pub(super) fn windows_candidate_digest(architecture:Option<&str>)->Option<String>{
+    type Entry=(u64,std::time::SystemTime,String);
+    static HASHES:std::sync::OnceLock<Mutex<HashMap<PathBuf,Entry>>>=std::sync::OnceLock::new();
+    let path=candidate_for(HostPlatform::Windows,architecture).ok()?;
+    let metadata=fs::metadata(&path).ok()?;let modified=metadata.modified().ok()?;
+    let mut hashes=HASHES.get_or_init(Default::default).lock().ok()?;
+    if let Some((length,at,digest))=hashes.get(&path){if *length==metadata.len() && *at==modified{return Some(digest.clone());}}
+    let digest=hex::encode(Sha256::digest(fs::read(&path).ok()?));hashes.insert(path,(metadata.len(),modified,digest.clone()));Some(digest)
 }

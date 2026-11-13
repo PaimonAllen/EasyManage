@@ -210,6 +210,10 @@ def publish(manifest, inventory):
         path = ROOT / name
         if not path.is_file(): raise RuntimeError(f"Release artifact missing: {path}")
         atomic_copy(path, release / name, 0o700 if name.endswith(".sh") or name.endswith(".py") or name.endswith("easymanage-agent") else 0o600)
+    for triple in ("x86_64-pc-windows-gnu", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
+        name = f"target/{triple}/release/easymanage-agent.exe"
+        if (ROOT / name).is_file(): atomic_copy(ROOT / name, release / name, 0o700)
+    atomic_copy(ROOT / "deploy/windows/agent-control.ps1", release / "deploy/windows/agent-control.ps1", 0o600)
     atomic_copy(inventory, release / "deploy/local/fleet.json")
     digest = hashlib.sha256((release / "target/release/easymanage-agent").read_bytes()).hexdigest()
     registry_path = BASE / "config/targets.json"
@@ -240,7 +244,7 @@ def publish(manifest, inventory):
                 raise RuntimeError("Managed target registry must be private and owned by the platform user")
             overlay = json.loads(managed.read_text())
             for target in overlay["targets"]:
-                target["release_sha256"] = digest
+                if target.get("platform", "linux") == "linux": target["release_sha256"] = digest
             with tempfile.NamedTemporaryFile(mode="w", dir=managed.parent, prefix=".managed-publish-", delete=False) as stream:
                 temporary = Path(stream.name)
                 stream.write(json.dumps(overlay, indent=2))

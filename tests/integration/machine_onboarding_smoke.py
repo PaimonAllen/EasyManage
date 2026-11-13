@@ -113,11 +113,45 @@ sys.exit(2)
     ssh_env = environment | {"HOME": str(home), "USER": current.pw_name,
         "PATH": str(commands) + ":/usr/bin:/bin", "MACHINE_FIXTURE_RUNTIME": str(runtime)}
 
+    def relay_scan_controls(channel, process):
+        def forward():
+            try:
+                while True:
+                    data=channel.recv(256)
+                    if not data:break
+                    process.stdin.write(data);process.stdin.flush()
+            except (OSError,EOFError,ValueError):pass
+            finally:
+                try:process.stdin.close()
+                except (OSError,ValueError):pass
+        threading.Thread(target=forward,daemon=True).start()
+
     def serve_command(channel, invocation):
         try:
             command = invocation.decode()
-            if command.startswith('/usr/bin/env -i ') and 'Bounded read-only disk analysis.' in command:
+            if command.startswith("/usr/bin/sudo -k -S -p '' /usr/bin/env -i ") and 'Bounded read-only disk analysis.' in command:
+                submitted=bytearray()
+                while not submitted.endswith(b"\n"):
+                    submitted.extend(channel.recv(1))
+                if not secrets.compare_digest(submitted.rstrip(b"\n"),password.encode()):
+                    raise RuntimeError("Fixture scan sudo authentication failed")
+                argv=shlex.split(command)[5:]
+                # Effective UID 0 exists only inside a private user namespace.
+                process=subprocess.Popen(["bwrap","--unshare-user","--unshare-pid","--unshare-ipc","--unshare-uts","--die-with-parent",
+                    "--uid","0","--ro-bind","/","/","--dev","/dev","--proc","/proc",*argv],
+                    stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+                relay_scan_controls(channel,process)
+                while True:
+                    line=process.stdout.readline()
+                    if not line:break
+                    channel.sendall(line)
+                process.stdin.close();result=process.wait(timeout=5)
+            elif command.startswith("/usr/bin/timeout 15s /usr/bin/python3 -I -B -c "):
+                completed=subprocess.run(shlex.split(command),capture_output=True,timeout=20)
+                channel.sendall(completed.stdout);result=completed.returncode
+            elif command.startswith('/usr/bin/env -i ') and 'Bounded read-only disk analysis.' in command:
                 process=subprocess.Popen(shlex.split(command),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+                relay_scan_controls(channel,process)
                 while True:
                     line=process.stdout.readline()
                     if not line:break
@@ -374,7 +408,9 @@ sys.exit(0)
             with opener.open(urllib.request.Request(base_url+path,data=data,headers=headers),timeout=30) as response:
                 return response.status,json.load(response)
         except urllib.error.HTTPError as error:
-            return error.code,json.load(error)
+            raw=error.read()
+            try:return error.code,json.loads(raw)
+            except ValueError:return error.code,{'message':raw.decode('utf-8',errors='replace')}
     def wait_job(created):
         deadline=time.monotonic()+120
         while time.monotonic()<deadline:
@@ -548,7 +584,7 @@ sys.exit(0)
             dials=len(transports)
             scan_path=f'/api/v1/nodes/{node_id}/disk-space'
             status,created_scan=request(scan_path,{'mode':'basic','path':'/tmp/work/tests/integration/fixtures','seconds':30})
-            require(status==200,'SSH-only disk scan starts on the authenticated persistent control session')
+            require(status==200,'SSH-only disk scan starts on an independent authenticated session')
             deadline=time.monotonic()+25
             while time.monotonic()<deadline:
                 _,snapshot=request(scan_path+'/'+created_scan['id'])
@@ -556,9 +592,127 @@ sys.exit(0)
                 time.sleep(.2)
             require(snapshot['status']=='complete' and snapshot['result']['uid']==os.getuid(),
                     'real SSH fixed scanner returns the original ordinary-user identity and directory tree')
-            require(len(transports)==dials,'disk scanning opens a channel without creating any new SSH connections')
+            require(snapshot['result']['estimated_percent']==100,'completed real SSH scanner reaches 100 percent')
+            require(len(transports)==dials+1,'disk scanning owns one ephemeral SSH session independent from the control transport')
             current_machine=next(m for m in request('/api/v1/machines')[1]['machines'] if m['node_id']==node_id)
             require(current_machine['ssh_transport']['connections']==2,'reverse HTTPS reporting remains connected during disk analysis')
+            # A second real Agent is Full inside its private root namespace.
+            allow_full.set()
+            status,full_created=request("/api/v1/machines",key_payload|{"host":"10.222.0.10","deployment_mode":"full","sudo_password":password,"connection_mode":"ssh"})
+            require(status==200 and wait_job(full_created)["status"]=="success","Full disk fixture installs namespace-root Agent")
+            public=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=context))
+            full_path=f'/api/v1/nodes/{full_created["node_id"]}/disk-space'
+            def public_request(path,body=None):
+                data=None if body is None else json.dumps(body).encode()
+                try:
+                    with public.open(urllib.request.Request(base_url+path,data=data,headers={"Content-Type":"application/json","Origin":base_url}),timeout=20) as response:
+                        return response.status,json.load(response)
+                except urllib.error.HTTPError as error:
+                    raw=error.read()
+                    try:return error.code,json.loads(raw)
+                    except ValueError:return error.code,{'message':raw.decode('utf-8',errors='replace')}
+            require(public_request(full_path)[1]["full_access"],"Full scanner is available without browser cookies")
+            sensitive_body={"mode":"full","path":"/","scope":"all_local","seconds":0,"max_entries":1,"storage":"realtime"}
+            require(public_request(full_path,sensitive_body)[0]==401,'public Full access does not authorize root or all-local ranges')
+            admin_path=f'/api/v1/nodes/{full_created["node_id"]}/admin-credentials'
+            admin_key={"username":current.pw_name,"private_key":ed_private,"passphrase":key_phrase,"sudo_password":password}
+            require(request(admin_path,admin_key)[0]==200,'sensitive scan administrator proof verifies actual namespace root over SSH')
+            require(request(full_path,sensitive_body)[0]==409,'administrator credentials alone do not bypass the second confirmation')
+            require(request(full_path+'/review',sensitive_body|{"command":"touch /tmp/forbidden"})[0] in (400,422),'review refuses any supplied command')
+            code,review=request(full_path+'/review',sensitive_body)
+            require(code==200 and review['read_only'] and len(review['script_sha256'])==64,'server safety review binds a fixed readonly scanner and exact parameters')
+            approval={"review_token":review['review_token'],"confirmed":True}
+            require(public_request(full_path,sensitive_body|approval)[0]==401,'review cannot be transferred to another browser')
+            require(request(full_path,sensitive_body|approval|{"path":"/home","scope":"directory"})[0]==409,'changing the reviewed path invalidates confirmation')
+            require(request(full_path,sensitive_body|approval|{"seconds":5})[0]==409,'changing a reviewed budget invalidates confirmation')
+            code,guarded=request(full_path,sensitive_body|approval)
+            require(code==200,'second explicit confirmation starts the exact reviewed root scan')
+            require(request(full_path,sensitive_body|approval)[0]==409,'review confirmation is single-use')
+            deadline=time.monotonic()+15
+            while time.monotonic()<deadline:
+                guarded_result=request(full_path+'/'+guarded['id'])[1]
+                if guarded_result['status']!='running':break
+                time.sleep(.1)
+            require(guarded_result['status']=='partial' and guarded_result['result']['scope']=='all_local'
+                    and guarded_result['result']['reason']=='entry_limit' and guarded_result['result']['visited']==1,
+                    'authorized all-local scanner retains global limits and stops before traversing the fixture root')
+
+            require(public_request(full_path+"/homes")[1]["paths"]==sorted(p.as_posix() for p in Path('/home').iterdir() if p.is_dir()),"home alternatives enumerate actual SSH host directories")
+            for storage in ["snapshot","realtime"]:
+                code,created_scan=public_request(full_path,{"mode":"basic","path":"/tmp/work/tests/integration/fixtures","seconds":30,"storage":storage})
+                require(code==200,"cookie-free Full scan starts using saved onboarding sudo credentials")
+                deadline=time.monotonic()+25
+                while time.monotonic()<deadline:
+                    _,snapshot=public_request(full_path+'/'+created_scan['id'])
+                    if snapshot['status']!='running':break
+                    time.sleep(.2)
+                require(snapshot['status']=='complete' and snapshot['mode']=='full' and snapshot['result']['uid']==0
+                        and snapshot['result']['username']=='root',"public snapshot/realtime scan executes fixed scanner as real namespace root, even for old Basic clients")
+                require(snapshot["result"]["estimated_percent"]==100,"Full snapshot and realtime SSH results reach 100 only on completion")
+                require(public_request(full_path+'/'+created_scan['id']+'/cancel',{})[0]==200,"public Full scan cancellation needs no admin cookie")
+            if os.environ.get('EASYMANAGE_TEST_DISK_CONTROL_FIXTURE')=='/tmp/control-fixture':
+                fixture=Path('/tmp/control-fixture')
+                for i in range(16000):(fixture/('ssh-entry-'+str(i))).touch()
+                code,created_scan=public_request(full_path,{"mode":"full","path":str(fixture),"seconds":30,"storage":"realtime"})
+                require(code==200,"Full SSH pause fixture starts without browser authentication")
+                control_path=full_path+'/'+created_scan['id']
+                require(public_request(control_path+'/pause',{"paused":True})[0]==200,"public root pause request reaches the existing SSH channel")
+                deadline=time.monotonic()+12
+                while time.monotonic()<deadline:
+                    _,value=public_request(control_path)
+                    if value.get('paused') and not value.get('pause_pending'):break
+                    require(value['status']=='running','Full SSH task survives until pause acknowledgement')
+                    time.sleep(.05)
+                require(value.get('paused') is True,"real namespace-root scanner acknowledges pause over SSH stdin")
+                visited=value['progress'].get('visited',0);time.sleep(.3)
+                value=public_request(control_path)[1]
+                require(value['paused'] and value['progress'].get('visited',0)==visited,"Full SSH paused traversal stops advancing")
+                require(public_request(control_path+'/pause',{"paused":False})[0]==200,"Full SSH scan resumes on the same task")
+                deadline=time.monotonic()+15
+                while time.monotonic()<deadline:
+                    value=public_request(control_path)[1]
+                    if value['status']!='running':break
+                    time.sleep(.1)
+                require(value['status']=='complete' and value['result']['uid']==0,"root SSH pause/resume preserves the real scan and completes its original tree")
+                # Keep ten real scanners paused on the same host. Each owns its
+                # own SSH session and stdin controls; the eleventh must fail.
+                held=[]
+                for i in range(10):
+                    code,job=public_request(full_path,{"mode":"full","path":str(fixture),"seconds":30,"storage":"realtime"})
+                    require(code==200,"concurrent SSH scanner starts on the same host: "+str(i+1))
+                    path=full_path+'/'+job['id'];held.append(path)
+                    require(public_request(path+'/pause',{"paused":True})[0]==200,"concurrent scanner accepts its own pause")
+                    deadline=time.monotonic()+12
+                    while time.monotonic()<deadline:
+                        value=public_request(path)[1]
+                        if value.get('paused') and not value.get('pause_pending'):break
+                        require(value['status']=='running','concurrent fixture remains running until pause')
+                        time.sleep(.05)
+                    require(value.get('paused') is True,"concurrent scanner independently acknowledges pause")
+                status=public_request(full_path)[1]
+                require(status['active_count']==10 and status['node_active_count']==10 and status['limits']['concurrent']==10,
+                        'API reports ten active scans including paused scans')
+                require(request(admin_path,{'use_saved':True})[0]==200,'read-only administrator verification coexists with ten paused scans')
+                require(public_request(full_path,{"mode":"full","path":str(fixture),"seconds":0,"storage":"realtime"})[0]==409,
+                        'eleventh scanner is refused without disturbing existing tasks')
+                machine=next(m for m in request('/api/v1/machines')[1]['machines'] if m['node_id']==full_created['node_id'])
+                require(2<=machine['ssh_transport']['connections']<=3 and machine['ssh_transport']['scan_connections']==10,
+                        'ten scan SSH sessions leave the two monitoring sessions connected')
+                require(public_request(held[0]+'/cancel',{})[0]==200,'cancel one paused scan independently')
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline and public_request(held[0])[1]['status']=='running':time.sleep(.1)
+                require(public_request(held[0])[1]['status']!='running','selected paused scan terminates')
+                require(all(public_request(path)[1].get('paused') for path in held[1:]),'cancelling one scanner leaves all nine others paused')
+                code,replacement=public_request(full_path,{"mode":"full","path":str(fixture),"seconds":30,"storage":"realtime"})
+                require(code==200,'released scan slot immediately admits another job')
+                require(public_request(held[1]+'/pause',{"paused":False})[0]==200,'resume one of the remaining paused scans')
+                for path in held[1:]+[full_path+'/'+replacement['id']]:public_request(path+'/cancel',{})
+                deadline=time.monotonic()+12
+                while time.monotonic()<deadline and public_request(full_path)[1]['active_count']:time.sleep(.1)
+                require(public_request(full_path)[1]['active_count']==0,'all private fixture scan sessions release their slots')
+                for path in fixture.iterdir():path.unlink()
+            require(public_request(f'/api/v1/nodes/{full_created["node_id"]}/admin-credentials')[1]=={"available":False},
+                    "public disk scan access does not grant browser administrator capabilities")
             return
         net=request('/api/v1/platform-network')[1]
         net_groups={g['group']:g for g in net['server']['groups']}

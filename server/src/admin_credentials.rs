@@ -78,7 +78,9 @@ async fn verify_and_save(
         None
     };
     let credentials = resolve_credentials(&state, &target, &headers, request)?;
-    let lease = acquire_node_lease(&state.limits, target.node_id, true, true)?;
+    // Administrator verification is fixed read-only work; it can coexist
+    // with disk scans while exclusive management mutations remain guarded.
+    let lease = acquire_node_lease(&state.limits, target.node_id, false, true)?;
     let cancellation = Arc::new(Cancellation::default());
     let _guard = CancelOnDrop(cancellation.clone());
     let worker = tokio::task::spawn_blocking(move || {
@@ -94,7 +96,10 @@ async fn verify_and_save(
             sudo_password: credentials.sudo_password.clone(),
             use_saved: false,
         };
-        run_privileged_command(&target, verified, &cancellation, check)?;
+        if target.platform.is_windows(){
+            let session=ssh_connect(&target,&verified,&cancellation)?;
+            machines::windows_operation(&session,&target,"verify_admin",json!({}))?;
+        }else{run_privileged_command(&target, verified, &cancellation, check)?;}
         if cancellation.is_cancelled() {
             return Err(OperationsError::ssh("管理员验证已取消，未保存新凭据"));
         }

@@ -370,6 +370,21 @@ pub(super) fn load_admin(
     Ok(saved)
 }
 
+// Only the fixed disk scanner/home listing may use a fresh Full-node grant.
+// Keep load_admin/browser capabilities unchanged for all management endpoints.
+pub(super) fn load_for_full_disk_scan(
+    registry: &FsPath, target: &Target, grant: &disk_space::FullScanGrant,
+) -> Result<Saved, OperationsError> {
+    if grant.node_id() != target.node_id { return Err(failure()); }
+    let saved = load_scoped(registry, target, true).or_else(|_| {
+        // Full onboarding also saves the SSH/sudo transport identity.
+        if target.agent_mode.as_deref() == Some("full") { load(registry, target) }
+        else { Err(failure()) }
+    });
+    saved.map_err(|_| OperationsError(StatusCode::SERVICE_UNAVAILABLE,
+        "Full Agent 的只读扫描通道尚未就绪，请由平台管理员修复已保存的 SSH/sudo 连接"))
+}
+
 pub(super) fn admin_available(registry: &FsPath, target: &Target, headers: &HeaderMap) -> bool {
     load_admin(registry, target, headers).is_ok()
 }

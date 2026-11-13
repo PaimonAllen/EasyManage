@@ -30,8 +30,35 @@ with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
     before=hashlib.sha256((root/'alpha'/'real.bin').read_bytes()).hexdigest()
     def run(**kwargs):
         return scan(str(root), allowed_fs={'tmpfs'}, **kwargs)
+    sensitive=module['sensitive_path']
+    assert sensitive('/') and sensitive('/etc/ssh') and sensitive('/home')
+    assert not sensitive('/home/user') and not sensitive('/data/disk')
+    table=[{'id':1,'device':'1:1','filesystem':'tmpfs','path':'/','root':'/'},
+           {'id':2,'device':'1:1','filesystem':'tmpfs','path':'/home/user/alias','root':'/etc'}]
+    assert module['original_mount_path']('/home/user/alias/ssh',table,table[1])=='/etc/ssh'
+    with patch.dict(scan.__globals__,{'mounts':lambda:table}):
+        try:scan('/home/user/alias',allowed_fs={'tmpfs'},enforce_scope=True)
+        except ValueError as error:assert str(error)=='administrator_review_required'
+        else:raise AssertionError('public-looking bind alias of /etc must require administrator review')
+    def source_metadata():
+        values={}
+        for path in [root,*root.rglob('*')]:
+            meta=path.lstat()
+            values[str(path)]=(meta.st_mode,meta.st_uid,meta.st_gid,meta.st_size,meta.st_mtime_ns,meta.st_ctime_ns)
+        return values
+    metadata_before=source_metadata()
     result=run()
+    assert source_metadata()==metadata_before,'scan cannot change contents/size, ownership, permissions, mtime or ctime'
     assert result['status']=='complete',result
+    assert result['estimated_percent']==100
+    estimates=[]
+    with patch('time.monotonic',side_effect=range(1000000)),patch('time.sleep'):
+        estimated=run(stream=True,realtime=True,emit=estimates.append)
+    values=[v['estimated_percent'] for v in estimates if v['type']=='progress']
+    assert len(values)>3 and values==sorted(values) and values[0]==0
+    assert any(0<v<99.9 for v in values) and all(0<=v<100 for v in values)
+    assert estimated['estimated_percent']==100
+
     nodes=result['nodes'];by_name={node['name']:node for node in nodes}
     assert result['hardlinks']==1 and result['symlinks']==1
     assert set(by_name)=={str(root),'alpha','empty'}
@@ -59,6 +86,7 @@ with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
     assert timed['status']=='partial' and timed['reason']=='time_limit'
     limited=run(max_nodes=3)
     assert limited['status']=='partial' and limited['reason']=='entry_limit' and limited['nodes'][0]['incomplete']
+    assert 0<=limited['estimated_percent']<100
     assert run(max_depth=1)['status']=='partial'
     assert run(cancelled=lambda:True)['status']=='cancelled'
     real_open=os.open
@@ -85,6 +113,30 @@ with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
     with patch('os.open',replaced): raced=run()
     assert raced['status']=='partial' and not any(n['name']=='passwd' for n in raced['nodes'])
     print('PASS allocated/apparent totals, sparse files, hardlinks, symlinks/FIFO, unusual names, permission errors, cancellation, entry/depth limits and symlink replacement; content unchanged')
+
+# Progressive totals must include an unfinished nested child without double
+# counting it when traversal eventually folds that child into the parent.
+with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
+    root=Path(temporary);(root/'nested').mkdir();(root/'nested/deeper').mkdir()
+    for index in range(80):(root/'nested/deeper'/str(index)).write_bytes(b'x'*128)
+    expected=scan(str(root),allowed_fs={'tmpfs'})
+    events=[]
+    with patch('time.monotonic',side_effect=range(1000000)),patch('time.sleep'):
+        result=scan(str(root),allowed_fs={'tmpfs'},stream=True,realtime=True,emit=events.append)
+    merged={};partial_sizes=[];seen=0
+    for event in events:
+        if event['type']=='entries':
+            for entry in event['nodes']:
+                assert entry['id']<=seen
+                if entry['id']==seen:seen+=1
+                merged[entry['id']]=entry
+                if entry['id']==0 and entry['incomplete']:partial_sizes.append(entry['apparent'])
+    assert result['status']=='complete'
+    assert result['nodes'][0]==expected['nodes'][0]
+    assert sorted(merged.values(),key=lambda n:n['id'])==expected['nodes']
+    assert len(set(partial_sizes))>5 and max(partial_sizes)>128*10
+    assert result['nodes'][0]['files']==80
+    print('PASS realtime publishes growing unfinished ancestor totals and final totals match snapshot without double counting')
 
 # Visit more than the old file limit without persisting any file metadata.
 with tempfile.TemporaryDirectory(dir='/tmp') as temporary:

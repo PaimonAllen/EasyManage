@@ -454,7 +454,8 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     target = target_list["targets"][0]
     require(status == 200 and target["node_id"] == node_id and target["elevation_available"]
             and target["update_state"] == "not_published" and not target["restart_available"]
-            and set(target) == {"node_id", "hostname", "host", "port", "default_user", "elevation_available", "update_available", "update_state", "restart_available"},
+            and target["platform"] == "linux"
+            and set(target) == {"platform", "node_id", "hostname", "host", "port", "default_user", "elevation_available", "update_available", "update_state", "restart_available"},
             "target listing exposes no credentials or private deployment paths")
     status, platform_health = request("/api/v1/platform-health")
     require(status == 200 and platform_health["platform"]["database_healthy"]
@@ -756,6 +757,9 @@ def exercise_api(base_url, context, enrollment_token, node_id):
     require(request('/api/v1/agent/report',current_report,resume_header)[0]==200
             and next(n for n in request('/api/v1/nodes')[1]['nodes'] if n['id']==resume_id)['online'],
             'resumed monitoring is online only after a fresh report with the applied revision')
+
+    from windows_protocol_smoke import exercise as exercise_windows_protocol
+    exercise_windows_protocol(request,require,enrollment,enrollment_token,report)
 
 
 def exercise_agent(binary, root, environment, base_url, ca_certificate, enrollment_token):
@@ -1201,6 +1205,16 @@ def smoke(args):
                         raise RuntimeError("Isolated EasyManage server did not become ready")
                     time.sleep(0.1)
                 exercise_api(base_url, context, enrollment, node_id)
+                if args.machine_disk_space_only:
+                    from machine_onboarding_smoke import exercise as exercise_machine_disk
+                    exercise_machine_disk(args.agent_binary,root,env,base_url,context,enrollment,require,disk_only=True)
+                    print("PASS focused real SSH disk scanner controls",flush=True)
+                    return
+                if args.disk_space_only:
+                    from disk_space_api_smoke import exercise as exercise_disk_space
+                    exercise_disk_space(root,base_url,context,enrollment,require)
+                    print("PASS focused isolated disk-space API/scanner regression",flush=True)
+                    return
                 from documents_smoke import exercise as exercise_documents
                 saved_document = exercise_documents(base_url, context, require)
                 from external_platforms_smoke import exercise as exercise_external_platforms
@@ -1224,7 +1238,7 @@ def smoke(args):
                     exercise_usage_history(root, base_url, context, enrollment, require)
                 if args.disk_space:
                     from disk_space_api_smoke import exercise as exercise_disk_space
-                    exercise_disk_space(root, base_url, context, enrollment, require)
+                    disk_space_node=exercise_disk_space(root, base_url, context, enrollment, require)
                 if args.agent_binary is not None and not args.machine_onboarding:
                     exercise_agent(args.agent_binary, root, env, base_url, ca_certificate, enrollment)
                 if args.machine_onboarding:
@@ -1316,6 +1330,13 @@ def smoke(args):
                         time.sleep(0.3)
                 else: raise RuntimeError("Server did not recover automatically after PostgreSQL returned")
                 require(True, "database recovery automatically restores monitoring without another platform restart")
+                if args.disk_space:
+                    path=f'/api/v1/nodes/{disk_space_node}/disk-space'
+                    with opener.open(base_url+path+'?storage=realtime',timeout=5) as response:
+                        require(json.load(response)['scans']==[], 'platform restart releases ephemeral realtime trees')
+                    with opener.open(base_url+path,timeout=5) as response:
+                        require(bool(json.load(response)['scans']), 'persistent disk snapshots survive platform and database restarts')
+
                 with opener.open(base_url + '/api/v1/machines', timeout=5) as response:
                     require(response.status == 200 and json.load(response)['machines'],
                             'machine management recovers automatically after PostgreSQL returns')
@@ -1389,10 +1410,13 @@ if __name__ == "__main__":
     parser.add_argument("--machine-admin-credentials",action="store_true",help="Focused real SSH administrator password/key vault and saved-credential operations regression")
     parser.add_argument("--machine-admin-http2",action="store_true",help="Real TLS/HTTP2 split-cookie administrator authorization, renewal and platform restart")
     parser.add_argument("--usage-history",action="store_true",help="Standalone seven-day history, cache, calendar boundaries and reader isolation")
+    parser.add_argument("--disk-space-only",action="store_true",help="Run API bootstrap and disk-space regressions without unrelated network-probe suites")
     parser.add_argument("--disk-space",action="store_true",help="Read-only disk scanner task, permission and database API regression")
+    parser.add_argument("--machine-disk-space-only",action="store_true",help="Run API bootstrap and real SSH Basic/Full scanner controls only")
     parser.add_argument("--machine-disk-space",action="store_true",help="Focused disk scanner over real persistent SSH with a real Basic Agent")
     parser.add_argument("--host-netns", required=True)
     parser.add_argument("--host-mntns", required=True)
     args=parser.parse_args()
+    if args.machine_disk_space_only:args.machine_disk_space=True
     if args.machine_redeployment or args.machine_admin_credentials or args.machine_disk_space or args.machine_update or args.machine_agent_stop or args.machine_admin_http2:args.machine_onboarding=True
     smoke(args)

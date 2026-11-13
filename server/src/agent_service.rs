@@ -282,7 +282,12 @@ async fn stop(
                     shell_quote(&target.agent_home.to_string_lossy()),
                     shell_quote(&target.default_user)
                 );
-                if full {
+                if target.platform.is_windows(){
+                    if full{machines::windows_operation(&session,&target,"verify_admin",json!({}))?;}
+                    let output=machines::windows_operation(&session,&target,"stop",json!({}))?;
+                    if output.trim()!="AGENT_STOPPED_FILES_RETAINED"{return Err(OperationsError::ssh("Windows Agent 停止状态未确认"));}
+                    drop(session);
+                }else if full {
                     run_privileged_on(&session, credentials, &invocation)?;
                     drop(session);
                 } else {
