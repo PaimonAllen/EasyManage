@@ -8,7 +8,7 @@ HTTP/2 浏览器授权：`isolated_smoke.py --machine-admin-http2 --agent-binary
 
 全机磁盘扫描回归在私有 mount namespace 创建两个小型 tmpfs 和重叠的 bind mount，验证各文件系统覆盖、绑定去重、真实路径、全局预算、取消和不可读主入口的绑定回退；生产默认仍禁止扫描 tmpfs。HTTP 用 `all_local` 加 1 条预算验证新范围持久化，在发现或枚举文件系统前停止，不扫描宿主目录。
 
-磁盘扫描无限制回归：合成 32,010 个文件，并模拟超过原时间上限，验证文件计入汇总、只保存一个目录且不生成临时 SQLite。HTTP/PostgreSQL 用 26,001 个子目录验证完整目录排序、跨页搜索、末页和祖先导航；root 结果沿用平台普通读取权限，启动或取消 root 扫描仍要求管理员授权。测试保留有限预算、手动取消和旧版快照的回归。
+磁盘扫描无限制回归：合成 32,010 个文件，并模拟超过原时间上限，验证文件计入汇总、只保存一个目录且不生成临时 SQLite。HTTP/PostgreSQL 用 26,001 个子目录验证完整目录排序、跨页搜索、末页和祖先导航；root 结果沿用平台普通读取权限，在线 Full 机器允许无 Cookie 启动或取消固定只读扫描。Full 授权测试验证缺少真实保存连接时明确失败、Basic 不能请求 root、跨源拒绝及通用管理员权限不变。测试保留有限预算、手动取消和旧版快照的回归。
 
 磁盘空间分析：`disk_space_scanner_smoke.py` 在上述隔离环境中接收宿主 net/mnt ID，使用合成目录验证实际/逻辑大小、稀疏文件、硬链接、符号链接竞态、FIFO、无权限目录、取消和条目/深度限制。嵌套私有 root/mount namespace 验证同设备 bind mount 不被跨越。`isolated_smoke.py --disk-space` 运行真实临时 HTTPS/PostgreSQL 和固定扫描器，只读取只读绑定的仓库测试夹具，验证权限、输入、跨源拦截、持久任务和虚拟文件系统拒绝。`web/tests/diskSpace.test.ts` 检查父级分母和矩形面积，SSR 检查不完整值提示及文件名转义。测试不连接生产 SSH、不扫描生产数据目录。
 
@@ -91,3 +91,19 @@ SSH fixture 还强制遮蔽 `/var`、`/etc/easymanage`、`/etc/systemd/system` �
 清单缓存与性能回归：默认 HTTP smoke 覆盖协议 3 的完整/引用上报、缓存缺失与冲突拒绝、完整快照一致性、旧协议拒绝和重复重传。Rust 队列测试覆盖内容共享、不同版本、重启恢复及旧队列；真实 Agent 的丢缓存、采集开关和暂停恢复仍走原隔离入口。
 
 可加 `--performance-baseline /tmp/server-before`，将已备份的旧服务二进制只读映射到隔离环境，比较每组 240 次相同采样比例的模拟上报。仅在私有 PostgreSQL 创建临时数据库，对比请求正文、WAL 生成、后端 CPU 时间和观测 RSS；另验证带真实数据的 schema-21 → 22 升级/回退、跨节点缓存隔离与缓存重建。包含旧 Agent 向新平台完整上报的兼容场景。它不是生产压力测试，不测 TLS 握手、所有采集子进程或整机磁盘写入；CPU 时间很短，受时钟精度和调度影响，不能用其百分比承诺生产收益。
+
+实时磁盘扫描回归：`disk_space_scanner_smoke.py` 用合成目录与可控时钟核验未完成父目录的持续增长及最终汇总无重复计数；Server 的 `operations::disk_space::live::tests` 覆盖运行中分页、全量排序、独立多结果、节点隔离、多查看页、关闭后 24 小时、异常断开租约及重新打开续期。`isolated_smoke.py --disk-space` 使用真实固定扫描器和私有数据库，验证 5 份内存结果、与快照相同的目录总量、结果表零写入、两种历史分离、心跳同源校验、多页面续期及 root 授权边界。测试不等待真实 24 小时，不连接生产服务。
+
+实时扫描页面刷新回归：在上述私有 bwrap 环境中调用 `node web/tests/diskSpace-live-dom.mjs <宿主 netns> <宿主 mntns> /tmp/ui-test-deps`。测试依赖单独安装 `jsdom@31.0.0`，将其安装目录只读映射到 `/tmp/ui-test-deps`，不加入平台依赖。合成响应覆盖后台更新不插入加载行、DOM/展开/滚动/颜色保留、慢请求合并、最终修订不丢失、分页和旧响应竞争及完成状态保留布局位置。该用例是 DOM 交互回归，不等同真实浏览器像素布局测试。
+
+Windows 协议回归：默认隔离 HTTP smoke 会调用 `windows_protocol_smoke.py`，验证 Windows 原生 SID/管理员令牌、NTFS 盘符路径、null POSIX 负载值及协议 3 清单复用经过真实 HTTPS/PostgreSQL 往返保持语义。它不代表 Windows 服务、提权或实际采集器已做真机验证。`web/tests/hostPlatform.test.ts` 和 SSR 检查 Windows Full 不依赖 UID 0、添加机器可选 Windows、SCM/受限登录任务说明及管理员界面。Windows 在用测试机只运行明确授权的只读诊断和独立合成目录扫描，SCM/账户变更需独立维护授权。
+
+Windows pwsh discovery: `windows_pwsh_discovery.ps1 -DiscoveryPath <runtime/src/pwsh-discovery.ps1>` performs only read-only version/path probes; PATH/LOCALAPPDATA changes are scoped to the test process and restored. It covers explicit paths, missing PATH, stale hints and installed-package/registry fallback. Run under built-in Windows PowerShell or pwsh in the authorized test account. Linux deployment still requires Bash.
+
+`--machine-disk-space` 还会部署私有 root namespace 的真实 Full Agent，经真实 SSH/sudo fixture 运行固定扫描器；无 Cookie 请求两种存储模式，验证实际 UID 0、旧 Basic 请求升级为 Full、完整 /home 备选以及不授予浏览器管理员权限。
+
+浏览器扫描会话回归：`diskSpaceSession.test.ts` 检查随机 client 标识、机器与任务选择、目录/分页偏好、24 小时闲置过期、损坏/禁用本地存储；`diskSpace-live-dom.mjs` 实际卸载重挂载模拟 F5，验证恢复同一任务和目录页、不发起新的扫描、不会跟随其他访问者的最新任务，并恢复暂停按钮。浏览器只保存偏好元数据。
+
+暂停回归：在原隔离命名空间额外把私有空 ext4 临时目录可写映射到 `/tmp/control-fixture`，设置 `EASYMANAGE_TEST_DISK_CONTROL_FIXTURE=/tmp/control-fixture` 后运行 `isolated_smoke.py --disk-space-only`。该专用入口保留 API 初始化与全部磁盘检查，省略无关的网络探测套件。测试仅在该绑定内生成合成文件，实际通过 HTTPS 控制固定扫描器，验证暂停确认后计数不增长、暂停时间不消耗时限、同一任务继续、暂停中取消，以及跨源和已结束任务拒绝；结束清理合成文件，不扫描生产目录。
+
+磁盘并发回归：`--machine-disk-space-only` 配合私有 `/tmp/control-fixture`（`EASYMANAGE_TEST_DISK_CONTROL_FIXTURE`）会以真实 SSH 会话启动同机 10 个扫描，逐个确认暂停、第 11 个拒绝、取消互不影响以及释放后重新准入；监控原有两条长连接保持。协调器单测另覆盖竞争准入、100 份内存结果上限和最旧已结束结果清理。

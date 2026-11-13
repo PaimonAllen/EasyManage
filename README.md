@@ -2,7 +2,7 @@
 
 EasyManage is a bare-metal infrastructure monitoring and operations platform. It combines a Rust HTTPS server, a Rust agent, PostgreSQL, an agent-side SQLite queue, and a React/TypeScript console.
 
-The controller can also monitor its own host. Remote agents report over HTTPS, with persistent SSH transport available for hosts that only allow SSH connections. Native Linux deployments are supported. Windows and macOS integration is planned; container deployment is not currently supported.
+The controller can also monitor its own host. Remote agents report over HTTPS, with persistent SSH transport available for hosts that only allow SSH connections. The controller runs natively on Linux and manages Linux or Windows Agents. Windows uses OpenSSH, SFTP, PowerShell 7 and a native SCM service (Full) or a limited login task (Basic). macOS integration is planned; container deployment is not currently supported.
 
 ## Features
 
@@ -28,7 +28,7 @@ Controller deployment mode and agent privileges are independent:
 
 User mode is a supported deployment option. A user-mode controller can manage Full agents, and existing mixed deployments are supported. Repository layout changes do not automatically migrate services or downgrade agent privileges.
 
-The intranet monitoring interface does not currently require a platform login. Terminal sessions, privilege elevation, account operations, and emergency restarts require authentication against the target host through SSH and, where needed, sudo. Full status is confirmed by a recent heartbeat reporting root / UID 0. Information unavailable to a Basic agent is reported as unknown.
+The intranet monitoring interface does not currently require a platform login. Terminal sessions, privilege elevation, account operations, and emergency restarts require authentication against the target host through SSH and, where needed, sudo. Full status is confirmed by a recent heartbeat reporting root / UID 0 on Linux or an actual Windows Administrator token and native SID on Windows. Information unavailable to a Basic agent is reported as unknown.
 
 ## Build and Deployment
 
@@ -72,7 +72,7 @@ Deployment instructions:
 | `deploy/linux/` | System/user installation, bootstrap, operations, and deployment-mode handover |
 | `deploy/orchestration/` | Trusted fleet orchestration, currently implemented for Linux |
 | `deploy/examples/` | Public configuration and inventory templates |
-| `deploy/windows/`, `deploy/macos/` | Native integration requirements; installers are not yet implemented |
+| `deploy/windows/`, `deploy/macos/` | Windows Agent operations and native integration requirements for macOS |
 | `deploy/docker/` | Reserved directory; container deployment is not supported |
 | `scripts/diagnostics/` | Read-only diagnostic tools |
 | `tests/integration/`, `web/tests/` | Isolated integration tests and frontend checks |
@@ -96,3 +96,5 @@ Page refresh intervals are separate from host collection and independent website
 Treat managed hosts as production systems. Compilation and static checks may run in the workspace. Runtime, failure-recovery, privilege, and load tests must run in an isolated environment with private resources rather than against production services.
 
 Deployment, database migration, key rotation, and forced restarts change real services. Confirm the target and an appropriate maintenance window before performing those operations. Existing production services retain their deployment mode, and privileged agents retain Full mode unless an explicit change is requested.
+
+Windows requirements, deployment modes and validation boundaries: [Windows Agent](deploy/windows/README.md).

@@ -24,3 +24,5 @@
 前台入口兼容当前用户的 `~/.easymanage/config/*.env`，可显式设置 `EASYMANAGE_ENV_FILE`。系统配置和数据库模板见 [数据库说明](../deploy/database/README.md)。`diagnostics/` 放只读磁盘与 Nginx 检查。实际部署会影响生产服务，不属于测试。
 
 发布前运行 `python3 scripts/check-repository.py --staged`，核对索引包含源码、锁文件及迁移，没有私有/生成文件。检查仅输出路径和行号，不显示发现的秘密值；属于定向检查，不代替完整秘密扫描。
+
+Windows Agent 交叉构建：`./scripts/build-windows-agent.sh --check` 或 `--release`；`--release --publish` 只发布 Windows 候选，不重启服务，见 `deploy/windows/README.md`。

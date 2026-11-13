@@ -1,6 +1,6 @@
 # 裸机部署
 
-当前仅支持 Linux 裸机。`windows/` 和 `macos/` 是带接入说明的准备目录，尚无可执行安装器；`docker/` 按要求保留但不支持容器。
+控制平台运行于 Linux 裸机，可通过网页接入 Linux 或 Windows Agent。`windows/` 含实际 PowerShell 7 部署、SCM 生命周期、账户管理与目录扫描脚本；`macos/` 仅有接入说明。`docker/` 按要求保留但不支持容器。
 
 ## 模式与目录
 
@@ -13,7 +13,7 @@
 - `examples/`：可发布的配置示例，不含真实节点身份或凭据。
 - `database/`：PostgreSQL 通用部署说明。
 - `third-party/`：平台探测用第三方源码版本、许可证与独立内核安装说明。
-- `windows/`、`macos/`：原生安装与权限适配的接入清单，不表示已支持。
+- `windows/`：Windows Agent 的实际 pwsh 运维脚本与部署说明。`macos/`：尚未实现的原生接入清单。
 - `local/`：Git 忽略的本机清单和私有配置，不随项目发布。
 
 系统级配置位于 `/etc/easymanage/`，二进制在 `/usr/local/sbin/`，Server 静态文件在 `/opt/easymanage/web/`，Agent SQLite 在 `/var/lib/easymanage-agent/`。普通用户的资产位于 `~/.easymanage/`，单元位于 `~/.config/systemd/user/`。目录整理不意味着迁移运行中的服务。Server 的运行模式和 Agent 的权限独立：用户 Server 可以管理 Full Agent。
@@ -22,7 +22,7 @@
 
 ## 发布清单
 
-`examples/fleet.example.json` 仅含示例地址和 ID，并标记 `example: true`，部署器拒绝执行。复制为 `deploy/local/fleet.json`，替换主机、端口、SSH 别名、用户、平台 URL 和节点 ID，完成配置后删除 example 标记。已有节点保留真实 ID 和 SQLite 状态，不重新生成身份。默认只读取私有清单；自定义路径用 `--inventory`。目标可显式标记 `platform: "linux"`；旧清单缺失此字段仍按 Linux 处理，其他平台目前拒绝执行。
+`examples/fleet.example.json` 仅含示例地址和 ID，并标记 `example: true`，部署器拒绝执行。复制为 `deploy/local/fleet.json`，替换主机、端口、SSH 别名、用户、平台 URL 和节点 ID，完成配置后删除 example 标记。已有节点保留真实 ID 和 SQLite 状态，不重新生成身份。默认只读取私有清单；自定义路径用 `--inventory`。目标可显式标记 `platform: "linux"`；旧清单缺失此字段仍按 Linux 处理，此 fleet CLI 仍拒绝非 Linux 部署；Windows 请使用「添加机器 → Windows」及匹配的 Windows 候选。
 
 SSH 主机密钥须预先核验。编排使用普通 SSH 用户和严格密钥检查，不自动运行远端 sudo。Full 实际更新仍需管理员 SSH / sudo 验证。构建及候选发布不更新运行中的服务。
 
